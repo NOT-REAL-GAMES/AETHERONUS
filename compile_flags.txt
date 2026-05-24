@@ -1,0 +1,5 @@
+-std=c++23
+-Iinclude
+-Iglad/include
+-Ibuild/_deps/sdl3-build/include-revision
+-Ibuild/_deps/sdl3-src/include
