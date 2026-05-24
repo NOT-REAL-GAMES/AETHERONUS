@@ -253,6 +253,32 @@ void upload_indexed_mesh_buffer(
     glBindVertexArray(0);
 }
 
+std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
+    std::vector<DebugVertex> vertices;
+    vertices.reserve(mesh.vertices.size());
+    for (const QuantizedMeshVertex& vertex : mesh.vertices) {
+        Vec3 color = vertex.material_id == 2u
+            ? Vec3{0.045f, 0.095f, 0.045f}
+            : vertex.material_id == 4u
+            ? Vec3{0.010f, 0.014f, 0.018f}
+            : vertex.material_id == 1u
+            ? Vec3{0.20f, 0.15f, 0.10f}
+            : Vec3{0.07f, 0.15f, 0.18f};
+        if (vertex.fracture_chunk_id != 0u && vertex.material_id != 2u && vertex.material_id != 4u) {
+            const uint32_t hash = vertex.fracture_chunk_id * 747796405u + 2891336453u;
+            const float warm = static_cast<float>((hash >> 8) & 0xffu) / 255.0f;
+            const float cool = static_cast<float>((hash >> 16) & 0xffu) / 255.0f;
+            color = {
+                color.x + warm * 0.045f,
+                color.y + (1.0f - warm) * 0.030f,
+                color.z + cool * 0.035f,
+            };
+        }
+        vertices.push_back({vertex.position, color});
+    }
+    return vertices;
+}
+
 void append_line(std::vector<DebugVertex>& vertices, float x0, float y0, float x1, float y1, Vec3 color) {
     vertices.push_back({{x0, y0, 0.0f}, color});
     vertices.push_back({{x1, y1, 0.0f}, color});
@@ -368,30 +394,7 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const std::vect
         point_vertices.push_back({point.position * 1.018f, point_color(point)});
     }
 
-    std::vector<DebugVertex> mesh_vertices;
-    mesh_vertices.reserve(mesh.vertices.size());
-    for (const QuantizedMeshVertex& vertex : mesh.vertices) {
-        const Vec3 color = vertex.material_id == 2u
-            ? Vec3{0.045f, 0.095f, 0.045f}
-            : vertex.material_id == 1u
-            ? Vec3{0.20f, 0.15f, 0.10f}
-            : Vec3{0.07f, 0.15f, 0.18f};
-        mesh_vertices.push_back({vertex.position, color});
-    }
-
-    upload_indexed_mesh_buffer(
-        mesh_vao_,
-        mesh_vbo_,
-        mesh_triangle_ebo_,
-        mesh_line_ebo_,
-        stitch_triangle_ebo_,
-        stitch_line_ebo_,
-        mesh_vertices,
-        mesh.triangle_indices,
-        mesh.line_indices,
-        mesh.stitch_triangle_indices,
-        mesh.stitch_line_indices
-    );
+    update_mesh(mesh);
     upload_vertex_buffer(line_vao_, line_vbo_, line_vertices);
     upload_vertex_buffer(grid_ribbon_vao_, grid_ribbon_vbo_, grid_ribbon_vertices);
     upload_vertex_buffer(grid_ribbon_line_vao_, grid_ribbon_line_vbo_, grid_ribbon_line_vertices);
@@ -409,10 +412,6 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const std::vect
 
     line_vertex_count_ = static_cast<int>(line_vertices.size());
     point_vertex_count_ = static_cast<int>(point_vertices.size());
-    mesh_triangle_index_count_ = static_cast<int>(mesh.triangle_indices.size());
-    mesh_line_index_count_ = static_cast<int>(mesh.line_indices.size());
-    stitch_triangle_index_count_ = static_cast<int>(mesh.stitch_triangle_indices.size());
-    stitch_line_index_count_ = static_cast<int>(mesh.stitch_line_indices.size());
     grid_ribbon_vertex_count_ = static_cast<int>(grid_ribbon_vertices.size());
     grid_ribbon_line_vertex_count_ = static_cast<int>(grid_ribbon_line_vertices.size());
 
@@ -422,12 +421,36 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const std::vect
     return true;
 }
 
+void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
+    release_mesh_buffers();
+
+    const std::vector<DebugVertex> mesh_vertices = build_debug_mesh_vertices(mesh);
+    upload_indexed_mesh_buffer(
+        mesh_vao_,
+        mesh_vbo_,
+        mesh_triangle_ebo_,
+        mesh_line_ebo_,
+        stitch_triangle_ebo_,
+        stitch_line_ebo_,
+        mesh_vertices,
+        mesh.triangle_indices,
+        mesh.line_indices,
+        mesh.stitch_triangle_indices,
+        mesh.stitch_line_indices
+    );
+
+    mesh_triangle_index_count_ = static_cast<int>(mesh.triangle_indices.size());
+    mesh_line_index_count_ = static_cast<int>(mesh.line_indices.size());
+    stitch_triangle_index_count_ = static_cast<int>(mesh.stitch_triangle_indices.size());
+    stitch_line_index_count_ = static_cast<int>(mesh.stitch_line_indices.size());
+}
+
 void DebugRenderer::resize(int width, int height) {
     width_ = width > 0 ? width : 1;
     height_ = height > 0 ? height : 1;
 }
 
-void DebugRenderer::render(const OrbitCamera& camera, bool show_fps, float fps) {
+void DebugRenderer::render(const OrbitCamera& camera, const DebugRenderOptions& options, bool show_fps, float fps) {
     glViewport(0, 0, width_, height_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -455,36 +478,44 @@ void DebugRenderer::render(const OrbitCamera& camera, bool show_fps, float fps) 
     glDrawElements(GL_TRIANGLES, mesh_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
     glDisable(GL_POLYGON_OFFSET_FILL);
 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh_line_ebo_);
-    glDisableVertexAttribArray(1);
-    glVertexAttrib3f(1, 0.42f, 0.92f, 1.0f);
-    glDrawElements(GL_LINES, mesh_line_index_count_, GL_UNSIGNED_INT, nullptr);
-    glEnableVertexAttribArray(1);
+    if (options.show_mesh_wire) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh_line_ebo_);
+        glDisableVertexAttribArray(1);
+        glVertexAttrib3f(1, 0.42f, 0.92f, 1.0f);
+        glDrawElements(GL_LINES, mesh_line_index_count_, GL_UNSIGNED_INT, nullptr);
+        glEnableVertexAttribArray(1);
+    }
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_triangle_ebo_);
     glDrawElements(GL_TRIANGLES, stitch_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
 
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_line_ebo_);
-    glDisableVertexAttribArray(1);
-    glVertexAttrib3f(1, 0.32f, 0.56f, 0.18f);
-    glDrawElements(GL_LINES, stitch_line_index_count_, GL_UNSIGNED_INT, nullptr);
-    glEnableVertexAttribArray(1);
+    if (options.show_mesh_wire) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_line_ebo_);
+        glDisableVertexAttribArray(1);
+        glVertexAttrib3f(1, 0.32f, 0.56f, 0.18f);
+        glDrawElements(GL_LINES, stitch_line_index_count_, GL_UNSIGNED_INT, nullptr);
+        glEnableVertexAttribArray(1);
+    }
 
-    glDepthFunc(GL_LEQUAL);
-    glBindVertexArray(grid_ribbon_vao_);
-    glDrawArrays(GL_TRIANGLES, 0, grid_ribbon_vertex_count_);
+    if (options.show_goldberg_grid) {
+        glDepthFunc(GL_LEQUAL);
+        glBindVertexArray(grid_ribbon_vao_);
+        glDrawArrays(GL_TRIANGLES, 0, grid_ribbon_vertex_count_);
 
-    glBindVertexArray(grid_ribbon_line_vao_);
-    glDrawArrays(GL_LINES, 0, grid_ribbon_line_vertex_count_);
-    glDepthFunc(GL_LESS);
+        glBindVertexArray(grid_ribbon_line_vao_);
+        glDrawArrays(GL_LINES, 0, grid_ribbon_line_vertex_count_);
+        glDepthFunc(GL_LESS);
 
-    glUniform1f(point_size_location, 1.0f);
-    glBindVertexArray(line_vao_);
-    glDrawArrays(GL_LINES, 0, line_vertex_count_);
+        glUniform1f(point_size_location, 1.0f);
+        glBindVertexArray(line_vao_);
+        glDrawArrays(GL_LINES, 0, line_vertex_count_);
+    }
 
-    glUniform1f(point_size_location, 6.0f);
-    glBindVertexArray(point_vao_);
-    glDrawArrays(GL_POINTS, 0, point_vertex_count_);
+    if (options.show_points) {
+        glUniform1f(point_size_location, 6.0f);
+        glBindVertexArray(point_vao_);
+        glDrawArrays(GL_POINTS, 0, point_vertex_count_);
+    }
 
     glBindVertexArray(0);
     glUseProgram(0);
@@ -514,23 +545,7 @@ void DebugRenderer::render_fps_overlay(float fps) {
     glUseProgram(0);
 }
 
-void DebugRenderer::shutdown() {
-    if (line_vbo_ != 0) {
-        glDeleteBuffers(1, &line_vbo_);
-        line_vbo_ = 0;
-    }
-    if (line_vao_ != 0) {
-        glDeleteVertexArrays(1, &line_vao_);
-        line_vao_ = 0;
-    }
-    if (point_vbo_ != 0) {
-        glDeleteBuffers(1, &point_vbo_);
-        point_vbo_ = 0;
-    }
-    if (point_vao_ != 0) {
-        glDeleteVertexArrays(1, &point_vao_);
-        point_vao_ = 0;
-    }
+void DebugRenderer::release_mesh_buffers() {
     if (mesh_line_ebo_ != 0) {
         glDeleteBuffers(1, &mesh_line_ebo_);
         mesh_line_ebo_ = 0;
@@ -555,6 +570,31 @@ void DebugRenderer::shutdown() {
         glDeleteVertexArrays(1, &mesh_vao_);
         mesh_vao_ = 0;
     }
+
+    mesh_triangle_index_count_ = 0;
+    mesh_line_index_count_ = 0;
+    stitch_triangle_index_count_ = 0;
+    stitch_line_index_count_ = 0;
+}
+
+void DebugRenderer::shutdown() {
+    if (line_vbo_ != 0) {
+        glDeleteBuffers(1, &line_vbo_);
+        line_vbo_ = 0;
+    }
+    if (line_vao_ != 0) {
+        glDeleteVertexArrays(1, &line_vao_);
+        line_vao_ = 0;
+    }
+    if (point_vbo_ != 0) {
+        glDeleteBuffers(1, &point_vbo_);
+        point_vbo_ = 0;
+    }
+    if (point_vao_ != 0) {
+        glDeleteVertexArrays(1, &point_vao_);
+        point_vao_ = 0;
+    }
+    release_mesh_buffers();
     if (grid_ribbon_line_vbo_ != 0) {
         glDeleteBuffers(1, &grid_ribbon_line_vbo_);
         grid_ribbon_line_vbo_ = 0;
@@ -585,10 +625,6 @@ void DebugRenderer::shutdown() {
     }
     line_vertex_count_ = 0;
     point_vertex_count_ = 0;
-    mesh_triangle_index_count_ = 0;
-    mesh_line_index_count_ = 0;
-    stitch_triangle_index_count_ = 0;
-    stitch_line_index_count_ = 0;
     grid_ribbon_vertex_count_ = 0;
     grid_ribbon_line_vertex_count_ = 0;
 }

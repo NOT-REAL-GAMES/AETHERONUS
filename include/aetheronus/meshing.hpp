@@ -16,6 +16,28 @@ struct MarchingCubesConfig {
     uint32_t resolution_z = 4;
     float radial_half_depth = 0.08f;
     bool quantize_positions = true;
+    bool enable_lod_subdivision_test = false;
+    bool enable_camera_proximity_lod = false;
+    uint32_t lod_min_subdivisions = 4;
+    uint32_t lod_max_subdivisions = 16;
+    uint32_t lod_levels = 4;
+    Vec3 lod_camera_position = {0.0f, 0.0f, 3.4f};
+    float lod_inner_patch_radius = 0.18f;
+    float lod_outer_patch_radius = 0.95f;
+    bool enable_fractures = false;
+    bool connect_fractures_across_cells = true;
+    uint32_t fracture_seed = 1;
+    uint32_t global_fracture_seed_copies = 1;
+    uint32_t shards_per_hex = 7;
+    uint32_t shards_per_pent = 6;
+    float fracture_gap = 0.024f;
+    float fracture_depth = 0.010f;
+    float fracture_edge_guard = 0.0030f;
+    bool enable_fracture_walls = true;
+    float fracture_wall_depth = 0.30f;
+    uint32_t fracture_wall_material_id = 4;
+    float fracture_chunk_outward_min = 0.030f;
+    float fracture_chunk_outward_max = 0.120f;
 };
 
 struct QuantizedMeshVertex {
@@ -23,6 +45,7 @@ struct QuantizedMeshVertex {
     Vec3 normal;
     uint32_t material_id = 0;
     uint32_t cell_id = 0;
+    uint32_t fracture_chunk_id = 0;
 };
 
 struct QuantizedMesh {
@@ -47,6 +70,9 @@ struct QuantizedMesh {
     uint32_t greedy_path_step_count = 0;
     uint32_t rejected_greedy_jump_count = 0;
     uint32_t cell_count = 0;
+    uint32_t min_cell_subdivisions = 0;
+    uint32_t max_cell_subdivisions = 0;
+    uint32_t lod_level_count = 0;
 };
 
 struct QuantizedMeshValidation {

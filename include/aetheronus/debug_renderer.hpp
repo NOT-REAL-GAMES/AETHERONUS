@@ -16,6 +16,12 @@ struct OrbitCamera {
     float distance = 3.4f;
 };
 
+struct DebugRenderOptions {
+    bool show_goldberg_grid = false;
+    bool show_mesh_wire = false;
+    bool show_points = false;
+};
+
 class DebugRenderer {
 public:
     DebugRenderer() = default;
@@ -25,11 +31,13 @@ public:
     DebugRenderer& operator=(const DebugRenderer&) = delete;
 
     bool initialize(const GoldbergTopology& topology, const std::vector<PointSample>& points, const QuantizedMesh& mesh);
+    void update_mesh(const QuantizedMesh& mesh);
     void resize(int width, int height);
-    void render(const OrbitCamera& camera, bool show_fps, float fps);
+    void render(const OrbitCamera& camera, const DebugRenderOptions& options, bool show_fps, float fps);
     void shutdown();
 
 private:
+    void release_mesh_buffers();
     void render_fps_overlay(float fps);
 
     uint32_t shader_ = 0;
