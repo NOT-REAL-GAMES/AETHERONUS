@@ -269,12 +269,66 @@ std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
             const float warm = static_cast<float>((hash >> 8) & 0xffu) / 255.0f;
             const float cool = static_cast<float>((hash >> 16) & 0xffu) / 255.0f;
             color = {
-                color.x + warm * 0.045f,
-                color.y + (1.0f - warm) * 0.030f,
-                color.z + cool * 0.035f,
+                0.070f + warm * 0.050f,
+                0.145f + (1.0f - warm) * 0.035f,
+                0.175f + cool * 0.040f,
             };
         }
         vertices.push_back({vertex.position, color});
+    }
+    return vertices;
+}
+
+Vec3 ship_forward(const SpaceshipState& ship) {
+    return normalize(ship.forward);
+}
+
+void append_ship_triangle(std::vector<DebugVertex>& vertices, Vec3 a, Vec3 b, Vec3 c, Vec3 color) {
+    vertices.push_back({a, color});
+    vertices.push_back({b, color});
+    vertices.push_back({c, color});
+}
+
+std::vector<DebugVertex> build_spaceship_vertices(const SpaceshipState& ship) {
+    const Vec3 forward = ship_forward(ship);
+    Vec3 visual_up = ship.up - forward * dot(ship.up, forward);
+    if (length(visual_up) <= 0.000001f) {
+        visual_up = {0.0f, 1.0f, 0.0f};
+    }
+    visual_up = normalize(visual_up);
+    const Vec3 right = normalize(cross(forward, visual_up));
+    const Vec3 center = spaceship_position(ship);
+
+    const Vec3 nose = center + forward * 0.080f;
+    const Vec3 tail = center - forward * 0.072f;
+    const Vec3 left = center - forward * 0.030f - right * 0.052f - visual_up * 0.004f;
+    const Vec3 right_wing = center - forward * 0.030f + right * 0.052f - visual_up * 0.004f;
+    const Vec3 top = center + forward * 0.008f + visual_up * 0.034f;
+    const Vec3 keel = center - forward * 0.020f - visual_up * 0.020f;
+
+    std::vector<DebugVertex> vertices;
+    vertices.reserve(18);
+    append_ship_triangle(vertices, nose, left, top, {0.82f, 0.92f, 1.0f});
+    append_ship_triangle(vertices, right_wing, nose, top, {0.46f, 0.76f, 1.0f});
+    append_ship_triangle(vertices, left, tail, top, {0.28f, 0.42f, 0.72f});
+    append_ship_triangle(vertices, tail, right_wing, top, {0.22f, 0.36f, 0.66f});
+    append_ship_triangle(vertices, nose, keel, left, {0.12f, 0.18f, 0.28f});
+    append_ship_triangle(vertices, right_wing, keel, nose, {0.10f, 0.16f, 0.26f});
+    return vertices;
+}
+
+std::vector<DebugVertex> build_spaceship_trail_vertices(const SpaceshipState& ship) {
+    std::vector<DebugVertex> vertices;
+    if (ship.trail.size() < 2) {
+        return vertices;
+    }
+
+    vertices.reserve((ship.trail.size() - 1) * 2);
+    for (uint32_t i = 1; i < ship.trail.size(); ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(ship.trail.size() - 1);
+        const Vec3 color = {0.16f + t * 0.42f, 0.38f + t * 0.42f, 0.58f + t * 0.38f};
+        vertices.push_back({ship.trail[i - 1], color});
+        vertices.push_back({ship.trail[i], color});
     }
     return vertices;
 }
@@ -450,20 +504,13 @@ void DebugRenderer::resize(int width, int height) {
     height_ = height > 0 ? height : 1;
 }
 
-void DebugRenderer::render(const OrbitCamera& camera, const DebugRenderOptions& options, bool show_fps, float fps) {
+void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, const DebugRenderOptions& options, bool show_fps, float fps) {
     glViewport(0, 0, width_, height_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    const float cp = std::cos(camera.pitch);
-    const Vec3 eye = {
-        camera.distance * cp * std::sin(camera.yaw),
-        camera.distance * std::sin(camera.pitch),
-        camera.distance * cp * std::cos(camera.yaw),
-    };
-
     const Mat4 projection = perspective(50.0f * Pi / 180.0f, static_cast<float>(width_) / static_cast<float>(height_), 0.05f, 32.0f);
-    const Mat4 view = look_at(eye, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
-    const Mat4 mvp = projection * view;
+    const Mat4 view_matrix = look_at(view.eye, view.target, view.up);
+    const Mat4 mvp = projection * view_matrix;
 
     glUseProgram(shader_);
     const int mvp_location = glGetUniformLocation(shader_, "u_mvp");
@@ -489,14 +536,6 @@ void DebugRenderer::render(const OrbitCamera& camera, const DebugRenderOptions& 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_triangle_ebo_);
     glDrawElements(GL_TRIANGLES, stitch_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
 
-    if (options.show_mesh_wire) {
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_line_ebo_);
-        glDisableVertexAttribArray(1);
-        glVertexAttrib3f(1, 0.32f, 0.56f, 0.18f);
-        glDrawElements(GL_LINES, stitch_line_index_count_, GL_UNSIGNED_INT, nullptr);
-        glEnableVertexAttribArray(1);
-    }
-
     if (options.show_goldberg_grid) {
         glDepthFunc(GL_LEQUAL);
         glBindVertexArray(grid_ribbon_vao_);
@@ -516,6 +555,31 @@ void DebugRenderer::render(const OrbitCamera& camera, const DebugRenderOptions& 
         glBindVertexArray(point_vao_);
         glDrawArrays(GL_POINTS, 0, point_vertex_count_);
     }
+
+    const std::vector<DebugVertex> trail_vertices = build_spaceship_trail_vertices(ship);
+    if (!trail_vertices.empty()) {
+        glUniform1f(point_size_location, 1.0f);
+        glBindVertexArray(overlay_vao_);
+        glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(trail_vertices.size() * sizeof(DebugVertex)),
+            trail_vertices.data(),
+            GL_DYNAMIC_DRAW
+        );
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(trail_vertices.size()));
+    }
+
+    const std::vector<DebugVertex> ship_vertices = build_spaceship_vertices(ship);
+    glBindVertexArray(overlay_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(ship_vertices.size() * sizeof(DebugVertex)),
+        ship_vertices.data(),
+        GL_DYNAMIC_DRAW
+    );
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(ship_vertices.size()));
 
     glBindVertexArray(0);
     glUseProgram(0);

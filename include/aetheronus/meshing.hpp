@@ -30,14 +30,16 @@ struct MarchingCubesConfig {
     uint32_t global_fracture_seed_copies = 1;
     uint32_t shards_per_hex = 7;
     uint32_t shards_per_pent = 6;
-    float fracture_gap = 0.024f;
-    float fracture_depth = 0.010f;
-    float fracture_edge_guard = 0.0030f;
+    float fracture_gap = 0.014f;
+    float fracture_depth = 0.006f;
+    float fracture_edge_guard = 0.0f;
+    float fracture_boundary_falloff = 0.0f;
+    bool fracture_seams_use_max_lift = false;
     bool enable_fracture_walls = true;
     float fracture_wall_depth = 0.30f;
     uint32_t fracture_wall_material_id = 4;
-    float fracture_chunk_outward_min = 0.030f;
-    float fracture_chunk_outward_max = 0.120f;
+    float fracture_chunk_outward_min = 0.004f;
+    float fracture_chunk_outward_max = 0.024f;
 };
 
 struct QuantizedMeshVertex {

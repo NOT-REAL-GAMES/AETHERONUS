@@ -57,6 +57,11 @@ struct EdgeKey {
     PositionKey b;
 };
 
+struct CorridorPointKey {
+    PositionKey position;
+    uint32_t fracture_chunk_id = 0;
+};
+
 struct CellEdgeKey {
     uint32_t cell_id = 0;
     EdgeKey edge;
@@ -66,6 +71,8 @@ struct BoundaryEdgeRecord {
     uint32_t cell_id = 0;
     Vec3 a;
     Vec3 b;
+    uint32_t material_id = 0;
+    uint32_t fracture_chunk_id = 0;
     uint32_t count = 0;
 };
 
@@ -74,6 +81,8 @@ struct BoundarySegment {
     Vec3 b;
     Vec3 midpoint;
     float sort_value = 0.0f;
+    uint32_t material_id = 0;
+    uint32_t fracture_chunk_id = 0;
 };
 
 struct BoundaryPairKey {
@@ -108,6 +117,8 @@ struct BoundaryPairGeometry {
 struct CorridorPoint {
     Vec3 position;
     float sort_value = 0.0f;
+    uint32_t material_id = 0;
+    uint32_t fracture_chunk_id = 0;
 };
 
 using BoundaryEdgeMap = std::map<CellEdgeKey, BoundaryEdgeRecord>;
@@ -128,6 +139,12 @@ bool operator<(const EdgeKey& lhs, const EdgeKey& rhs) {
     if (lhs.a < rhs.a) return true;
     if (rhs.a < lhs.a) return false;
     return lhs.b < rhs.b;
+}
+
+bool operator<(const CorridorPointKey& lhs, const CorridorPointKey& rhs) {
+    if (lhs.position < rhs.position) return true;
+    if (rhs.position < lhs.position) return false;
+    return lhs.fracture_chunk_id < rhs.fracture_chunk_id;
 }
 
 bool operator<(const CellEdgeKey& lhs, const CellEdgeKey& rhs) {
@@ -387,21 +404,38 @@ BoundaryPairKey boundary_pair_key(uint32_t a, uint32_t b) {
     return {a, b};
 }
 
-void record_triangle_edge(BoundaryEdgeMap& edges, uint32_t cell_id, Vec3 a, Vec3 b) {
+void record_triangle_edge(
+    BoundaryEdgeMap& edges,
+    uint32_t cell_id,
+    Vec3 a,
+    Vec3 b,
+    uint32_t material_id,
+    uint32_t fracture_chunk_id
+) {
     const CellEdgeKey key = {cell_id, edge_key(a, b)};
     BoundaryEdgeRecord& record = edges[key];
     if (record.count == 0) {
         record.cell_id = cell_id;
         record.a = a;
         record.b = b;
+        record.material_id = material_id;
+        record.fracture_chunk_id = fracture_chunk_id;
     }
     ++record.count;
 }
 
-void record_triangle_edges(BoundaryEdgeMap& edges, uint32_t cell_id, Vec3 a, Vec3 b, Vec3 c) {
-    record_triangle_edge(edges, cell_id, a, b);
-    record_triangle_edge(edges, cell_id, b, c);
-    record_triangle_edge(edges, cell_id, c, a);
+void record_triangle_edges(
+    BoundaryEdgeMap& edges,
+    uint32_t cell_id,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    uint32_t material_id,
+    uint32_t fracture_chunk_id
+) {
+    record_triangle_edge(edges, cell_id, a, b, material_id, fracture_chunk_id);
+    record_triangle_edge(edges, cell_id, b, c, material_id, fracture_chunk_id);
+    record_triangle_edge(edges, cell_id, c, a, material_id, fracture_chunk_id);
 }
 
 void emit_mesh_triangle(
@@ -429,7 +463,7 @@ void emit_mesh_triangle(
     mesh.line_indices.push_back(base + 2);
     mesh.line_indices.push_back(base);
     ++mesh.triangle_count;
-    record_triangle_edges(boundary_edges, emitting_cell_id, a, b, c);
+    record_triangle_edges(boundary_edges, emitting_cell_id, a, b, c, material_id, fracture_chunk_id);
 }
 
 bool clip_changed(const std::array<GridSample, 3>& triangle, const std::vector<ClipVertex>& clipped) {
@@ -811,7 +845,7 @@ std::vector<FractureShard> build_fracture_shards(
 
         shards.push_back({
             shard_polygon,
-            polygon_centroid(shard_polygon),
+            seeds[seed_index].local,
             seeds[seed_index].chunk_id,
         });
     }
@@ -830,20 +864,17 @@ FracturedLocalSample fractured_local_sample(
     Vec2 adjusted = local;
     float radius = surface_radius;
     bool is_internal = false;
-    const float boundary_distance = distance_to_polygon_boundary(local, cell_polygon);
-    if (boundary_distance > config.fracture_edge_guard) {
-        const Vec2 to_center = shard_center - local;
-        const float to_center_length = length2(to_center);
-        if (to_center_length > 0.000001f) {
-            adjusted = adjusted + to_center * (std::min(config.fracture_gap, to_center_length * 0.45f) / to_center_length);
-        }
-        const float outward_min = std::max(0.0f, std::min(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
-        const float outward_max = std::max(outward_min, std::max(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
-        const float outward_t = hash_unit(config.fracture_seed ^ (chunk_id * 0x9e3779b9u) ^ 0x68bc21ebu);
-        const float outward_lift = outward_min + (outward_max - outward_min) * outward_t;
-        radius = std::max(0.1f, radius - config.fracture_depth + outward_lift);
+    const Vec2 to_center = shard_center - local;
+    const float to_center_length = length2(to_center);
+    if (to_center_length > 0.000001f) {
+        adjusted = adjusted + to_center * (std::min(config.fracture_gap, to_center_length * 0.45f) / to_center_length);
         is_internal = true;
     }
+    const float outward_min = std::max(0.0f, std::min(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
+    const float outward_max = std::max(outward_min, std::max(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
+    const float outward_t = hash_unit(config.fracture_seed ^ (chunk_id * 0x9e3779b9u) ^ 0x68bc21ebu);
+    const float deterministic_lift = config.fracture_seams_use_max_lift ? outward_max : outward_min + (outward_max - outward_min) * outward_t;
+    radius = std::max(0.1f, radius - config.fracture_depth + deterministic_lift);
 
     return {adjusted, radius, is_internal};
 }
@@ -909,7 +940,8 @@ void emit_fracture_wall_quad(
 }
 
 bool fracture_wall_point_is_internal(Vec2 point, const std::vector<Vec2>& cell_polygon, const MarchingCubesConfig& config) {
-    return distance_to_polygon_boundary(point, cell_polygon) > config.fracture_edge_guard;
+    (void)config;
+    return point_in_convex_polygon(point, cell_polygon) && distance_to_polygon_boundary(point, cell_polygon) > 0.000001f;
 }
 
 Vec2 fracture_wall_guard_crossing(
@@ -979,52 +1011,30 @@ void emit_trimmed_fracture_wall_edge(
     float surface_radius,
     const MarchingCubesConfig& config
 ) {
-    constexpr uint32_t SegmentCount = 24;
-    Vec2 previous = edge_a;
-    bool previous_internal = fracture_wall_point_is_internal(previous, cell_polygon, config);
-    bool has_segment_start = previous_internal;
-    Vec2 segment_start = edge_a;
-
-    for (uint32_t step = 1; step <= SegmentCount; ++step) {
-        const Vec2 current = lerp2(edge_a, edge_b, static_cast<float>(step) / static_cast<float>(SegmentCount));
-        const bool current_internal = fracture_wall_point_is_internal(current, cell_polygon, config);
-
-        if (current_internal && !previous_internal) {
-            segment_start = fracture_wall_guard_crossing(current, previous, cell_polygon, config);
-            has_segment_start = true;
+    constexpr uint32_t SegmentCount = 48;
+    for (uint32_t step = 0; step < SegmentCount; ++step) {
+        Vec2 segment_a = lerp2(edge_a, edge_b, static_cast<float>(step) / static_cast<float>(SegmentCount));
+        Vec2 segment_b = lerp2(edge_a, edge_b, static_cast<float>(step + 1) / static_cast<float>(SegmentCount));
+        const bool a_internal = fracture_wall_point_is_internal(segment_a, cell_polygon, config);
+        const bool b_internal = fracture_wall_point_is_internal(segment_b, cell_polygon, config);
+        if (!a_internal && !b_internal) {
+            continue;
         }
 
-        if (!current_internal && previous_internal && has_segment_start) {
-            const Vec2 segment_end = fracture_wall_guard_crossing(previous, current, cell_polygon, config);
-            if (length2(segment_end - segment_start) > 0.000001f) {
-                emit_fracture_wall_segment(
-                    mesh,
-                    cell_id,
-                    shard,
-                    segment_start,
-                    segment_end,
-                    cell_center,
-                    frame,
-                    cell_polygon,
-                    surface_radius,
-                    config
-                );
-            }
-            has_segment_start = false;
+        if (!a_internal) {
+            segment_a = fracture_wall_guard_crossing(segment_b, segment_a, cell_polygon, config);
+        }
+        if (!b_internal) {
+            segment_b = fracture_wall_guard_crossing(segment_a, segment_b, cell_polygon, config);
         }
 
-        previous = current;
-        previous_internal = current_internal;
-    }
-
-    if (has_segment_start && previous_internal) {
-        if (length2(edge_b - segment_start) > 0.000001f) {
+        if (length2(segment_b - segment_a) > 0.000001f) {
             emit_fracture_wall_segment(
                 mesh,
                 cell_id,
                 shard,
-                segment_start,
-                edge_b,
+                segment_a,
+                segment_b,
                 cell_center,
                 frame,
                 cell_polygon,
@@ -1127,7 +1137,7 @@ void emit_fractured_local_triangle(
             const uint32_t next = (edge + 1) % 3;
             if (distance_to_polygon_boundary(local_points[edge], cell_polygon) <= BoundaryRecordEpsilon &&
                 distance_to_polygon_boundary(local_points[next], cell_polygon) <= BoundaryRecordEpsilon) {
-                record_triangle_edge(boundary_edges, cell_id, world_points[edge], world_points[next]);
+                record_triangle_edge(boundary_edges, cell_id, world_points[edge], world_points[next], material_id, shard.chunk_id);
             }
         }
     }
@@ -1241,14 +1251,21 @@ uint32_t cell_lod_subdivisions(const GoldbergCell& cell, const MarchingCubesConf
     return std::max(1u, lerp_uint32(min_subdivisions, max_subdivisions, t));
 }
 
-void append_stitch_triangle(QuantizedMesh& mesh, Vec3 a, Vec3 b, Vec3 c, uint32_t cell_id) {
+void append_stitch_triangle(
+    QuantizedMesh& mesh,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    uint32_t cell_id,
+    uint32_t material_id = 2u,
+    uint32_t fracture_chunk_id = 0
+) {
     const Vec3 normal = normalize(cross(b - a, c - a));
     const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
-    constexpr uint32_t TransitionMaterial = 2u;
 
-    mesh.vertices.push_back({a, normal, TransitionMaterial, cell_id, 0});
-    mesh.vertices.push_back({b, normal, TransitionMaterial, cell_id, 0});
-    mesh.vertices.push_back({c, normal, TransitionMaterial, cell_id, 0});
+    mesh.vertices.push_back({a, normal, material_id, cell_id, fracture_chunk_id});
+    mesh.vertices.push_back({b, normal, material_id, cell_id, fracture_chunk_id});
+    mesh.vertices.push_back({c, normal, material_id, cell_id, fracture_chunk_id});
 
     mesh.stitch_triangle_indices.push_back(base);
     mesh.stitch_triangle_indices.push_back(base + 1);
@@ -1262,8 +1279,16 @@ void append_stitch_triangle(QuantizedMesh& mesh, Vec3 a, Vec3 b, Vec3 c, uint32_
     ++mesh.stitch_triangle_count;
 }
 
-void append_chain_stitch_triangle(QuantizedMesh& mesh, Vec3 a, Vec3 b, Vec3 c, uint32_t cell_id) {
-    append_stitch_triangle(mesh, a, b, c, cell_id);
+void append_chain_stitch_triangle(
+    QuantizedMesh& mesh,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    uint32_t cell_id,
+    uint32_t material_id = 2u,
+    uint32_t fracture_chunk_id = 0
+) {
+    append_stitch_triangle(mesh, a, b, c, cell_id, material_id, fracture_chunk_id);
     ++mesh.chain_stitch_triangle_count;
 }
 
@@ -1290,11 +1315,6 @@ std::array<uint32_t, 2> shared_goldberg_edge(const GoldbergCell& a, const Goldbe
         return {UINT32_MAX, UINT32_MAX};
     }
     return shared;
-}
-
-Vec3 stitch_side_sample(Vec3 edge_point, Vec3 cell_center, float radius) {
-    constexpr float StripHalfWidth = 0.035f;
-    return normalize(lerp(edge_point, cell_center, StripHalfWidth)) * radius;
 }
 
 float edge_sort_value(Vec3 point, Vec3 edge_start, Vec3 edge_axis) {
@@ -1540,51 +1560,6 @@ bool segment_is_near_shared_boundary(
     return std::fabs(current_dot - neighbor_dot) <= max_bisector_delta;
 }
 
-bool append_ideal_edge_strip(
-    QuantizedMesh& mesh,
-    const GoldbergTopology& topology,
-    const std::vector<PointSample>& points,
-    uint32_t cell_id,
-    uint32_t neighbor_id
-) {
-    constexpr uint32_t SamplesPerEdge = 6;
-
-    const GoldbergCell& cell = topology.cells[cell_id];
-    const GoldbergCell& neighbor = topology.cells[neighbor_id];
-    const std::array<uint32_t, 2> shared_edge = shared_goldberg_edge(cell, neighbor);
-    if (shared_edge[0] == UINT32_MAX || shared_edge[1] == UINT32_MAX) {
-        return false;
-    }
-
-    const Vec3 center_a = topology.cells[cell_id].center;
-    const Vec3 center_b = topology.cells[neighbor_id].center;
-    Vec3 edge_a = topology.vertices[shared_edge[0]].position;
-    Vec3 edge_b = topology.vertices[shared_edge[1]].position;
-    const Vec3 edge_mid = normalize(edge_a + edge_b);
-    const Vec3 center_mid = normalize(center_a + center_b);
-    if (dot(edge_mid, center_mid) < 0.0f) {
-        std::swap(edge_a, edge_b);
-    }
-
-    const float radius = (owned_surface_radius(points, cell_id) + owned_surface_radius(points, neighbor_id)) * 0.5f;
-
-    for (uint32_t i = 0; i + 1 < SamplesPerEdge; ++i) {
-        const float t0 = static_cast<float>(i) / static_cast<float>(SamplesPerEdge - 1);
-        const float t1 = static_cast<float>(i + 1) / static_cast<float>(SamplesPerEdge - 1);
-        const Vec3 edge0 = normalize(lerp(edge_a, edge_b, t0));
-        const Vec3 edge1 = normalize(lerp(edge_a, edge_b, t1));
-        const Vec3 a0 = stitch_side_sample(edge0, center_a, radius);
-        const Vec3 a1 = stitch_side_sample(edge1, center_a, radius);
-        const Vec3 b0 = stitch_side_sample(edge0, center_b, radius);
-        const Vec3 b1 = stitch_side_sample(edge1, center_b, radius);
-
-        append_fallback_stitch_triangle(mesh, a0, b0, a1, cell_id);
-        append_fallback_stitch_triangle(mesh, a1, b0, b1, cell_id);
-    }
-
-    return true;
-}
-
 BoundaryPairMap build_boundary_pair_chains(
     QuantizedMesh& mesh,
     const GoldbergTopology& topology,
@@ -1628,7 +1603,7 @@ BoundaryPairMap build_boundary_pair_chains(
         }
 
         const BoundaryPairKey pair_key = boundary_pair_key(record.cell_id, accepted_neighbor);
-        BoundarySegment segment = {record.a, record.b, midpoint, 0.0f};
+        BoundarySegment segment = {record.a, record.b, midpoint, 0.0f, record.material_id, record.fracture_chunk_id};
         BoundaryPairChains& chains = pairs[pair_key];
         if (record.cell_id == pair_key.a) {
             chains.a_segments.push_back(segment);
@@ -1672,7 +1647,7 @@ std::vector<CorridorPoint> collect_corridor_points(
     const BoundaryPairGeometry& geometry,
     float radius
 ) {
-    std::map<PositionKey, CorridorPoint> unique_points;
+    std::map<CorridorPointKey, CorridorPoint> unique_points;
     for (const BoundarySegment& segment : segments) {
         const std::array<Vec3, 2> endpoints = {{
             normalize(segment.a) * radius,
@@ -1690,7 +1665,12 @@ std::vector<CorridorPoint> collect_corridor_points(
                 continue;
             }
 
-            unique_points[position_key(endpoint)] = {endpoint, sort_value};
+            unique_points[{position_key(endpoint), segment.fracture_chunk_id}] = {
+                endpoint,
+                sort_value,
+                segment.material_id,
+                segment.fracture_chunk_id,
+            };
         }
     }
 
@@ -1719,6 +1699,8 @@ bool append_greedy_corridor_stitches(
         Vec3 a;
         Vec3 b;
         float sort_value = 0.0f;
+        uint32_t material_id = 0;
+        uint32_t fracture_chunk_id = 0;
     };
 
     std::vector<Pair> pairs;
@@ -1736,6 +1718,9 @@ bool append_greedy_corridor_stitches(
         float best_score = 1000000.0f;
         for (uint32_t b_index = b_start; b_index < side_b.size(); ++b_index) {
             const CorridorPoint& b = side_b[b_index];
+            if (a.fracture_chunk_id != b.fracture_chunk_id) {
+                continue;
+            }
             const float sort_delta = std::fabs(a.sort_value - b.sort_value);
             if (sort_delta > max_sort_delta) {
                 if (b.sort_value > a.sort_value) {
@@ -1765,6 +1750,8 @@ bool append_greedy_corridor_stitches(
             normalize(a.position) * radius,
             normalize(side_b[best_b].position) * radius,
             (a.sort_value + side_b[best_b].sort_value) * 0.5f,
+            a.material_id,
+            a.fracture_chunk_id,
         });
         b_start = best_b + 1;
     }
@@ -1774,7 +1761,8 @@ bool append_greedy_corridor_stitches(
     }
 
     const float max_path_step = std::max(geometry.edge_length * 0.30f, 0.040f);
-    const float max_triangle_edge = std::max(geometry.edge_length * 0.46f, 0.060f);
+    const float max_triangle_edge = std::max(geometry.edge_length * 0.48f, 0.065f);
+    const float max_bridge_cross_gap = std::max(geometry.edge_length * 0.42f, 0.055f);
     bool emitted = false;
 
     for (uint32_t i = 0; i + 1 < pairs.size(); ++i) {
@@ -1783,21 +1771,30 @@ bool append_greedy_corridor_stitches(
         const Vec3 b0 = pairs[i].b;
         const Vec3 b1 = pairs[i + 1].b;
 
+        if (pairs[i].fracture_chunk_id != pairs[i + 1].fracture_chunk_id) {
+            continue;
+        }
+
         const bool path_ok =
             length(a0 - a1) <= max_path_step &&
             length(b0 - b1) <= max_path_step &&
             pairs[i + 1].sort_value >= pairs[i].sort_value;
-        const bool edges_ok =
+        const bool cross_ok =
+            length(a0 - b0) <= max_bridge_cross_gap &&
+            length(a1 - b1) <= max_bridge_cross_gap;
+        const bool diagonals_ok =
             length(a1 - b0) <= max_triangle_edge &&
             length(a0 - b1) <= max_triangle_edge;
 
-        if (!path_ok || !edges_ok) {
+        if (!path_ok || !cross_ok || !diagonals_ok) {
             ++mesh.rejected_greedy_jump_count;
             continue;
         }
 
-        append_chain_stitch_triangle(mesh, normalize(a0) * radius, normalize(b0) * radius, normalize(a1) * radius, cell_id);
-        append_chain_stitch_triangle(mesh, normalize(a1) * radius, normalize(b0) * radius, normalize(b1) * radius, cell_id);
+        const uint32_t material_id = pairs[i].material_id;
+        const uint32_t fracture_chunk_id = pairs[i].fracture_chunk_id;
+        append_chain_stitch_triangle(mesh, normalize(a0) * radius, normalize(b0) * radius, normalize(a1) * radius, cell_id, material_id, fracture_chunk_id);
+        append_chain_stitch_triangle(mesh, normalize(a1) * radius, normalize(b0) * radius, normalize(b1) * radius, cell_id, material_id, fracture_chunk_id);
         ++mesh.greedy_path_step_count;
         emitted = true;
     }
@@ -1829,10 +1826,14 @@ void append_chain_stitches_for_pair(
     ++mesh.shared_edge_path_count;
     ++mesh.boundary_run_count;
     ++mesh.paired_boundary_run_count;
-    if (!append_greedy_corridor_stitches(mesh, side_a, side_b, geometry, pair_key.a, radius)) {
-        ++mesh.rejected_stitch_run_count;
-        ++mesh.unstitched_gap_count;
-    }
+    append_greedy_corridor_stitches(
+        mesh,
+        side_a,
+        side_b,
+        geometry,
+        pair_key.a,
+        radius
+    );
 }
 
 void build_transition_stitches(
@@ -1860,6 +1861,7 @@ void build_transition_stitches(
             append_chain_stitches_for_pair(mesh, topology, points, pair_key, found->second);
         }
     }
+
 }
 
 void polygonize_cube(

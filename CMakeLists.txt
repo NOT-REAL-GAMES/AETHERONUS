@@ -26,6 +26,7 @@ add_executable(AETHERONUS
     src/math.cpp
     src/meshing.cpp
     src/point_cloud.cpp
+    src/spaceship.cpp
     src/topology.cpp
     glad/src/glad.c
 )
