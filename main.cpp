@@ -13,13 +13,20 @@
 #include <cmath>
 #include <future>
 #include <iostream>
+#include <limits>
+#include <utility>
 #include <vector>
 
 namespace {
 
-constexpr uint32_t DefaultSvoDepth = 8;
-constexpr uint32_t ScreamSvoDepth = 13;
+constexpr uint32_t DefaultSvoDepth = 15;
+constexpr uint32_t LowSvoDepth = 8;
 constexpr uint32_t SvoDebugDrawDepth = 8;
+
+enum class MeshBuildMode {
+    Full,
+    VoxelsOnly,
+};
 
 void print_gl_string(GLenum name, const char* label) {
     const GLubyte* value = glGetString(name);
@@ -89,13 +96,122 @@ bool ray_sphere_intersection(ae::Vec3 origin, ae::Vec3 direction, float radius, 
     return true;
 }
 
+bool ray_triangle_intersection(
+    ae::Vec3 origin,
+    ae::Vec3 direction,
+    ae::Vec3 a,
+    ae::Vec3 b,
+    ae::Vec3 c,
+    float& t
+) {
+    constexpr float Epsilon = 0.0000001f;
+    const ae::Vec3 edge_ab = b - a;
+    const ae::Vec3 edge_ac = c - a;
+    const ae::Vec3 p = ae::cross(direction, edge_ac);
+    const float determinant = ae::dot(edge_ab, p);
+    if (std::fabs(determinant) < Epsilon) {
+        return false;
+    }
+
+    const float inverse_determinant = 1.0f / determinant;
+    const ae::Vec3 s = origin - a;
+    const float u = inverse_determinant * ae::dot(s, p);
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+
+    const ae::Vec3 q = ae::cross(s, edge_ab);
+    const float v = inverse_determinant * ae::dot(direction, q);
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+
+    t = inverse_determinant * ae::dot(edge_ac, q);
+    return t > Epsilon;
+}
+
+bool ray_surface_net_intersection(
+    const ae::SurfaceNetMesh& surface_net,
+    ae::Vec3 origin_mesh,
+    ae::Vec3 direction,
+    ae::Vec3& hit_mesh
+) {
+    if (surface_net.vertices.empty() || surface_net.triangle_indices.empty()) {
+        return false;
+    }
+
+    direction = ae::normalize(direction);
+    bool found = false;
+    float closest_t = std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i + 2 < surface_net.triangle_indices.size(); i += 3) {
+        const uint32_t ia = surface_net.triangle_indices[i];
+        const uint32_t ib = surface_net.triangle_indices[i + 1u];
+        const uint32_t ic = surface_net.triangle_indices[i + 2u];
+        if (ia >= surface_net.vertices.size() || ib >= surface_net.vertices.size() || ic >= surface_net.vertices.size()) {
+            continue;
+        }
+
+        float t = 0.0f;
+        if (ray_triangle_intersection(
+                origin_mesh,
+                direction,
+                surface_net.vertices[ia],
+                surface_net.vertices[ib],
+                surface_net.vertices[ic],
+                t
+            ) && t < closest_t) {
+            closest_t = t;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    hit_mesh = origin_mesh + direction * closest_t;
+    return true;
+}
+
 struct MeshBuildResult {
     ae::QuantizedMesh mesh;
     ae::QuantizedMeshValidation validation;
     ae::Vec3 camera_position;
     ae::Vec3 lod_focus;
     uint32_t revision = 0;
+    MeshBuildMode mode = MeshBuildMode::Full;
 };
+
+ae::QuantizedMesh make_voxel_rebuild_source(const ae::QuantizedMesh& mesh) {
+    ae::QuantizedMesh result;
+    result.vertices = mesh.vertices;
+    result.triangle_indices = mesh.triangle_indices;
+    result.line_indices = mesh.line_indices;
+    result.stitch_triangle_indices = mesh.stitch_triangle_indices;
+    result.stitch_line_indices = mesh.stitch_line_indices;
+    result.surface_net_base_cache = mesh.surface_net_base_cache;
+    result.voxel_occupancy_cache = mesh.voxel_occupancy_cache;
+    result.triangle_count = mesh.triangle_count;
+    result.rejected_triangle_count = mesh.rejected_triangle_count;
+    result.stitch_triangle_count = mesh.stitch_triangle_count;
+    result.boundary_edge_count = mesh.boundary_edge_count;
+    result.chain_stitch_triangle_count = mesh.chain_stitch_triangle_count;
+    result.fallback_stitch_triangle_count = mesh.fallback_stitch_triangle_count;
+    result.boundary_run_count = mesh.boundary_run_count;
+    result.paired_boundary_run_count = mesh.paired_boundary_run_count;
+    result.rejected_stitch_run_count = mesh.rejected_stitch_run_count;
+    result.unstitched_gap_count = mesh.unstitched_gap_count;
+    result.clipped_triangle_count = mesh.clipped_triangle_count;
+    result.discarded_clipped_triangle_count = mesh.discarded_clipped_triangle_count;
+    result.shared_edge_path_count = mesh.shared_edge_path_count;
+    result.greedy_path_step_count = mesh.greedy_path_step_count;
+    result.rejected_greedy_jump_count = mesh.rejected_greedy_jump_count;
+    result.cell_count = mesh.cell_count;
+    result.min_cell_subdivisions = mesh.min_cell_subdivisions;
+    result.max_cell_subdivisions = mesh.max_cell_subdivisions;
+    result.lod_level_count = mesh.lod_level_count;
+    return result;
+}
 
 MeshBuildResult build_lod_mesh_async(
     const ae::GoldbergTopology& topology,
@@ -107,7 +223,23 @@ MeshBuildResult build_lod_mesh_async(
     result.camera_position = config.lod_camera_position;
     result.lod_focus = ae::normalize(config.lod_camera_position);
     result.revision = revision;
+    result.mode = MeshBuildMode::Full;
     result.mesh = ae::build_quantized_marching_cubes(topology, points, config);
+    result.validation = ae::validate_quantized_mesh(result.mesh);
+    return result;
+}
+
+MeshBuildResult build_voxel_mesh_async(
+    ae::QuantizedMesh mesh,
+    ae::MarchingCubesConfig config,
+    uint32_t revision
+) {
+    MeshBuildResult result;
+    result.camera_position = config.lod_camera_position;
+    result.lod_focus = ae::normalize(config.lod_camera_position);
+    result.revision = revision;
+    result.mode = MeshBuildMode::VoxelsOnly;
+    result.mesh = ae::rebuild_quantized_mesh_voxels(std::move(mesh), config);
     result.validation = ae::validate_quantized_mesh(result.mesh);
     return result;
 }
@@ -221,12 +353,14 @@ int main() {
         return 1;
     }
 
+    ae::QuantizedMesh current_mesh = mesh;
     ae::Vec3 last_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
     ae::Vec3 requested_mesh_lod_focus = last_mesh_lod_focus;
     ae::Vec3 requested_mesh_camera_position = mesh_config.lod_camera_position;
     uint32_t mesh_revision = 1;
     uint32_t requested_mesh_revision = mesh_revision;
     std::future<MeshBuildResult> pending_mesh_build;
+    MeshBuildMode requested_mesh_build_mode = MeshBuildMode::Full;
     bool mesh_build_pending = false;
     bool mesh_rebuild_requested = false;
     bool show_fps = false;
@@ -239,10 +373,20 @@ int main() {
     uint64_t last_update_time = fps_update_start;
     constexpr float LodRebuildDistance = 0.12f;
     constexpr std::chrono::milliseconds NoWait{0};
-    auto request_mesh_rebuild = [&]() {
+    auto request_full_mesh_rebuild = [&]() {
         requested_mesh_revision = ++mesh_revision;
         requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
         requested_mesh_camera_position = mesh_config.lod_camera_position;
+        requested_mesh_build_mode = MeshBuildMode::Full;
+        mesh_rebuild_requested = true;
+    };
+    auto request_voxel_mesh_rebuild = [&]() {
+        requested_mesh_revision = ++mesh_revision;
+        requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
+        requested_mesh_camera_position = mesh_config.lod_camera_position;
+        if (!mesh_rebuild_requested || requested_mesh_build_mode != MeshBuildMode::Full) {
+            requested_mesh_build_mode = MeshBuildMode::VoxelsOnly;
+        }
         mesh_rebuild_requested = true;
     };
 
@@ -262,10 +406,7 @@ int main() {
                     mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        requested_mesh_lod_focus = new_lod_focus;
-                        requested_mesh_camera_position = mesh_config.lod_camera_position;
-                        requested_mesh_revision = ++mesh_revision;
-                        mesh_rebuild_requested = true;
+                        request_full_mesh_rebuild();
                     }
                 } else if (event.key.key == SDLK_F3) {
                     show_fps = !show_fps;
@@ -285,10 +426,9 @@ int main() {
                     render_options.show_surface_net = !render_options.show_surface_net;
                     std::cout << "Surface nets " << (render_options.show_surface_net ? "shown" : "hidden") << std::endl;
                 } else if (event.key.key == SDLK_F11) {
-                    const bool enable_scream_mode = mesh_config.svo_depth < ScreamSvoDepth;
-                    mesh_config.svo_depth = enable_scream_mode ? ScreamSvoDepth : DefaultSvoDepth;
+                    mesh_config.svo_depth = mesh_config.svo_depth >= DefaultSvoDepth ? LowSvoDepth : DefaultSvoDepth;
                     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
-                    request_mesh_rebuild();
+                    request_voxel_mesh_rebuild();
                     std::cout << "SVO depth " << mesh_config.svo_depth
                               << " rebuild requested (debug draw depth " << mesh_config.svo_debug_draw_depth
                               << ")" << std::endl;
@@ -310,34 +450,47 @@ int main() {
                     std::cout << "Ship follow camera " << (render_options.follow_ship ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F4) {
                     mesh_config.enable_fractures = !mesh_config.enable_fractures;
-                    request_mesh_rebuild();
+                    request_full_mesh_rebuild();
                     std::cout << "Fractures " << (mesh_config.enable_fractures ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F5) {
                     ++mesh_config.fracture_seed;
                     mesh_config.enable_fractures = true;
-                    request_mesh_rebuild();
+                    request_full_mesh_rebuild();
                     std::cout << "Fracture seed " << mesh_config.fracture_seed << std::endl;
                 } else if (event.key.key == SDLK_F13) {
                     voxel_edits.digs.clear();
                     mesh_config.voxel_edits = voxel_edits;
-                    request_mesh_rebuild();
+                    request_voxel_mesh_rebuild();
                     std::cout << "Cleared dig edits; rebuild requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
                 const ae::CameraView dig_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
+                const ae::Vec3 dig_direction = ae::normalize(dig_view.target - dig_view.eye);
+                ae::Vec3 hit_mesh = {};
+                const bool hit_surface_net = ray_surface_net_intersection(
+                    current_mesh.surface_net,
+                    dig_view.eye / ae::PlanetRadiusKilometers,
+                    dig_direction,
+                    hit_mesh
+                );
                 ae::Vec3 hit_km = {};
-                if (ray_sphere_intersection(dig_view.eye, dig_view.target - dig_view.eye, ae::PlanetRadiusKilometers, hit_km)) {
+                const bool hit_planet = hit_surface_net ||
+                    ray_sphere_intersection(dig_view.eye, dig_direction, ae::PlanetRadiusKilometers, hit_km);
+                if (hit_planet) {
+                    if (!hit_surface_net) {
+                        hit_mesh = hit_km / ae::PlanetRadiusKilometers;
+                    }
                     voxel_edits.digs.push_back({
-                        hit_km / ae::PlanetRadiusKilometers,
+                        hit_mesh,
                         8.0f,
                         voxel_edits.local_depth,
                     });
                     mesh_config.voxel_edits = voxel_edits;
                     mesh_config.lod_camera_position = dig_view.eye;
-                    request_mesh_rebuild();
+                    request_voxel_mesh_rebuild();
                     std::cout << "Dig edit " << voxel_edits.digs.size()
                               << ": radius 8 km, local depth " << voxel_edits.local_depth
-                              << " rebuild requested" << std::endl;
+                              << " voxel rebuild requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_MOTION && render_options.follow_ship) {
                 ship_mouse_yaw += static_cast<float>(event.motion.xrel);
@@ -348,10 +501,7 @@ int main() {
                 mesh_config.lod_camera_position = free_camera_eye(camera);
                 const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                 if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                    requested_mesh_lod_focus = new_lod_focus;
-                    requested_mesh_camera_position = mesh_config.lod_camera_position;
-                    requested_mesh_revision = ++mesh_revision;
-                    mesh_rebuild_requested = true;
+                    request_full_mesh_rebuild();
                 }
             } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
                 camera.distance = std::clamp(
@@ -394,10 +544,7 @@ int main() {
                     mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        requested_mesh_lod_focus = new_lod_focus;
-                        requested_mesh_camera_position = mesh_config.lod_camera_position;
-                        requested_mesh_revision = ++mesh_revision;
-                        mesh_rebuild_requested = true;
+                        request_full_mesh_rebuild();
                     }
                 }
             }
@@ -407,19 +554,18 @@ int main() {
         mesh_config.lod_camera_position = camera_view.eye;
         const ae::Vec3 frame_lod_focus = ae::normalize(mesh_config.lod_camera_position);
         if (ae::length(frame_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-            requested_mesh_lod_focus = frame_lod_focus;
-            requested_mesh_camera_position = mesh_config.lod_camera_position;
-            requested_mesh_revision = ++mesh_revision;
-            mesh_rebuild_requested = true;
+            request_full_mesh_rebuild();
         }
 
         if (mesh_build_pending && pending_mesh_build.wait_for(NoWait) == std::future_status::ready) {
             MeshBuildResult result = pending_mesh_build.get();
             mesh_build_pending = false;
             if (result.validation.ok) {
+                current_mesh = result.mesh;
                 renderer.update_mesh(result.mesh);
                 last_mesh_lod_focus = result.lod_focus;
-                std::cout << "Mesh rebuild OK: " << result.validation.message << std::endl;
+                std::cout << (result.mode == MeshBuildMode::VoxelsOnly ? "Voxel rebuild OK: " : "Mesh rebuild OK: ")
+                          << result.validation.message << std::endl;
             } else {
                 std::cerr << result.validation.message << std::endl;
                 last_mesh_lod_focus = result.lod_focus;
@@ -430,15 +576,28 @@ int main() {
             ae::MarchingCubesConfig async_config = mesh_config;
             async_config.lod_camera_position = requested_mesh_camera_position;
             const uint32_t async_revision = requested_mesh_revision;
+            const MeshBuildMode async_mode = requested_mesh_build_mode;
             mesh_rebuild_requested = false;
-            pending_mesh_build = std::async(
-                std::launch::async,
-                build_lod_mesh_async,
-                std::cref(topology),
-                std::cref(points),
-                async_config,
-                async_revision
-            );
+            requested_mesh_build_mode = MeshBuildMode::Full;
+            if (async_mode == MeshBuildMode::VoxelsOnly) {
+                ae::QuantizedMesh voxel_base_mesh = make_voxel_rebuild_source(current_mesh);
+                pending_mesh_build = std::async(
+                    std::launch::async,
+                    build_voxel_mesh_async,
+                    std::move(voxel_base_mesh),
+                    async_config,
+                    async_revision
+                );
+            } else {
+                pending_mesh_build = std::async(
+                    std::launch::async,
+                    build_lod_mesh_async,
+                    std::cref(topology),
+                    std::cref(points),
+                    async_config,
+                    async_revision
+                );
+            }
             mesh_build_pending = true;
         }
 

@@ -135,12 +135,6 @@ struct JunctionCapPoint {
     float angle = 0.0f;
 };
 
-struct VoxelKey {
-    uint32_t x = 0;
-    uint32_t y = 0;
-    uint32_t z = 0;
-};
-
 struct SurfaceNetEdgeKey {
     uint32_t x = 0;
     uint32_t y = 0;
@@ -150,14 +144,24 @@ struct SurfaceNetEdgeKey {
 
 struct PreparedVoxelDig {
     Vec3 center_mesh;
+    float radius_mesh = 0.0f;
     float radius_with_leaf_mesh = 0.0f;
 };
 
 struct LocalSurfaceNetPatch {
     Vec3 center_mesh;
+    float dig_radius_mesh = 0.0f;
     float suppress_radius_mesh = 0.0f;
     float extraction_radius_mesh = 0.0f;
-    uint32_t depth = 13;
+    uint32_t depth = 15;
+};
+
+struct LocalSurfaceNetGrid {
+    uint32_t depth = 15;
+    uint32_t resolution = 4;
+    float voxel_size = 0.0f;
+    float radius = 0.0f;
+    Vec3 origin;
 };
 
 using BoundaryEdgeMap = std::vector<BoundaryEdgeRecord>;
@@ -200,31 +204,6 @@ bool operator<(const BoundaryPairKey& lhs, const BoundaryPairKey& rhs) {
     return lhs.b < rhs.b;
 }
 
-uint64_t voxel_morton_code(VoxelKey key) {
-    uint64_t code = 0;
-    for (uint32_t bit = 0; bit < 21; ++bit) {
-        code |= (static_cast<uint64_t>((key.z >> bit) & 1u) << (bit * 3u));
-        code |= (static_cast<uint64_t>((key.y >> bit) & 1u) << (bit * 3u + 1u));
-        code |= (static_cast<uint64_t>((key.x >> bit) & 1u) << (bit * 3u + 2u));
-    }
-    return code;
-}
-
-bool operator<(const VoxelKey& lhs, const VoxelKey& rhs) {
-    const uint64_t lhs_code = voxel_morton_code(lhs);
-    const uint64_t rhs_code = voxel_morton_code(rhs);
-    if (lhs_code != rhs_code) {
-        return lhs_code < rhs_code;
-    }
-    if (lhs.x != rhs.x) return lhs.x < rhs.x;
-    if (lhs.y != rhs.y) return lhs.y < rhs.y;
-    return lhs.z < rhs.z;
-}
-
-bool operator==(const VoxelKey& lhs, const VoxelKey& rhs) {
-    return lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
-}
-
 bool operator<(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
     if (lhs.axis != rhs.axis) return lhs.axis < rhs.axis;
     if (lhs.x != rhs.x) return lhs.x < rhs.x;
@@ -234,6 +213,10 @@ bool operator<(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
 
 bool operator==(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
     return lhs.axis == rhs.axis && lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
+}
+
+bool contains_voxel_key(const std::vector<VoxelKey>& sorted_keys, VoxelKey key) {
+    return std::binary_search(sorted_keys.begin(), sorted_keys.end(), key);
 }
 
 Frame build_frame(Vec3 normal) {
@@ -2375,7 +2358,25 @@ std::vector<PreparedVoxelDig> prepare_voxel_digs(const VoxelEditSet& edits, floa
         const float radius_mesh = kilometers_to_world_units(dig.radius_km);
         prepared.push_back({
             dig.center_mesh,
+            radius_mesh,
             radius_mesh + leaf_radius,
+        });
+    }
+    return prepared;
+}
+
+std::vector<PreparedVoxelDig> prepare_exact_voxel_digs(const VoxelEditSet& edits) {
+    std::vector<PreparedVoxelDig> prepared;
+    prepared.reserve(edits.digs.size());
+    for (const VoxelDigEdit& dig : edits.digs) {
+        if (dig.radius_km <= 0.0f) {
+            continue;
+        }
+        const float radius_mesh = kilometers_to_world_units(dig.radius_km);
+        prepared.push_back({
+            dig.center_mesh,
+            radius_mesh,
+            radius_mesh,
         });
     }
     return prepared;
@@ -2406,6 +2407,42 @@ uint32_t apply_voxel_dig_edits(
                 for (const PreparedVoxelDig& dig : digs) {
                     const float distance_to_dig = length(center - dig.center_mesh);
                     if (distance_to_dig <= dig.radius_with_leaf_mesh) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        ),
+        keys.end()
+    );
+
+    return static_cast<uint32_t>(original_size - keys.size());
+}
+
+uint32_t apply_exact_voxel_dig_edits(
+    std::vector<VoxelKey>& keys,
+    float grid_radius,
+    float voxel_size,
+    const VoxelEditSet& edits
+) {
+    if (keys.empty() || edits.digs.empty()) {
+        return 0;
+    }
+
+    const std::vector<PreparedVoxelDig> digs = prepare_exact_voxel_digs(edits);
+    if (digs.empty()) {
+        return 0;
+    }
+
+    const size_t original_size = keys.size();
+    keys.erase(
+        std::remove_if(
+            keys.begin(),
+            keys.end(),
+            [&](VoxelKey key) {
+                const Vec3 center = voxel_center_from_key(key, grid_radius, voxel_size);
+                for (const PreparedVoxelDig& dig : digs) {
+                    if (length(center - dig.center_mesh) <= dig.radius_mesh) {
                         return true;
                     }
                 }
@@ -2450,8 +2487,8 @@ void add_voxelized_triangles(
         const Vec3 b = mesh.vertices[indices[i + 1]].position;
         const Vec3 c = mesh.vertices[indices[i + 2]].position;
         const float longest_edge = std::max(length(b - a), std::max(length(c - b), length(a - c)));
-        const float sample_spacing = std::max(voxel_size * 2.0f, 0.0001f);
-        const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(longest_edge / sample_spacing)), 1u, 10u);
+        const float sample_spacing = std::max(voxel_size * 2.0f, 0.000001f);
+        const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(longest_edge / sample_spacing)), 1u, 256u);
         for (uint32_t u_step = 0; u_step <= steps; ++u_step) {
             for (uint32_t v_step = 0; v_step + u_step <= steps; ++v_step) {
                 const float u = static_cast<float>(u_step) / static_cast<float>(steps);
@@ -2514,33 +2551,39 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
         return patches;
     }
 
-    const float suppress_radius = kilometers_to_world_units(std::max(0.0f, config.local_surface_net_patch_radius_km));
     const float overlap = kilometers_to_world_units(std::max(0.0f, config.local_surface_net_patch_overlap_km));
-    if (suppress_radius <= 0.0f) {
-        return patches;
-    }
-
-    const float extraction_radius = suppress_radius + overlap;
-    const uint32_t depth = std::clamp(config.local_surface_net_depth, 1u, 13u);
-    auto add_patch = [&](Vec3 center) {
+    const uint32_t fallback_depth = std::clamp(
+        config.local_surface_net_depth > 0u ? config.local_surface_net_depth : config.voxel_edits.local_depth,
+        1u,
+        15u
+    );
+    auto add_patch = [&](Vec3 center, float dig_radius_mesh, uint32_t requested_depth) {
         if (patches.size() >= config.local_surface_net_max_patches || length(center) <= 0.000001f) {
             return;
         }
-        center = normalize(center);
+        const float minimum_radius = kilometers_to_world_units(4.0f);
+        const float surface_pad = kilometers_to_world_units(1.5f);
+        const float suppress_radius = std::max(dig_radius_mesh + surface_pad, minimum_radius);
+        const float detail_radius = std::max(
+            kilometers_to_world_units(config.local_surface_net_patch_radius_km),
+            dig_radius_mesh + std::max(overlap, kilometers_to_world_units(48.0f))
+        );
+        const float extraction_radius = std::max(suppress_radius, detail_radius);
+        const uint32_t depth = std::clamp(requested_depth > 0u ? requested_depth : fallback_depth, 1u, 15u);
         for (const LocalSurfaceNetPatch& patch : patches) {
             if (length(patch.center_mesh - center) < suppress_radius * 0.5f) {
                 return;
             }
         }
-        patches.push_back({center, suppress_radius, extraction_radius, depth});
+        patches.push_back({center, dig_radius_mesh, suppress_radius, extraction_radius, depth});
     };
-
-    add_patch(config.lod_camera_position);
 
     struct DigCandidate {
         Vec3 center;
+        float radius_mesh = 0.0f;
         float distance_to_camera = 0.0f;
         uint32_t newest_rank = 0;
+        uint32_t depth = 15;
     };
 
     const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
@@ -2553,10 +2596,16 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
         if (length(dig.center_mesh) <= 0.000001f) {
             continue;
         }
+        const float radius_mesh = kilometers_to_world_units(dig.radius_km);
+        if (radius_mesh <= 0.0f) {
+            continue;
+        }
         dig_candidates.push_back({
-            normalize(dig.center_mesh),
+            dig.center_mesh,
+            radius_mesh,
             length(normalize(dig.center_mesh) - camera_center),
             static_cast<uint32_t>(config.voxel_edits.digs.size() - i),
+            std::clamp(dig.depth > 0u ? dig.depth : fallback_depth, 1u, 15u),
         });
     }
     std::sort(
@@ -2570,7 +2619,7 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
         }
     );
     for (const DigCandidate& dig : dig_candidates) {
-        add_patch(dig.center);
+        add_patch(dig.center, dig.radius_mesh, dig.depth);
     }
 
     return patches;
@@ -2578,7 +2627,8 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
 
 bool surface_net_key_in_patch(Vec3 center, float leaf_radius, const std::vector<LocalSurfaceNetPatch>& patches) {
     for (const LocalSurfaceNetPatch& patch : patches) {
-        if (length(center - patch.center_mesh) <= patch.suppress_radius_mesh + leaf_radius) {
+        const float edge_pad = std::min(leaf_radius, patch.suppress_radius_mesh * 0.25f);
+        if (length(center - patch.center_mesh) <= patch.suppress_radius_mesh + edge_pad) {
             return true;
         }
     }
@@ -2638,6 +2688,18 @@ int32_t surface_net_cube_vertex(
     return cube_vertices[surface_net_cube_index(x, y, z, cube_resolution)];
 }
 
+int32_t surface_net_sparse_cube_vertex(
+    const std::vector<VoxelKey>& cube_keys,
+    const std::vector<int32_t>& cube_vertices,
+    VoxelKey key
+) {
+    const auto found = std::lower_bound(cube_keys.begin(), cube_keys.end(), key);
+    if (found == cube_keys.end() || !(*found == key)) {
+        return -1;
+    }
+    return cube_vertices[static_cast<size_t>(found - cube_keys.begin())];
+}
+
 void append_surface_net_quad(
     SurfaceNetMesh& surface_net,
     int32_t a,
@@ -2656,6 +2718,170 @@ void append_surface_net_quad(
     surface_net.triangle_indices.push_back(static_cast<uint32_t>(d));
 }
 
+SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
+    std::vector<VoxelKey> occupied_keys,
+    uint32_t source_depth,
+    uint32_t target_depth,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    SurfaceNetMesh surface_net;
+    if (!config.enable_surface_net_generation || occupied_keys.empty()) {
+        return surface_net;
+    }
+
+    const uint32_t resolution = 1u << target_depth;
+    const uint32_t cube_resolution = resolution - 1u;
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    if (source_depth != target_depth) {
+        occupied_keys = coarsen_surface_net_keys(occupied_keys, source_depth, target_depth);
+    }
+
+    std::vector<VoxelKey> cube_candidates;
+    cube_candidates.reserve(std::min<size_t>(occupied_keys.size() * 8u, static_cast<size_t>(max_vertices) * 2u));
+    std::vector<SurfaceNetEdgeKey> edge_candidates;
+    edge_candidates.reserve(occupied_keys.size() * 6u);
+    for (VoxelKey key : occupied_keys) {
+        if (key.x >= resolution || key.y >= resolution || key.z >= resolution) {
+            continue;
+        }
+        for (uint32_t dz = 0; dz < 2; ++dz) {
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    if ((dx == 1u && key.x == 0u) || (dy == 1u && key.y == 0u) || (dz == 1u && key.z == 0u)) {
+                        continue;
+                    }
+                    const VoxelKey cube = {key.x - dx, key.y - dy, key.z - dz};
+                    if (cube.x < cube_resolution && cube.y < cube_resolution && cube.z < cube_resolution) {
+                        cube_candidates.push_back(cube);
+                    }
+                }
+            }
+        }
+
+        auto neighbor_occupied = [&](uint32_t x, uint32_t y, uint32_t z) {
+            return contains_voxel_key(occupied_keys, {x, y, z});
+        };
+        if (key.x > 0u && !neighbor_occupied(key.x - 1u, key.y, key.z)) edge_candidates.push_back({key.x - 1u, key.y, key.z, 0u});
+        if (key.x + 1u < resolution && !neighbor_occupied(key.x + 1u, key.y, key.z)) edge_candidates.push_back({key.x, key.y, key.z, 0u});
+        if (key.y > 0u && !neighbor_occupied(key.x, key.y - 1u, key.z)) edge_candidates.push_back({key.x, key.y - 1u, key.z, 1u});
+        if (key.y + 1u < resolution && !neighbor_occupied(key.x, key.y + 1u, key.z)) edge_candidates.push_back({key.x, key.y, key.z, 1u});
+        if (key.z > 0u && !neighbor_occupied(key.x, key.y, key.z - 1u)) edge_candidates.push_back({key.x, key.y, key.z - 1u, 2u});
+        if (key.z + 1u < resolution && !neighbor_occupied(key.x, key.y, key.z + 1u)) edge_candidates.push_back({key.x, key.y, key.z, 2u});
+    }
+
+    std::sort(cube_candidates.begin(), cube_candidates.end());
+    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
+    std::sort(edge_candidates.begin(), edge_candidates.end());
+    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+
+    std::vector<int32_t> cube_vertices(cube_candidates.size(), -1);
+    surface_net.source_depth = target_depth;
+    surface_net.bounds_radius = grid_radius;
+    surface_net.occupied_voxel_count = static_cast<uint32_t>(occupied_keys.size());
+    surface_net.candidate_cube_count = static_cast<uint32_t>(cube_candidates.size());
+    surface_net.material_id = config.surface_net_material_id;
+    surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
+    surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
+    surface_net.normals.reserve(surface_net.vertices.capacity());
+
+    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
+        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
+        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
+    }};
+    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
+        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
+        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+
+    for (size_t cube_index = 0; cube_index < cube_candidates.size(); ++cube_index) {
+        if (surface_net.vertices.size() >= max_vertices) {
+            break;
+        }
+        const VoxelKey cube = cube_candidates[cube_index];
+
+        std::array<bool, 8> inside = {};
+        std::array<Vec3, 8> positions = {};
+        uint32_t inside_count = 0;
+        for (uint32_t i = 0; i < corners.size(); ++i) {
+            const uint32_t x = cube.x + corners[i][0];
+            const uint32_t y = cube.y + corners[i][1];
+            const uint32_t z = cube.z + corners[i][2];
+            inside[i] = contains_voxel_key(occupied_keys, {x, y, z});
+            inside_count += inside[i] ? 1u : 0u;
+            positions[i] = surface_net_sample_position(x, y, z, grid_radius, voxel_size);
+        }
+        if (inside_count == 0u || inside_count == 8u) {
+            continue;
+        }
+
+        Vec3 average = {};
+        Vec3 normal = {};
+        uint32_t crossing_count = 0;
+        for (const auto& edge : edges) {
+            const uint32_t a = edge[0];
+            const uint32_t b = edge[1];
+            if (inside[a] == inside[b]) {
+                continue;
+            }
+            average = average + (positions[a] + positions[b]) * 0.5f;
+            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
+            ++crossing_count;
+        }
+        if (crossing_count == 0u) {
+            continue;
+        }
+
+        const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
+        surface_net.vertices.push_back(average / static_cast<float>(crossing_count));
+        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(average));
+        cube_vertices[cube_index] = static_cast<int32_t>(vertex_index);
+    }
+
+    surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    for (SurfaceNetEdgeKey edge : edge_candidates) {
+        if (edge.axis == 0u) {
+            if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y - 1u, edge.z - 1u}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y, edge.z - 1u}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y, edge.z}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y - 1u, edge.z})
+            );
+        } else if (edge.axis == 1u) {
+            if (edge.y >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x - 1u, edge.y, edge.z - 1u}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y, edge.z - 1u}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y, edge.z}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x - 1u, edge.y, edge.z})
+            );
+        } else {
+            if (edge.z >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x - 1u, edge.y - 1u, edge.z}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y - 1u, edge.z}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x, edge.y, edge.z}),
+                surface_net_sparse_cube_vertex(cube_candidates, cube_vertices, {edge.x - 1u, edge.y, edge.z})
+            );
+        }
+    }
+
+    return surface_net;
+}
+
 SurfaceNetMesh build_surface_net_mesh_from_occupancy(
     const std::vector<VoxelKey>& sorted_occupied_keys,
     uint32_t source_depth,
@@ -2668,7 +2894,16 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
         return surface_net;
     }
 
-    const uint32_t target_depth = std::clamp(std::min(config.surface_net_depth, source_depth), 1u, 8u);
+    const uint32_t target_depth = std::clamp(std::min(config.surface_net_depth, source_depth), 1u, 15u);
+    if (target_depth > 8u) {
+        return build_sparse_surface_net_mesh_from_occupancy(
+            sorted_occupied_keys,
+            source_depth,
+            target_depth,
+            grid_radius,
+            config
+        );
+    }
     const uint32_t resolution = 1u << target_depth;
     const uint32_t cube_resolution = resolution - 1u;
     const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
@@ -2852,6 +3087,49 @@ void append_surface_net_mesh(SurfaceNetMesh& destination, const SurfaceNetMesh& 
     }
 }
 
+bool surface_net_position_in_patch(Vec3 position, const std::vector<LocalSurfaceNetPatch>& patches, float pad) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (length(position - patch.center_mesh) <= patch.dig_radius_mesh + pad) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void suppress_surface_net_triangles_for_patches(
+    SurfaceNetMesh& surface_net,
+    const std::vector<LocalSurfaceNetPatch>& patches,
+    float pad
+) {
+    if (patches.empty() || surface_net.triangle_indices.empty()) {
+        return;
+    }
+
+    std::vector<uint32_t> filtered_indices;
+    filtered_indices.reserve(surface_net.triangle_indices.size());
+    for (uint32_t i = 0; i + 2 < surface_net.triangle_indices.size(); i += 3) {
+        const uint32_t ia = surface_net.triangle_indices[i];
+        const uint32_t ib = surface_net.triangle_indices[i + 1u];
+        const uint32_t ic = surface_net.triangle_indices[i + 2u];
+        if (ia >= surface_net.vertices.size() || ib >= surface_net.vertices.size() || ic >= surface_net.vertices.size()) {
+            continue;
+        }
+
+        const Vec3 a = surface_net.vertices[ia];
+        const Vec3 b = surface_net.vertices[ib];
+        const Vec3 c = surface_net.vertices[ic];
+        const Vec3 centroid = (a + b + c) / 3.0f;
+        if (surface_net_position_in_patch(centroid, patches, pad)) {
+            continue;
+        }
+
+        filtered_indices.push_back(ia);
+        filtered_indices.push_back(ib);
+        filtered_indices.push_back(ic);
+    }
+    surface_net.triangle_indices = std::move(filtered_indices);
+}
+
 bool local_voxel_key_for_position(Vec3 position, Vec3 origin, float voxel_size, uint32_t resolution, VoxelKey& key) {
     auto key_component = [&](float value, float offset, uint32_t& out) {
         const float normalized = (value - offset) / voxel_size;
@@ -2878,7 +3156,31 @@ Vec3 local_surface_net_sample_position(uint32_t x, uint32_t y, uint32_t z, Vec3 
 
 bool local_surface_net_sample_carved(Vec3 position, const std::vector<PreparedVoxelDig>& digs) {
     for (const PreparedVoxelDig& dig : digs) {
-        if (length(position - dig.center_mesh) <= dig.radius_with_leaf_mesh) {
+        if (length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        const Vec3 axis = normalize(dig.center_mesh);
+        const float axial = dot(position - dig.center_mesh, axis);
+        const Vec3 axis_point = dig.center_mesh + axis * axial;
+        const float tangent_distance = length(position - axis_point);
+        if (axial <= dig.radius_mesh * 0.35f && tangent_distance <= dig.radius_mesh) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool local_surface_net_near_dig_boundary(Vec3 position, const std::vector<PreparedVoxelDig>& digs, float voxel_size) {
+    const float tolerance = voxel_size * 3.0f;
+    for (const PreparedVoxelDig& dig : digs) {
+        if (length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        const Vec3 axis = normalize(dig.center_mesh);
+        const float axial = dot(position - dig.center_mesh, axis);
+        const Vec3 axis_point = dig.center_mesh + axis * axial;
+        const float tangent_distance = length(position - axis_point);
+        if (axial <= dig.radius_mesh * 0.5f && std::fabs(tangent_distance - dig.radius_mesh) <= tolerance) {
             return true;
         }
     }
@@ -2959,6 +3261,88 @@ void add_local_voxelized_triangles(
     }
 }
 
+void fill_local_radial_occupancy(
+    std::vector<uint64_t>& occupancy,
+    std::vector<VoxelKey>& occupied_keys,
+    const LocalSurfaceNetPatch& patch,
+    Vec3 origin,
+    float voxel_size,
+    uint32_t resolution,
+    float surface_radius,
+    const std::vector<PreparedVoxelDig>& digs
+) {
+    const float shell_radius = patch.extraction_radius_mesh + std::sqrt(3.0f) * voxel_size;
+    occupied_keys.clear();
+    for (uint32_t z = 0; z < resolution; ++z) {
+        for (uint32_t y = 0; y < resolution; ++y) {
+            for (uint32_t x = 0; x < resolution; ++x) {
+                const Vec3 position = local_surface_net_sample_position(x, y, z, origin, voxel_size);
+                if (length(position - patch.center_mesh) > shell_radius ||
+                    length(position) > surface_radius ||
+                    local_surface_net_sample_carved(position, digs)) {
+                    continue;
+                }
+                set_surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
+            }
+        }
+    }
+
+    for (uint32_t z = 1; z + 1 < resolution; ++z) {
+        for (uint32_t y = 1; y + 1 < resolution; ++y) {
+            for (uint32_t x = 1; x + 1 < resolution; ++x) {
+                if (!surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution))) {
+                    continue;
+                }
+                const bool boundary =
+                    !surface_net_bit(occupancy, surface_net_grid_index(x - 1u, y, z, resolution)) ||
+                    !surface_net_bit(occupancy, surface_net_grid_index(x + 1u, y, z, resolution)) ||
+                    !surface_net_bit(occupancy, surface_net_grid_index(x, y - 1u, z, resolution)) ||
+                    !surface_net_bit(occupancy, surface_net_grid_index(x, y + 1u, z, resolution)) ||
+                    !surface_net_bit(occupancy, surface_net_grid_index(x, y, z - 1u, resolution)) ||
+                    !surface_net_bit(occupancy, surface_net_grid_index(x, y, z + 1u, resolution));
+                const Vec3 position = local_surface_net_sample_position(x, y, z, origin, voxel_size);
+                if (boundary && length(position - patch.center_mesh) <= patch.extraction_radius_mesh - voxel_size * 2.0f) {
+                    occupied_keys.push_back({x, y, z});
+                }
+            }
+        }
+    }
+}
+
+LocalSurfaceNetGrid local_surface_net_grid_for_patch(
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius
+) {
+    LocalSurfaceNetGrid grid;
+    grid.depth = std::clamp(patch.depth, 1u, 15u);
+    const uint32_t global_resolution = 1u << grid.depth;
+    grid.voxel_size = (grid_radius * 2.0f) / static_cast<float>(global_resolution);
+    grid.resolution = static_cast<uint32_t>(std::ceil((patch.extraction_radius_mesh * 2.0f) / grid.voxel_size)) + 4u;
+    grid.resolution = std::clamp(grid.resolution, 4u, 192u);
+    grid.radius = grid.voxel_size * static_cast<float>(grid.resolution) * 0.5f;
+    grid.origin = patch.center_mesh - Vec3{grid.radius, grid.radius, grid.radius};
+    return grid;
+}
+
+std::vector<LocalSurfaceNetPatch> realized_local_surface_net_patches(
+    const std::vector<LocalSurfaceNetPatch>& patches,
+    float grid_radius
+) {
+    std::vector<LocalSurfaceNetPatch> realized;
+    realized.reserve(patches.size());
+    for (LocalSurfaceNetPatch patch : patches) {
+        const LocalSurfaceNetGrid grid = local_surface_net_grid_for_patch(patch, grid_radius);
+        const float realized_radius = std::max(
+            patch.suppress_radius_mesh,
+            grid.radius - grid.voxel_size * 3.0f
+        );
+        patch.suppress_radius_mesh = std::min(patch.extraction_radius_mesh, realized_radius);
+        patch.extraction_radius_mesh = patch.suppress_radius_mesh;
+        realized.push_back(patch);
+    }
+    return realized;
+}
+
 SurfaceNetMesh build_local_surface_net_patch_mesh(
     const QuantizedMesh& mesh,
     const LocalSurfaceNetPatch& patch,
@@ -2970,36 +3354,48 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
         return surface_net;
     }
 
-    const uint32_t depth = std::clamp(patch.depth, 1u, 13u);
-    const uint32_t global_resolution = 1u << depth;
-    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(global_resolution);
-    uint32_t resolution = static_cast<uint32_t>(std::ceil((patch.extraction_radius_mesh * 2.0f) / voxel_size)) + 4u;
-    resolution = std::clamp(resolution, 4u, 256u);
-    const Vec3 origin = patch.center_mesh - Vec3{
-        voxel_size * static_cast<float>(resolution) * 0.5f,
-        voxel_size * static_cast<float>(resolution) * 0.5f,
-        voxel_size * static_cast<float>(resolution) * 0.5f,
-    };
+    const LocalSurfaceNetGrid grid = local_surface_net_grid_for_patch(patch, grid_radius);
+    const uint32_t depth = grid.depth;
+    const float voxel_size = grid.voxel_size;
+    const uint32_t resolution = grid.resolution;
+    const Vec3 origin = grid.origin;
 
     std::vector<VoxelKey> occupied_keys;
     occupied_keys.reserve(32768);
-    const std::vector<PreparedVoxelDig> digs = prepare_voxel_digs(config.voxel_edits, voxel_size);
-    add_local_voxelized_triangles(occupied_keys, mesh, mesh.triangle_indices, patch, origin, voxel_size, resolution, digs);
-    add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs);
+    const uint32_t grid_count = resolution * resolution * resolution;
+    std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
+    const std::vector<PreparedVoxelDig> digs = prepare_exact_voxel_digs(config.voxel_edits);
+
+    if (!config.enable_fractures) {
+        fill_local_radial_occupancy(
+            occupancy,
+            occupied_keys,
+            patch,
+            origin,
+            voxel_size,
+            resolution,
+            1.0f,
+            digs
+        );
+    } else {
+        add_local_voxelized_triangles(occupied_keys, mesh, mesh.triangle_indices, patch, origin, voxel_size, resolution, digs);
+        add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs);
+    }
+
     std::sort(occupied_keys.begin(), occupied_keys.end());
     occupied_keys.erase(std::unique(occupied_keys.begin(), occupied_keys.end()), occupied_keys.end());
     if (occupied_keys.empty()) {
         return surface_net;
     }
-
-    const uint32_t cube_resolution = resolution - 1u;
-    const uint32_t grid_count = resolution * resolution * resolution;
-    std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
-    for (VoxelKey key : occupied_keys) {
-        if (key.x < resolution && key.y < resolution && key.z < resolution) {
-            set_surface_net_bit(occupancy, surface_net_grid_index(key.x, key.y, key.z, resolution));
+    if (config.enable_fractures) {
+        for (VoxelKey key : occupied_keys) {
+            if (key.x < resolution && key.y < resolution && key.z < resolution) {
+                set_surface_net_bit(occupancy, surface_net_grid_index(key.x, key.y, key.z, resolution));
+            }
         }
     }
+
+    const uint32_t cube_resolution = resolution - 1u;
 
     std::vector<VoxelKey> cube_candidates;
     cube_candidates.reserve(occupied_keys.size() * 8u);
@@ -3094,7 +3490,7 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
         }
 
         const Vec3 vertex = average / static_cast<float>(crossing_count);
-        if (length(vertex - patch.center_mesh) > patch.extraction_radius_mesh) {
+        if (length(vertex - patch.center_mesh) > patch.extraction_radius_mesh - voxel_size * 2.0f) {
             continue;
         }
         const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
@@ -3263,6 +3659,30 @@ void count_svo_debug_boxes_recursive(
     }
 }
 
+std::vector<VoxelKey> build_base_voxel_occupancy(
+    const QuantizedMesh& mesh,
+    float grid_radius,
+    float voxel_size,
+    uint32_t resolution
+) {
+    std::vector<VoxelKey> keys;
+    const uint32_t triangle_count = static_cast<uint32_t>((mesh.triangle_indices.size() + mesh.stitch_triangle_indices.size()) / 3u);
+    keys.reserve(static_cast<size_t>(triangle_count) * 16u);
+    add_voxelized_triangles(keys, mesh, mesh.triangle_indices, grid_radius, voxel_size, resolution);
+    add_voxelized_triangles(keys, mesh, mesh.stitch_triangle_indices, grid_radius, voxel_size, resolution);
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+float mesh_voxel_bounds_radius(const QuantizedMesh& mesh) {
+    float max_radius = 1.0f;
+    for (const QuantizedMeshVertex& vertex : mesh.vertices) {
+        max_radius = std::max(max_radius, length(vertex.position));
+    }
+    return max_radius * 1.025f;
+}
+
 void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig& config) {
     mesh.svo = {};
     mesh.surface_net = {};
@@ -3270,27 +3690,53 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
         return;
     }
 
-    const uint32_t depth = std::clamp(config.svo_depth, 1u, 13u);
+    const uint32_t depth = std::clamp(config.svo_depth, 1u, 15u);
     const uint32_t resolution = 1u << depth;
-    float max_radius = 1.0f;
-    for (const QuantizedMeshVertex& vertex : mesh.vertices) {
-        max_radius = std::max(max_radius, length(vertex.position));
+    float grid_radius = mesh.voxel_occupancy_cache.depth == depth && mesh.voxel_occupancy_cache.bounds_radius > 0.0f
+        ? mesh.voxel_occupancy_cache.bounds_radius
+        : mesh_voxel_bounds_radius(mesh);
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
+
+    if (mesh.voxel_occupancy_cache.depth != depth ||
+        mesh.voxel_occupancy_cache.bounds_radius <= 0.0f ||
+        mesh.voxel_occupancy_cache.leaf_keys.empty()) {
+        mesh.voxel_occupancy_cache.leaf_keys = build_base_voxel_occupancy(mesh, grid_radius, voxel_size, resolution);
+        mesh.voxel_occupancy_cache.bounds_radius = grid_radius;
+        mesh.voxel_occupancy_cache.depth = depth;
+    } else {
+        grid_radius = mesh.voxel_occupancy_cache.bounds_radius;
     }
 
-    const float grid_radius = max_radius * 1.025f;
-    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
-    std::vector<VoxelKey> keys;
-    const uint32_t triangle_count = static_cast<uint32_t>((mesh.triangle_indices.size() + mesh.stitch_triangle_indices.size()) / 3u);
-    keys.reserve(static_cast<size_t>(triangle_count) * 16u);
-    add_voxelized_triangles(keys, mesh, mesh.triangle_indices, grid_radius, voxel_size, resolution);
-    add_voxelized_triangles(keys, mesh, mesh.stitch_triangle_indices, grid_radius, voxel_size, resolution);
-
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-    const uint32_t dig_removed_leaf_count = apply_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
-    const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = build_local_surface_net_patches(config);
-    mesh.surface_net = build_surface_net_mesh_from_occupancy(keys, depth, grid_radius, config, local_surface_net_patches);
+    const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = realized_local_surface_net_patches(
+        build_local_surface_net_patches(config),
+        grid_radius
+    );
+    const uint32_t surface_net_depth = std::clamp(std::min(config.surface_net_depth, depth), 1u, 15u);
+    if (mesh.surface_net_base_cache.source_depth != surface_net_depth ||
+        std::fabs(mesh.surface_net_base_cache.bounds_radius - grid_radius) > 0.000001f ||
+        mesh.surface_net_base_cache.material_id != config.surface_net_material_id ||
+        mesh.surface_net_base_cache.vertices.empty()) {
+        MarchingCubesConfig base_surface_config = config;
+        base_surface_config.voxel_edits.digs.clear();
+        mesh.surface_net_base_cache = build_surface_net_mesh_from_occupancy(
+            mesh.voxel_occupancy_cache.leaf_keys,
+            depth,
+            grid_radius,
+            base_surface_config
+        );
+    }
+    mesh.surface_net = mesh.surface_net_base_cache;
+    mesh.surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
+    mesh.surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    suppress_surface_net_triangles_for_patches(
+        mesh.surface_net,
+        local_surface_net_patches,
+        kilometers_to_world_units(1.0f)
+    );
     append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
+
+    std::vector<VoxelKey> keys = mesh.voxel_occupancy_cache.leaf_keys;
+    const uint32_t dig_removed_leaf_count = apply_exact_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
 
     mesh.svo.bounds_radius = grid_radius;
     mesh.svo.depth = depth;
@@ -3356,6 +3802,14 @@ QuantizedMesh build_quantized_marching_cubes(
     build_transition_stitches(mesh, topology, points, boundary_edges, config, fracture_cache);
     generate_sparse_voxel_octree(mesh, config);
 
+    return mesh;
+}
+
+QuantizedMesh rebuild_quantized_mesh_voxels(
+    QuantizedMesh mesh,
+    const MarchingCubesConfig& config
+) {
+    generate_sparse_voxel_octree(mesh, config);
     return mesh;
 }
 

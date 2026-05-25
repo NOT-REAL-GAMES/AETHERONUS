@@ -21,6 +21,36 @@ struct VoxelEditSet {
     uint32_t local_depth = 15;
 };
 
+struct VoxelKey {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t z = 0;
+
+    bool operator<(const VoxelKey& rhs) const {
+        auto morton_code = [](const VoxelKey& key) {
+            uint64_t code = 0;
+            for (uint32_t bit = 0; bit < 21; ++bit) {
+                code |= (static_cast<uint64_t>((key.z >> bit) & 1u) << (bit * 3u));
+                code |= (static_cast<uint64_t>((key.y >> bit) & 1u) << (bit * 3u + 1u));
+                code |= (static_cast<uint64_t>((key.x >> bit) & 1u) << (bit * 3u + 2u));
+            }
+            return code;
+        };
+        const uint64_t lhs_code = morton_code(*this);
+        const uint64_t rhs_code = morton_code(rhs);
+        if (lhs_code != rhs_code) {
+            return lhs_code < rhs_code;
+        }
+        if (x != rhs.x) return x < rhs.x;
+        if (y != rhs.y) return y < rhs.y;
+        return z < rhs.z;
+    }
+
+    bool operator==(const VoxelKey& rhs) const {
+        return x == rhs.x && y == rhs.y && z == rhs.z;
+    }
+};
+
 struct MarchingCubesConfig {
     uint32_t resolution_x = 8;
     uint32_t resolution_y = 8;
@@ -53,15 +83,15 @@ struct MarchingCubesConfig {
     float fracture_chunk_outward_min = 0.004f;
     float fracture_chunk_outward_max = 0.024f;
     bool enable_svo_generation = true;
-    uint32_t svo_depth = 8;
+    uint32_t svo_depth = 15;
     uint32_t svo_debug_draw_depth = 8;
     uint32_t svo_debug_max_boxes = 2000000;
     bool enable_surface_net_generation = true;
-    uint32_t surface_net_depth = 8;
+    uint32_t surface_net_depth = 15;
     uint32_t surface_net_max_vertices = 2000000;
     uint32_t surface_net_material_id = 5;
     bool enable_local_surface_net_detail = true;
-    uint32_t local_surface_net_depth = 13;
+    uint32_t local_surface_net_depth = 15;
     float local_surface_net_patch_radius_km = 96.0f;
     float local_surface_net_patch_overlap_km = 16.0f;
     uint32_t local_surface_net_max_patches = 8;
@@ -118,6 +148,19 @@ struct SurfaceNetMesh {
     uint32_t local_triangle_count = 0;
 };
 
+struct VoxelOccupancyCache {
+    std::vector<VoxelKey> leaf_keys;
+    float bounds_radius = 0.0f;
+    uint32_t depth = 0;
+
+    bool empty() const { return leaf_keys.empty(); }
+    void clear() {
+        leaf_keys.clear();
+        bounds_radius = 0.0f;
+        depth = 0;
+    }
+};
+
 struct QuantizedMesh {
     std::vector<QuantizedMeshVertex> vertices;
     std::vector<uint32_t> triangle_indices;
@@ -126,6 +169,8 @@ struct QuantizedMesh {
     std::vector<uint32_t> stitch_line_indices;
     SparseVoxelOctree svo;
     SurfaceNetMesh surface_net;
+    SurfaceNetMesh surface_net_base_cache;
+    VoxelOccupancyCache voxel_occupancy_cache;
     uint32_t triangle_count = 0;
     uint32_t rejected_triangle_count = 0;
     uint32_t stitch_triangle_count = 0;
@@ -155,6 +200,11 @@ struct QuantizedMeshValidation {
 QuantizedMesh build_quantized_marching_cubes(
     const GoldbergTopology& topology,
     const PointCloud& points,
+    const MarchingCubesConfig& config = {}
+);
+
+QuantizedMesh rebuild_quantized_mesh_voxels(
+    QuantizedMesh mesh,
     const MarchingCubesConfig& config = {}
 );
 
