@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aetheronus/math.hpp"
+#include "aetheronus/morton.hpp"
 #include "aetheronus/point_cloud.hpp"
 #include "aetheronus/topology.hpp"
 
@@ -13,12 +14,12 @@ namespace ae {
 struct VoxelDigEdit {
     Vec3 center_mesh;
     float radius_km = 8.0f;
-    uint32_t depth = 15;
+    uint32_t depth = 16;
 };
 
 struct VoxelEditSet {
     std::vector<VoxelDigEdit> digs;
-    uint32_t local_depth = 15;
+    uint32_t local_depth = 16;
 };
 
 struct VoxelKey {
@@ -27,17 +28,8 @@ struct VoxelKey {
     uint32_t z = 0;
 
     bool operator<(const VoxelKey& rhs) const {
-        auto morton_code = [](const VoxelKey& key) {
-            uint64_t code = 0;
-            for (uint32_t bit = 0; bit < 21; ++bit) {
-                code |= (static_cast<uint64_t>((key.z >> bit) & 1u) << (bit * 3u));
-                code |= (static_cast<uint64_t>((key.y >> bit) & 1u) << (bit * 3u + 1u));
-                code |= (static_cast<uint64_t>((key.x >> bit) & 1u) << (bit * 3u + 2u));
-            }
-            return code;
-        };
-        const uint64_t lhs_code = morton_code(*this);
-        const uint64_t rhs_code = morton_code(rhs);
+        const uint64_t lhs_code = morton_encode(x, y, z);
+        const uint64_t rhs_code = morton_encode(rhs.x, rhs.y, rhs.z);
         if (lhs_code != rhs_code) {
             return lhs_code < rhs_code;
         }
@@ -83,17 +75,18 @@ struct MarchingCubesConfig {
     float fracture_chunk_outward_min = 0.004f;
     float fracture_chunk_outward_max = 0.024f;
     bool enable_svo_generation = true;
-    uint32_t svo_depth = 15;
+    uint32_t svo_depth = 8;
     uint32_t svo_debug_draw_depth = 8;
     uint32_t svo_debug_max_boxes = 2000000;
     bool enable_surface_net_generation = true;
-    uint32_t surface_net_depth = 15;
+    bool enable_surface_net_dual_contouring = true;
+    uint32_t surface_net_depth = 8;
     uint32_t surface_net_max_vertices = 2000000;
     uint32_t surface_net_material_id = 5;
     bool enable_local_surface_net_detail = true;
-    uint32_t local_surface_net_depth = 15;
-    float local_surface_net_patch_radius_km = 96.0f;
-    float local_surface_net_patch_overlap_km = 16.0f;
+    uint32_t local_surface_net_depth = 16;
+    float local_surface_net_patch_radius_km = 160.0f;
+    float local_surface_net_patch_overlap_km = 24.0f;
     uint32_t local_surface_net_max_patches = 8;
     VoxelEditSet voxel_edits;
 };
@@ -134,6 +127,7 @@ struct SparseVoxelOctree {
 struct SurfaceNetMesh {
     std::vector<Vec3> vertices;
     std::vector<Vec3> normals;
+    std::vector<uint32_t> vertex_depths;
     std::vector<uint32_t> triangle_indices;
     float bounds_radius = 0.0f;
     uint32_t source_depth = 0;

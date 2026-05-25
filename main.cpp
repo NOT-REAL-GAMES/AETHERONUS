@@ -19,8 +19,8 @@
 
 namespace {
 
-constexpr uint32_t DefaultSvoDepth = 15;
-constexpr uint32_t LowSvoDepth = 8;
+constexpr uint32_t DefaultSvoDepth = 8;
+constexpr uint32_t HighSvoDepth = 16;
 constexpr uint32_t SvoDebugDrawDepth = 8;
 
 enum class MeshBuildMode {
@@ -426,7 +426,7 @@ int main() {
                     render_options.show_surface_net = !render_options.show_surface_net;
                     std::cout << "Surface nets " << (render_options.show_surface_net ? "shown" : "hidden") << std::endl;
                 } else if (event.key.key == SDLK_F11) {
-                    mesh_config.svo_depth = mesh_config.svo_depth >= DefaultSvoDepth ? LowSvoDepth : DefaultSvoDepth;
+                    mesh_config.svo_depth = mesh_config.svo_depth >= HighSvoDepth ? DefaultSvoDepth : HighSvoDepth;
                     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
                     request_voxel_mesh_rebuild();
                     std::cout << "SVO depth " << mesh_config.svo_depth

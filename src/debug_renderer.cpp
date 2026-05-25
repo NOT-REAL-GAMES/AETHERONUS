@@ -604,9 +604,25 @@ std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
 std::vector<SurfaceNetVertex> build_surface_net_vertices(const SurfaceNetMesh& surface_net) {
     std::vector<SurfaceNetVertex> vertices;
     vertices.reserve(surface_net.vertices.size());
-    const Vec3 color = surface_net.material_id == 5u ? Vec3{0.95f, 0.62f, 0.18f} : Vec3{0.86f, 0.74f, 0.42f};
+    auto depth_color = [](uint32_t depth) {
+        if (depth >= 16u) {
+            return Vec3{0.18f, 0.92f, 1.00f};
+        }
+        if (depth >= 15u) {
+            return Vec3{0.32f, 0.70f, 1.00f};
+        }
+        if (depth >= 13u) {
+            return Vec3{0.75f, 0.42f, 1.00f};
+        }
+        if (depth >= 9u) {
+            return Vec3{1.00f, 0.82f, 0.24f};
+        }
+        return Vec3{0.95f, 0.50f, 0.12f};
+    };
     for (uint32_t i = 0; i < surface_net.vertices.size(); ++i) {
         const Vec3 normal = i < surface_net.normals.size() ? normalize(surface_net.normals[i]) : normalize(surface_net.vertices[i]);
+        const uint32_t depth = i < surface_net.vertex_depths.size() ? surface_net.vertex_depths[i] : surface_net.source_depth;
+        const Vec3 color = surface_net.material_id == 5u ? depth_color(depth) : Vec3{0.86f, 0.74f, 0.42f};
         vertices.push_back({planet_to_world(surface_net.vertices[i]), normal, color});
     }
     return vertices;

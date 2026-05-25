@@ -6,12 +6,18 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <vector>
 #include <sstream>
 
 namespace ae {
 namespace {
+
+constexpr uint32_t MaxSvoDepth = 16u;
+constexpr uint32_t SurfacePromotionRootDepth = 8u;
+constexpr uint32_t LocalSurfaceNetMaxResolution = 288u;
+constexpr float LocalSurfaceNetRootHaloVoxels = 6.0f;
 
 struct Frame {
     Vec3 tangent;
@@ -150,18 +156,28 @@ struct PreparedVoxelDig {
 
 struct LocalSurfaceNetPatch {
     Vec3 center_mesh;
+    Vec3 dig_center_mesh;
     float dig_radius_mesh = 0.0f;
     float suppress_radius_mesh = 0.0f;
     float extraction_radius_mesh = 0.0f;
-    uint32_t depth = 15;
+    uint32_t depth = MaxSvoDepth;
+    bool replace_surface = true;
+    std::vector<VoxelKey> promoted_depth8_keys;
+    Vec3 replacement_min;
+    Vec3 replacement_max;
 };
 
 struct LocalSurfaceNetGrid {
-    uint32_t depth = 15;
+    uint32_t depth = MaxSvoDepth;
     uint32_t resolution = 4;
     float voxel_size = 0.0f;
     float radius = 0.0f;
     Vec3 origin;
+};
+
+struct SurfaceNetPlacement {
+    Vec3 position;
+    Vec3 normal;
 };
 
 using BoundaryEdgeMap = std::vector<BoundaryEdgeRecord>;
@@ -219,6 +235,33 @@ bool contains_voxel_key(const std::vector<VoxelKey>& sorted_keys, VoxelKey key) 
     return std::binary_search(sorted_keys.begin(), sorted_keys.end(), key);
 }
 
+void validate_morton_helpers_once() {
+#ifndef NDEBUG
+    static bool validated = false;
+    if (validated) {
+        return;
+    }
+    validated = true;
+
+    constexpr std::array<VoxelKey, 5> samples = {{
+        {0u, 0u, 0u},
+        {1u, 2u, 3u},
+        {255u, 128u, 64u},
+        {65535u, 32768u, 12345u},
+        {0x1fffffu, 0x155555u, 0x0aaaau},
+    }};
+    for (VoxelKey sample : samples) {
+        uint32_t x = 0;
+        uint32_t y = 0;
+        uint32_t z = 0;
+        morton_decode(morton_encode(sample.x, sample.y, sample.z), x, y, z);
+        if (x != sample.x || y != sample.y || z != sample.z) {
+            std::abort();
+        }
+    }
+#endif
+}
+
 Frame build_frame(Vec3 normal) {
     const Vec3 reference_axis = std::fabs(normal.y) < 0.92f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
     const Vec3 tangent = normalize(cross(reference_axis, normal));
@@ -248,6 +291,18 @@ float length2(Vec2 v) {
 
 Vec2 lerp2(Vec2 a, Vec2 b, float t) {
     return a * (1.0f - t) + b * t;
+}
+
+float clamp_axis(float value, float minimum, float maximum) {
+    return std::max(minimum, std::min(maximum, value));
+}
+
+Vec3 clamp_vec3(Vec3 value, Vec3 minimum, Vec3 maximum) {
+    return {
+        clamp_axis(value.x, minimum.x, maximum.x),
+        clamp_axis(value.y, minimum.y, maximum.y),
+        clamp_axis(value.z, minimum.z, maximum.z),
+    };
 }
 
 float snap(float value, float step) {
@@ -2545,7 +2600,146 @@ std::vector<VoxelKey> coarsen_surface_net_keys(const std::vector<VoxelKey>& keys
     return result;
 }
 
-std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const MarchingCubesConfig& config) {
+Vec3 voxel_min_from_key(VoxelKey key, float grid_radius, float voxel_size) {
+    return {
+        -grid_radius + static_cast<float>(key.x) * voxel_size,
+        -grid_radius + static_cast<float>(key.y) * voxel_size,
+        -grid_radius + static_cast<float>(key.z) * voxel_size,
+    };
+}
+
+Vec3 voxel_max_from_key(VoxelKey key, float grid_radius, float voxel_size) {
+    const Vec3 minimum = voxel_min_from_key(key, grid_radius, voxel_size);
+    return minimum + Vec3{voxel_size, voxel_size, voxel_size};
+}
+
+bool aabb_intersects_sphere(Vec3 minimum, Vec3 maximum, Vec3 center, float radius) {
+    auto axis_distance_sq = [](float value, float minimum_axis, float maximum_axis) {
+        if (value < minimum_axis) {
+            const float distance = minimum_axis - value;
+            return distance * distance;
+        }
+        if (value > maximum_axis) {
+            const float distance = value - maximum_axis;
+            return distance * distance;
+        }
+        return 0.0f;
+    };
+    const float distance_sq =
+        axis_distance_sq(center.x, minimum.x, maximum.x) +
+        axis_distance_sq(center.y, minimum.y, maximum.y) +
+        axis_distance_sq(center.z, minimum.z, maximum.z);
+    return distance_sq <= radius * radius;
+}
+
+std::vector<VoxelKey> promoted_depth8_keys_for_dig(
+    Vec3 center,
+    float radius,
+    float grid_radius
+) {
+    std::vector<VoxelKey> keys;
+    if (radius <= 0.0f || grid_radius <= 0.0f) {
+        return keys;
+    }
+
+    const uint32_t root_resolution = 1u << SurfacePromotionRootDepth;
+    const float root_voxel_size = (grid_radius * 2.0f) / static_cast<float>(root_resolution);
+    const float promotion_radius = radius + root_voxel_size;
+    auto clamped_key_component = [&](float value) {
+        const float normalized = (value + grid_radius) / root_voxel_size;
+        const int32_t index = static_cast<int32_t>(std::floor(normalized));
+        return static_cast<uint32_t>(std::clamp(index, 0, static_cast<int32_t>(root_resolution - 1u)));
+    };
+
+    const uint32_t min_x = clamped_key_component(center.x - promotion_radius);
+    const uint32_t min_y = clamped_key_component(center.y - promotion_radius);
+    const uint32_t min_z = clamped_key_component(center.z - promotion_radius);
+    const uint32_t max_x = clamped_key_component(center.x + promotion_radius);
+    const uint32_t max_y = clamped_key_component(center.y + promotion_radius);
+    const uint32_t max_z = clamped_key_component(center.z + promotion_radius);
+    keys.reserve(static_cast<size_t>(max_x - min_x + 1u) * (max_y - min_y + 1u) * (max_z - min_z + 1u));
+
+    for (uint32_t z = min_z; z <= max_z; ++z) {
+        for (uint32_t y = min_y; y <= max_y; ++y) {
+            for (uint32_t x = min_x; x <= max_x; ++x) {
+                const VoxelKey key{x, y, z};
+                if (aabb_intersects_sphere(
+                        voxel_min_from_key(key, grid_radius, root_voxel_size),
+                        voxel_max_from_key(key, grid_radius, root_voxel_size),
+                        center,
+                        promotion_radius)) {
+                    keys.push_back(key);
+                }
+            }
+        }
+    }
+
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
+void update_patch_replacement_bounds(LocalSurfaceNetPatch& patch, float grid_radius) {
+    if (patch.promoted_depth8_keys.empty() || grid_radius <= 0.0f) {
+        const Vec3 extent{patch.extraction_radius_mesh, patch.extraction_radius_mesh, patch.extraction_radius_mesh};
+        patch.replacement_min = patch.center_mesh - extent;
+        patch.replacement_max = patch.center_mesh + extent;
+        return;
+    }
+
+    const float root_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << SurfacePromotionRootDepth);
+    Vec3 minimum{1000000.0f, 1000000.0f, 1000000.0f};
+    Vec3 maximum{-1000000.0f, -1000000.0f, -1000000.0f};
+    for (VoxelKey key : patch.promoted_depth8_keys) {
+        const Vec3 key_min = voxel_min_from_key(key, grid_radius, root_voxel_size);
+        const Vec3 key_max = voxel_max_from_key(key, grid_radius, root_voxel_size);
+        minimum.x = std::min(minimum.x, key_min.x);
+        minimum.y = std::min(minimum.y, key_min.y);
+        minimum.z = std::min(minimum.z, key_min.z);
+        maximum.x = std::max(maximum.x, key_max.x);
+        maximum.y = std::max(maximum.y, key_max.y);
+        maximum.z = std::max(maximum.z, key_max.z);
+    }
+    patch.replacement_min = minimum;
+    patch.replacement_max = maximum;
+    patch.center_mesh = (minimum + maximum) * 0.5f;
+    patch.extraction_radius_mesh = length((maximum - minimum) * 0.5f);
+    patch.suppress_radius_mesh = patch.extraction_radius_mesh;
+}
+
+void expand_patch_replacement_bounds(LocalSurfaceNetPatch& patch, float amount, float grid_radius) {
+    if (amount <= 0.0f || grid_radius <= 0.0f) {
+        return;
+    }
+
+    patch.replacement_min = {
+        std::max(-grid_radius, patch.replacement_min.x - amount),
+        std::max(-grid_radius, patch.replacement_min.y - amount),
+        std::max(-grid_radius, patch.replacement_min.z - amount),
+    };
+    patch.replacement_max = {
+        std::min(grid_radius, patch.replacement_max.x + amount),
+        std::min(grid_radius, patch.replacement_max.y + amount),
+        std::min(grid_radius, patch.replacement_max.z + amount),
+    };
+    patch.center_mesh = (patch.replacement_min + patch.replacement_max) * 0.5f;
+    patch.extraction_radius_mesh = length((patch.replacement_max - patch.replacement_min) * 0.5f);
+    patch.suppress_radius_mesh = patch.extraction_radius_mesh;
+}
+
+bool depth8_key_in_promoted_patches(VoxelKey key, const std::vector<LocalSurfaceNetPatch>& patches) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (!patch.replace_surface || patch.promoted_depth8_keys.empty()) {
+            continue;
+        }
+        if (std::binary_search(patch.promoted_depth8_keys.begin(), patch.promoted_depth8_keys.end(), key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const MarchingCubesConfig& config, float grid_radius) {
     std::vector<LocalSurfaceNetPatch> patches;
     if (!config.enable_local_surface_net_detail || config.local_surface_net_max_patches == 0u) {
         return patches;
@@ -2555,9 +2749,9 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
     const uint32_t fallback_depth = std::clamp(
         config.local_surface_net_depth > 0u ? config.local_surface_net_depth : config.voxel_edits.local_depth,
         1u,
-        15u
+        MaxSvoDepth
     );
-    auto add_patch = [&](Vec3 center, float dig_radius_mesh, uint32_t requested_depth) {
+    auto add_patch = [&](Vec3 center, float dig_radius_mesh, uint32_t requested_depth, bool replace_surface) {
         if (patches.size() >= config.local_surface_net_max_patches || length(center) <= 0.000001f) {
             return;
         }
@@ -2569,13 +2763,51 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
             dig_radius_mesh + std::max(overlap, kilometers_to_world_units(48.0f))
         );
         const float extraction_radius = std::max(suppress_radius, detail_radius);
-        const uint32_t depth = std::clamp(requested_depth > 0u ? requested_depth : fallback_depth, 1u, 15u);
+        const uint32_t depth = std::clamp(requested_depth > 0u ? requested_depth : fallback_depth, 1u, MaxSvoDepth);
+        std::vector<VoxelKey> promoted_keys = replace_surface
+            ? promoted_depth8_keys_for_dig(center, dig_radius_mesh, grid_radius)
+            : std::vector<VoxelKey>{};
+        if (!promoted_keys.empty()) {
+            promoted_keys.erase(
+                std::remove_if(
+                    promoted_keys.begin(),
+                    promoted_keys.end(),
+                    [&](VoxelKey key) {
+                        return std::any_of(
+                            patches.begin(),
+                            patches.end(),
+                            [&](const LocalSurfaceNetPatch& patch) {
+                                return std::binary_search(
+                                    patch.promoted_depth8_keys.begin(),
+                                    patch.promoted_depth8_keys.end(),
+                                    key
+                                );
+                            }
+                        );
+                    }
+                ),
+                promoted_keys.end()
+            );
+        }
+        if (replace_surface && promoted_keys.empty()) {
+            return;
+        }
         for (const LocalSurfaceNetPatch& patch : patches) {
-            if (length(patch.center_mesh - center) < suppress_radius * 0.5f) {
+            if (!replace_surface && length(patch.center_mesh - center) < suppress_radius * 0.5f) {
                 return;
             }
         }
-        patches.push_back({center, dig_radius_mesh, suppress_radius, extraction_radius, depth});
+        LocalSurfaceNetPatch patch;
+        patch.center_mesh = center;
+        patch.dig_center_mesh = center;
+        patch.dig_radius_mesh = dig_radius_mesh;
+        patch.suppress_radius_mesh = suppress_radius;
+        patch.extraction_radius_mesh = extraction_radius;
+        patch.depth = depth;
+        patch.replace_surface = replace_surface;
+        patch.promoted_depth8_keys = std::move(promoted_keys);
+        update_patch_replacement_bounds(patch, grid_radius);
+        patches.push_back(std::move(patch));
     };
 
     struct DigCandidate {
@@ -2583,12 +2815,13 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
         float radius_mesh = 0.0f;
         float distance_to_camera = 0.0f;
         uint32_t newest_rank = 0;
-        uint32_t depth = 15;
+        uint32_t depth = MaxSvoDepth;
     };
 
     const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
         ? normalize(config.lod_camera_position)
         : Vec3{0.0f, 0.0f, 1.0f};
+
     std::vector<DigCandidate> dig_candidates;
     dig_candidates.reserve(config.voxel_edits.digs.size());
     for (uint32_t i = 0; i < config.voxel_edits.digs.size(); ++i) {
@@ -2605,7 +2838,7 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
             radius_mesh,
             length(normalize(dig.center_mesh) - camera_center),
             static_cast<uint32_t>(config.voxel_edits.digs.size() - i),
-            std::clamp(dig.depth > 0u ? dig.depth : fallback_depth, 1u, 15u),
+            std::clamp(dig.depth > 0u ? dig.depth : fallback_depth, 1u, MaxSvoDepth),
         });
     }
     std::sort(
@@ -2619,7 +2852,7 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
         }
     );
     for (const DigCandidate& dig : dig_candidates) {
-        add_patch(dig.center, dig.radius_mesh, dig.depth);
+        add_patch(dig.center, dig.radius_mesh, dig.depth, true);
     }
 
     return patches;
@@ -2627,8 +2860,10 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
 
 bool surface_net_key_in_patch(Vec3 center, float leaf_radius, const std::vector<LocalSurfaceNetPatch>& patches) {
     for (const LocalSurfaceNetPatch& patch : patches) {
-        const float edge_pad = std::min(leaf_radius, patch.suppress_radius_mesh * 0.25f);
-        if (length(center - patch.center_mesh) <= patch.suppress_radius_mesh + edge_pad) {
+        if (!patch.replace_surface) {
+            continue;
+        }
+        if (length(center - patch.center_mesh) <= patch.suppress_radius_mesh + leaf_radius) {
             return true;
         }
     }
@@ -2716,6 +2951,144 @@ void append_surface_net_quad(
     surface_net.triangle_indices.push_back(static_cast<uint32_t>(a));
     surface_net.triangle_indices.push_back(static_cast<uint32_t>(c));
     surface_net.triangle_indices.push_back(static_cast<uint32_t>(d));
+}
+
+bool solve_surface_net_qef(
+    const std::array<float, 6>& ata,
+    const std::array<float, 3>& atb,
+    Vec3& result
+) {
+    float m[3][4] = {
+        {ata[0], ata[1], ata[2], atb[0]},
+        {ata[1], ata[3], ata[4], atb[1]},
+        {ata[2], ata[4], ata[5], atb[2]},
+    };
+
+    for (uint32_t column = 0; column < 3u; ++column) {
+        uint32_t pivot = column;
+        float pivot_value = std::fabs(m[column][column]);
+        for (uint32_t row = column + 1u; row < 3u; ++row) {
+            const float value = std::fabs(m[row][column]);
+            if (value > pivot_value) {
+                pivot = row;
+                pivot_value = value;
+            }
+        }
+        if (pivot_value <= 0.00000001f) {
+            return false;
+        }
+        if (pivot != column) {
+            for (uint32_t k = column; k < 4u; ++k) {
+                std::swap(m[column][k], m[pivot][k]);
+            }
+        }
+
+        const float inv_pivot = 1.0f / m[column][column];
+        for (uint32_t k = column; k < 4u; ++k) {
+            m[column][k] *= inv_pivot;
+        }
+        for (uint32_t row = 0; row < 3u; ++row) {
+            if (row == column) {
+                continue;
+            }
+            const float factor = m[row][column];
+            for (uint32_t k = column; k < 4u; ++k) {
+                m[row][k] -= factor * m[column][k];
+            }
+        }
+    }
+
+    result = {m[0][3], m[1][3], m[2][3]};
+    return std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z);
+}
+
+SurfaceNetPlacement surface_net_dual_contour_placement(
+    const std::array<bool, 8>& inside,
+    const std::array<Vec3, 8>& positions,
+    const std::array<std::array<uint32_t, 2>, 12>& edges,
+    bool enable_dual_contouring
+) {
+    Vec3 average = {};
+    Vec3 normal_sum = {};
+    uint32_t crossing_count = 0;
+
+    std::array<float, 6> ata = {};
+    std::array<float, 3> atb = {};
+    for (const auto& edge : edges) {
+        const uint32_t a = edge[0];
+        const uint32_t b = edge[1];
+        if (inside[a] == inside[b]) {
+            continue;
+        }
+
+        const Vec3 midpoint = (positions[a] + positions[b]) * 0.5f;
+        const Vec3 inside_position = inside[a] ? positions[a] : positions[b];
+        const Vec3 outside_position = inside[a] ? positions[b] : positions[a];
+        Vec3 normal = normalize(outside_position - inside_position);
+
+        // Binary occupancy has no true Hermite gradient. Bias the edge normal with
+        // the radial planet normal to keep smooth spherical regions from becoming
+        // axis-locked while still preserving sharp voxel/dig transitions.
+        if (length(midpoint) > 0.000001f) {
+            const Vec3 radial = normalize(midpoint);
+            if (dot(normal, radial) < 0.0f) {
+                normal = -normal;
+            }
+            normal = normalize(normal * 0.75f + radial * 0.25f);
+        }
+
+        average = average + midpoint;
+        normal_sum = normal_sum + normal;
+        ++crossing_count;
+
+        const float plane_offset = dot(normal, midpoint);
+        ata[0] += normal.x * normal.x;
+        ata[1] += normal.x * normal.y;
+        ata[2] += normal.x * normal.z;
+        ata[3] += normal.y * normal.y;
+        ata[4] += normal.y * normal.z;
+        ata[5] += normal.z * normal.z;
+        atb[0] += normal.x * plane_offset;
+        atb[1] += normal.y * plane_offset;
+        atb[2] += normal.z * plane_offset;
+    }
+
+    if (crossing_count == 0u) {
+        return {};
+    }
+
+    average = average / static_cast<float>(crossing_count);
+    Vec3 position = average;
+    if (enable_dual_contouring) {
+        constexpr float AnchorWeight = 0.05f;
+        ata[0] += AnchorWeight;
+        ata[3] += AnchorWeight;
+        ata[5] += AnchorWeight;
+        atb[0] += average.x * AnchorWeight;
+        atb[1] += average.y * AnchorWeight;
+        atb[2] += average.z * AnchorWeight;
+
+        Vec3 solved = {};
+        if (solve_surface_net_qef(ata, atb, solved)) {
+            Vec3 minimum = positions[0];
+            Vec3 maximum = positions[0];
+            for (const Vec3& p : positions) {
+                minimum.x = std::min(minimum.x, p.x);
+                minimum.y = std::min(minimum.y, p.y);
+                minimum.z = std::min(minimum.z, p.z);
+                maximum.x = std::max(maximum.x, p.x);
+                maximum.y = std::max(maximum.y, p.y);
+                maximum.z = std::max(maximum.z, p.z);
+            }
+            position = clamp_vec3(solved, minimum, maximum);
+        }
+    }
+
+    const Vec3 fallback_normal = length(average) > 0.000001f ? normalize(average) : Vec3{0.0f, 1.0f, 0.0f};
+    return {
+        position,
+        length(normal_sum) > 0.000001f ? normalize(normal_sum) : fallback_normal,
+    };
 }
 
 SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
@@ -2818,26 +3191,20 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
             continue;
         }
 
-        Vec3 average = {};
-        Vec3 normal = {};
-        uint32_t crossing_count = 0;
-        for (const auto& edge : edges) {
-            const uint32_t a = edge[0];
-            const uint32_t b = edge[1];
-            if (inside[a] == inside[b]) {
-                continue;
-            }
-            average = average + (positions[a] + positions[b]) * 0.5f;
-            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
-            ++crossing_count;
-        }
-        if (crossing_count == 0u) {
+        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
+            inside,
+            positions,
+            edges,
+            config.enable_surface_net_dual_contouring
+        );
+        if (length(placement.normal) <= 0.000001f) {
             continue;
         }
 
         const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
-        surface_net.vertices.push_back(average / static_cast<float>(crossing_count));
-        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(average));
+        surface_net.vertices.push_back(placement.position);
+        surface_net.normals.push_back(placement.normal);
+        surface_net.vertex_depths.push_back(target_depth);
         cube_vertices[cube_index] = static_cast<int32_t>(vertex_index);
     }
 
@@ -2894,7 +3261,7 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
         return surface_net;
     }
 
-    const uint32_t target_depth = std::clamp(std::min(config.surface_net_depth, source_depth), 1u, 15u);
+    const uint32_t target_depth = std::clamp(std::min(config.surface_net_depth, source_depth), 1u, MaxSvoDepth);
     if (target_depth > 8u) {
         return build_sparse_surface_net_mesh_from_occupancy(
             sorted_occupied_keys,
@@ -2916,11 +3283,9 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
                 occupied_keys.begin(),
                 occupied_keys.end(),
                 [&](VoxelKey key) {
-                    return surface_net_key_in_patch(
-                        voxel_center_from_key(key, grid_radius, voxel_size),
-                        voxel_radius,
-                        suppression_patches
-                    );
+                    (void)voxel_radius;
+                    return target_depth == SurfacePromotionRootDepth &&
+                           depth8_key_in_promoted_patches(key, suppression_patches);
                 }
             ),
             occupied_keys.end()
@@ -3013,26 +3378,20 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
             continue;
         }
 
-        Vec3 average = {};
-        Vec3 normal = {};
-        uint32_t crossing_count = 0;
-        for (const auto& edge : edges) {
-            const uint32_t a = edge[0];
-            const uint32_t b = edge[1];
-            if (inside[a] == inside[b]) {
-                continue;
-            }
-            average = average + (positions[a] + positions[b]) * 0.5f;
-            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
-            ++crossing_count;
-        }
-        if (crossing_count == 0u) {
+        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
+            inside,
+            positions,
+            edges,
+            config.enable_surface_net_dual_contouring
+        );
+        if (length(placement.normal) <= 0.000001f) {
             continue;
         }
 
         const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
-        surface_net.vertices.push_back(average / static_cast<float>(crossing_count));
-        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(average));
+        surface_net.vertices.push_back(placement.position);
+        surface_net.normals.push_back(placement.normal);
+        surface_net.vertex_depths.push_back(target_depth);
         cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
     }
 
@@ -3081,25 +3440,551 @@ void append_surface_net_mesh(SurfaceNetMesh& destination, const SurfaceNetMesh& 
     const uint32_t vertex_offset = static_cast<uint32_t>(destination.vertices.size());
     destination.vertices.insert(destination.vertices.end(), source.vertices.begin(), source.vertices.end());
     destination.normals.insert(destination.normals.end(), source.normals.begin(), source.normals.end());
+    destination.vertex_depths.reserve(destination.vertex_depths.size() + source.vertices.size());
+    if (source.vertex_depths.size() == source.vertices.size()) {
+        destination.vertex_depths.insert(destination.vertex_depths.end(), source.vertex_depths.begin(), source.vertex_depths.end());
+    } else {
+        destination.vertex_depths.insert(destination.vertex_depths.end(), source.vertices.size(), source.source_depth);
+    }
     destination.triangle_indices.reserve(destination.triangle_indices.size() + source.triangle_indices.size());
     for (uint32_t index : source.triangle_indices) {
         destination.triangle_indices.push_back(vertex_offset + index);
     }
 }
 
+void bias_surface_net_outward(SurfaceNetMesh& surface_net, float bias) {
+    if (bias <= 0.0f) {
+        return;
+    }
+
+    for (Vec3& vertex : surface_net.vertices) {
+        if (length(vertex) <= 0.000001f) {
+            continue;
+        }
+        vertex = vertex + normalize(vertex) * bias;
+    }
+}
+
 bool surface_net_position_in_patch(Vec3 position, const std::vector<LocalSurfaceNetPatch>& patches, float pad) {
     for (const LocalSurfaceNetPatch& patch : patches) {
-        if (length(position - patch.center_mesh) <= patch.dig_radius_mesh + pad) {
+        if (patch.dig_radius_mesh <= 0.0f) {
+            continue;
+        }
+        if (length(position - patch.dig_center_mesh) <= patch.dig_radius_mesh + pad) {
             return true;
         }
     }
     return false;
 }
 
+bool surface_net_position_in_replacement_patch(Vec3 position, const std::vector<LocalSurfaceNetPatch>& patches, float pad) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (!patch.replace_surface) {
+            continue;
+        }
+        if (length(position - patch.center_mesh) <= patch.suppress_radius_mesh + pad) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool point_in_triangle_2d(Vec2 p, Vec2 a, Vec2 b, Vec2 c) {
+    const Vec2 v0 = c - a;
+    const Vec2 v1 = b - a;
+    const Vec2 v2 = p - a;
+    const float dot00 = dot2(v0, v0);
+    const float dot01 = dot2(v0, v1);
+    const float dot02 = dot2(v0, v2);
+    const float dot11 = dot2(v1, v1);
+    const float dot12 = dot2(v1, v2);
+    const float denominator = dot00 * dot11 - dot01 * dot01;
+    if (std::fabs(denominator) <= 0.000000000001f) {
+        return false;
+    }
+    const float inv_denominator = 1.0f / denominator;
+    const float u = (dot11 * dot02 - dot01 * dot12) * inv_denominator;
+    const float v = (dot00 * dot12 - dot01 * dot02) * inv_denominator;
+    return u >= 0.0f && v >= 0.0f && (u + v) <= 1.0f;
+}
+
+bool surface_net_triangle_overlaps_patch_radius(
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    Vec3 center,
+    float radius
+) {
+    if (radius <= 0.0f || length(center) <= 0.000001f) {
+        return false;
+    }
+
+    const Vec3 axis = normalize(center);
+    const Vec3 reference = std::fabs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference, axis));
+    const Vec3 bitangent = cross(axis, tangent);
+    const float radius_sq = radius * radius;
+
+    auto project = [&](Vec3 position) {
+        const Vec3 relative = position - center;
+        return Vec2{dot(relative, tangent), dot(relative, bitangent)};
+    };
+
+    const Vec2 pa = project(a);
+    const Vec2 pb = project(b);
+    const Vec2 pc = project(c);
+    const Vec2 origin{0.0f, 0.0f};
+    if (dot2(pa, pa) <= radius_sq || dot2(pb, pb) <= radius_sq || dot2(pc, pc) <= radius_sq) {
+        return true;
+    }
+    if (point_segment_distance(origin, pa, pb) <= radius ||
+        point_segment_distance(origin, pb, pc) <= radius ||
+        point_segment_distance(origin, pc, pa) <= radius) {
+        return true;
+    }
+    return point_in_triangle_2d(origin, pa, pb, pc);
+}
+
+bool surface_net_triangle_overlaps_dig_patch(
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    const LocalSurfaceNetPatch& patch,
+    float pad
+) {
+    return surface_net_triangle_overlaps_patch_radius(
+        a,
+        b,
+        c,
+        patch.dig_center_mesh,
+        patch.dig_radius_mesh + std::max(0.0f, pad)
+    );
+}
+
+bool surface_net_triangle_overlaps_dig_patches(
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    const std::vector<LocalSurfaceNetPatch>& patches,
+    float pad
+) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (surface_net_triangle_overlaps_dig_patch(a, b, c, patch, pad)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool surface_net_triangle_overlaps_replacement_patches(
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    const std::vector<LocalSurfaceNetPatch>& patches,
+    float pad
+) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (!patch.replace_surface) {
+            continue;
+        }
+        if (surface_net_triangle_overlaps_patch_radius(
+                a,
+                b,
+                c,
+                patch.center_mesh,
+                patch.suppress_radius_mesh + std::max(0.0f, pad))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Vec3 patch_surface_point(
+    Vec3 axis,
+    Vec3 tangent,
+    Vec3 bitangent,
+    float surface_radius,
+    float local_radius,
+    float angle
+) {
+    const Vec3 tangent_offset = tangent * (std::cos(angle) * local_radius) +
+                                bitangent * (std::sin(angle) * local_radius);
+    return normalize(axis * surface_radius + tangent_offset) * surface_radius;
+}
+
+void append_surface_net_triangle(
+    SurfaceNetMesh& surface_net,
+    Vec3 a,
+    Vec3 b,
+    Vec3 c,
+    Vec3 preferred_normal,
+    uint32_t max_vertices,
+    uint32_t depth_tag = 0u
+) {
+    if (surface_net.vertices.size() + 3u > max_vertices) {
+        return;
+    }
+
+    Vec3 normal = cross(b - a, c - a);
+    if (length(normal) <= 0.000000000001f) {
+        return;
+    }
+    normal = normalize(normal);
+    if (dot(normal, preferred_normal) < 0.0f) {
+        std::swap(b, c);
+        normal = -normal;
+    }
+
+    const uint32_t base = static_cast<uint32_t>(surface_net.vertices.size());
+    surface_net.vertices.push_back(a);
+    surface_net.vertices.push_back(b);
+    surface_net.vertices.push_back(c);
+    surface_net.normals.push_back(normal);
+    surface_net.normals.push_back(normal);
+    surface_net.normals.push_back(normal);
+    const uint32_t resolved_depth = depth_tag != 0u ? depth_tag : surface_net.source_depth;
+    surface_net.vertex_depths.push_back(resolved_depth);
+    surface_net.vertex_depths.push_back(resolved_depth);
+    surface_net.vertex_depths.push_back(resolved_depth);
+    surface_net.triangle_indices.push_back(base);
+    surface_net.triangle_indices.push_back(base + 1u);
+    surface_net.triangle_indices.push_back(base + 2u);
+}
+
+void append_local_surface_net_transition_fill(
+    SurfaceNetMesh& surface_net,
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    if (!patch.replace_surface || length(patch.center_mesh) <= 0.000001f) {
+        return;
+    }
+
+    const float outer_radius = patch.suppress_radius_mesh;
+    if (outer_radius <= 0.0f) {
+        return;
+    }
+
+    const float surface_radius = std::max(1.0f, length(patch.center_mesh));
+    const float dig_radius = patch.dig_radius_mesh > 0.0f
+        ? patch.dig_radius_mesh + kilometers_to_world_units(0.35f)
+        : 0.0f;
+    const float inner_radius = std::min(dig_radius, outer_radius * 0.9f);
+    if (outer_radius <= inner_radius + 0.000001f) {
+        return;
+    }
+
+    const Vec3 axis = normalize(patch.center_mesh);
+    const Vec3 reference = std::fabs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference, axis));
+    const Vec3 bitangent = cross(axis, tangent);
+
+    const uint32_t patch_depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
+    const float depth_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << patch_depth);
+    const float surface_bias = std::max(depth_voxel_size * 2.0f, kilometers_to_world_units(0.5f));
+    const float fill_surface_radius = surface_radius + surface_bias;
+    const float ring_spacing = std::max(depth_voxel_size * 12.0f, kilometers_to_world_units(1.0f));
+    const float angular_spacing = std::max(depth_voxel_size * 10.0f, kilometers_to_world_units(1.25f));
+    const uint32_t radial_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((outer_radius - inner_radius) / ring_spacing)),
+        4u,
+        96u
+    );
+    const uint32_t angular_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((2.0f * Pi * outer_radius) / angular_spacing)),
+        32u,
+        256u
+    );
+
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    const Vec3 outward = axis;
+
+    if (inner_radius <= 0.000001f) {
+        const Vec3 center = axis * fill_surface_radius;
+        const float first_radius = outer_radius / static_cast<float>(radial_segments);
+        for (uint32_t i = 0; i < angular_segments; ++i) {
+            const float a0 = 2.0f * Pi * static_cast<float>(i) / static_cast<float>(angular_segments);
+            const float a1 = 2.0f * Pi * static_cast<float>(i + 1u) / static_cast<float>(angular_segments);
+            append_surface_net_triangle(
+                surface_net,
+                center,
+                patch_surface_point(axis, tangent, bitangent, fill_surface_radius, first_radius, a0),
+                patch_surface_point(axis, tangent, bitangent, fill_surface_radius, first_radius, a1),
+                outward,
+                max_vertices
+            );
+        }
+    }
+
+    const uint32_t start_ring = inner_radius <= 0.000001f ? 1u : 0u;
+    for (uint32_t ring = start_ring; ring < radial_segments; ++ring) {
+        const float t0 = static_cast<float>(ring) / static_cast<float>(radial_segments);
+        const float t1 = static_cast<float>(ring + 1u) / static_cast<float>(radial_segments);
+        const float r0 = inner_radius + (outer_radius - inner_radius) * t0;
+        const float r1 = inner_radius + (outer_radius - inner_radius) * t1;
+        for (uint32_t i = 0; i < angular_segments; ++i) {
+            const float a0 = 2.0f * Pi * static_cast<float>(i) / static_cast<float>(angular_segments);
+            const float a1 = 2.0f * Pi * static_cast<float>(i + 1u) / static_cast<float>(angular_segments);
+            const Vec3 p00 = patch_surface_point(axis, tangent, bitangent, fill_surface_radius, r0, a0);
+            const Vec3 p01 = patch_surface_point(axis, tangent, bitangent, fill_surface_radius, r0, a1);
+            const Vec3 p10 = patch_surface_point(axis, tangent, bitangent, fill_surface_radius, r1, a0);
+            const Vec3 p11 = patch_surface_point(axis, tangent, bitangent, fill_surface_radius, r1, a1);
+            append_surface_net_triangle(surface_net, p00, p10, p11, outward, max_vertices);
+            append_surface_net_triangle(surface_net, p00, p11, p01, outward, max_vertices);
+        }
+    }
+}
+
+void append_local_surface_net_footprint_fill(
+    SurfaceNetMesh& surface_net,
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    if (!patch.replace_surface || length(patch.center_mesh) <= 0.000001f || patch.suppress_radius_mesh <= 0.0f) {
+        return;
+    }
+
+    const Vec3 axis = normalize(patch.center_mesh);
+    const Vec3 reference = std::fabs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference, axis));
+    const Vec3 bitangent = cross(axis, tangent);
+    const uint32_t patch_depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
+    const float depth_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << patch_depth);
+    const float surface_bias = std::max(depth_voxel_size * 3.0f, kilometers_to_world_units(0.75f));
+    const float surface_radius = std::max(1.0f, length(patch.center_mesh)) + surface_bias;
+    const float half_extent = patch.suppress_radius_mesh;
+    const float dig_radius = patch.dig_radius_mesh > 0.0f
+        ? patch.dig_radius_mesh + kilometers_to_world_units(0.25f)
+        : 0.0f;
+    const float cell_spacing = std::max(depth_voxel_size * 14.0f, kilometers_to_world_units(1.5f));
+    const uint32_t segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((half_extent * 2.0f) / cell_spacing)),
+        8u,
+        192u
+    );
+    const float step = (half_extent * 2.0f) / static_cast<float>(segments);
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+
+    auto sample = [&](float x, float y) {
+        const Vec3 offset = tangent * x + bitangent * y;
+        return normalize(axis * surface_radius + offset) * surface_radius;
+    };
+
+    for (uint32_t y = 0; y < segments; ++y) {
+        const float y0 = -half_extent + static_cast<float>(y) * step;
+        const float y1 = y0 + step;
+        for (uint32_t x = 0; x < segments; ++x) {
+            const float x0 = -half_extent + static_cast<float>(x) * step;
+            const float x1 = x0 + step;
+            const float cx = (x0 + x1) * 0.5f;
+            const float cy = (y0 + y1) * 0.5f;
+            if (dig_radius > 0.0f && std::sqrt(cx * cx + cy * cy) <= dig_radius) {
+                continue;
+            }
+
+            const Vec3 p00 = sample(x0, y0);
+            const Vec3 p01 = sample(x0, y1);
+            const Vec3 p10 = sample(x1, y0);
+            const Vec3 p11 = sample(x1, y1);
+            append_surface_net_triangle(surface_net, p00, p10, p11, axis, max_vertices);
+            append_surface_net_triangle(surface_net, p00, p11, p01, axis, max_vertices);
+        }
+    }
+}
+
+void append_depth_transition_rect(
+    SurfaceNetMesh& surface_net,
+    Vec3 axis,
+    Vec3 tangent,
+    Vec3 bitangent,
+    float surface_radius,
+    float u0,
+    float u1,
+    float v0,
+    float v1,
+    float step,
+    const LocalSurfaceNetPatch& patch,
+    uint32_t max_vertices,
+    uint32_t depth_tag
+) {
+    if (u1 <= u0 || v1 <= v0 || step <= 0.0f) {
+        return;
+    }
+
+    auto sample = [&](float u, float v) {
+        return normalize(axis * surface_radius + tangent * u + bitangent * v) * surface_radius;
+    };
+    auto blocked_by_dig = [&](Vec3 position) {
+        if (patch.dig_radius_mesh <= 0.0f || length(patch.dig_center_mesh) <= 0.000001f) {
+            return false;
+        }
+        const Vec3 dig_axis = normalize(patch.dig_center_mesh);
+        const float axial = dot(position - patch.dig_center_mesh, dig_axis);
+        const Vec3 axis_point = patch.dig_center_mesh + dig_axis * axial;
+        const float tangent_distance = length(position - axis_point);
+        return axial <= patch.dig_radius_mesh * 0.65f &&
+               tangent_distance <= patch.dig_radius_mesh + step * 3.0f;
+    };
+
+    const uint32_t u_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((u1 - u0) / step)),
+        1u,
+        160u
+    );
+    const uint32_t v_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((v1 - v0) / step)),
+        1u,
+        160u
+    );
+
+    for (uint32_t y = 0; y < v_segments; ++y) {
+        const float ty0 = static_cast<float>(y) / static_cast<float>(v_segments);
+        const float ty1 = static_cast<float>(y + 1u) / static_cast<float>(v_segments);
+        const float va = v0 + (v1 - v0) * ty0;
+        const float vb = v0 + (v1 - v0) * ty1;
+        for (uint32_t x = 0; x < u_segments; ++x) {
+            const float tx0 = static_cast<float>(x) / static_cast<float>(u_segments);
+            const float tx1 = static_cast<float>(x + 1u) / static_cast<float>(u_segments);
+            const float ua = u0 + (u1 - u0) * tx0;
+            const float ub = u0 + (u1 - u0) * tx1;
+            const Vec3 p00 = sample(ua, va);
+            const Vec3 p10 = sample(ub, va);
+            const Vec3 p01 = sample(ua, vb);
+            const Vec3 p11 = sample(ub, vb);
+            const Vec3 centroid = (p00 + p10 + p01 + p11) * 0.25f;
+            if (blocked_by_dig(centroid)) {
+                continue;
+            }
+
+            append_surface_net_triangle(surface_net, p00, p10, p11, axis, max_vertices, depth_tag);
+            append_surface_net_triangle(surface_net, p00, p11, p01, axis, max_vertices, depth_tag);
+        }
+    }
+}
+
+void append_depth8_to_depth16_transition_skirt(
+    SurfaceNetMesh& surface_net,
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    if (!patch.replace_surface || patch.promoted_depth8_keys.empty() || length(patch.center_mesh) <= 0.000001f) {
+        return;
+    }
+
+    const Vec3 axis = normalize(patch.center_mesh);
+    const Vec3 reference = std::fabs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference, axis));
+    const Vec3 bitangent = cross(axis, tangent);
+
+    float min_u = 1000000.0f;
+    float max_u = -1000000.0f;
+    float min_v = 1000000.0f;
+    float max_v = -1000000.0f;
+    for (uint32_t corner = 0; corner < 8u; ++corner) {
+        const Vec3 p{
+            (corner & 1u) != 0u ? patch.replacement_max.x : patch.replacement_min.x,
+            (corner & 2u) != 0u ? patch.replacement_max.y : patch.replacement_min.y,
+            (corner & 4u) != 0u ? patch.replacement_max.z : patch.replacement_min.z,
+        };
+        const Vec3 relative = p - patch.center_mesh;
+        const float u = dot(relative, tangent);
+        const float v = dot(relative, bitangent);
+        min_u = std::min(min_u, u);
+        max_u = std::max(max_u, u);
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+    }
+
+    if (max_u <= min_u || max_v <= min_v) {
+        return;
+    }
+
+    const float root_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << SurfacePromotionRootDepth);
+    const uint32_t patch_depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
+    const float detail_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << patch_depth);
+    const float inner_overlap = std::max(detail_voxel_size * 8.0f, kilometers_to_world_units(1.0f));
+    const float outer_width = std::max(root_voxel_size * 0.45f, kilometers_to_world_units(18.0f));
+    const float step = std::max(detail_voxel_size * 32.0f, kilometers_to_world_units(3.0f));
+    const float surface_radius = std::max(1.0f, length(patch.dig_center_mesh)) +
+                                 std::max(detail_voxel_size * 4.0f, kilometers_to_world_units(0.75f));
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    const uint32_t transition_depth_tag = patch_depth > 1u ? patch_depth - 1u : patch_depth;
+
+    const float outer_min_u = min_u - outer_width;
+    const float outer_max_u = max_u + outer_width;
+    const float outer_min_v = min_v - outer_width;
+    const float outer_max_v = max_v + outer_width;
+
+    append_depth_transition_rect(
+        surface_net,
+        axis,
+        tangent,
+        bitangent,
+        surface_radius,
+        outer_min_u,
+        min_u + inner_overlap,
+        outer_min_v,
+        outer_max_v,
+        step,
+        patch,
+        max_vertices,
+        transition_depth_tag
+    );
+    append_depth_transition_rect(
+        surface_net,
+        axis,
+        tangent,
+        bitangent,
+        surface_radius,
+        max_u - inner_overlap,
+        outer_max_u,
+        outer_min_v,
+        outer_max_v,
+        step,
+        patch,
+        max_vertices,
+        transition_depth_tag
+    );
+    append_depth_transition_rect(
+        surface_net,
+        axis,
+        tangent,
+        bitangent,
+        surface_radius,
+        min_u + inner_overlap,
+        max_u - inner_overlap,
+        outer_min_v,
+        min_v + inner_overlap,
+        step,
+        patch,
+        max_vertices,
+        transition_depth_tag
+    );
+    append_depth_transition_rect(
+        surface_net,
+        axis,
+        tangent,
+        bitangent,
+        surface_radius,
+        min_u + inner_overlap,
+        max_u - inner_overlap,
+        max_v - inner_overlap,
+        outer_max_v,
+        step,
+        patch,
+        max_vertices,
+        transition_depth_tag
+    );
+}
+
 void suppress_surface_net_triangles_for_patches(
     SurfaceNetMesh& surface_net,
     const std::vector<LocalSurfaceNetPatch>& patches,
-    float pad
+    float pad,
+    bool use_replacement_region
 ) {
     if (patches.empty() || surface_net.triangle_indices.empty()) {
         return;
@@ -3119,7 +4004,12 @@ void suppress_surface_net_triangles_for_patches(
         const Vec3 b = surface_net.vertices[ib];
         const Vec3 c = surface_net.vertices[ic];
         const Vec3 centroid = (a + b + c) / 3.0f;
-        if (surface_net_position_in_patch(centroid, patches, pad)) {
+        const bool remove_triangle = use_replacement_region
+            ? (surface_net_position_in_replacement_patch(centroid, patches, pad) ||
+               surface_net_triangle_overlaps_replacement_patches(a, b, c, patches, pad))
+            : (surface_net_position_in_patch(centroid, patches, pad) ||
+               surface_net_triangle_overlaps_dig_patches(a, b, c, patches, pad));
+        if (remove_triangle) {
             continue;
         }
 
@@ -3272,12 +4162,13 @@ void fill_local_radial_occupancy(
     const std::vector<PreparedVoxelDig>& digs
 ) {
     const float shell_radius = patch.extraction_radius_mesh + std::sqrt(3.0f) * voxel_size;
+    const bool use_replacement_bounds = !patch.promoted_depth8_keys.empty();
     occupied_keys.clear();
     for (uint32_t z = 0; z < resolution; ++z) {
         for (uint32_t y = 0; y < resolution; ++y) {
             for (uint32_t x = 0; x < resolution; ++x) {
                 const Vec3 position = local_surface_net_sample_position(x, y, z, origin, voxel_size);
-                if (length(position - patch.center_mesh) > shell_radius ||
+                if ((!use_replacement_bounds && length(position - patch.center_mesh) > shell_radius) ||
                     length(position) > surface_radius ||
                     local_surface_net_sample_carved(position, digs)) {
                     continue;
@@ -3301,7 +4192,12 @@ void fill_local_radial_occupancy(
                     !surface_net_bit(occupancy, surface_net_grid_index(x, y, z - 1u, resolution)) ||
                     !surface_net_bit(occupancy, surface_net_grid_index(x, y, z + 1u, resolution));
                 const Vec3 position = local_surface_net_sample_position(x, y, z, origin, voxel_size);
-                if (boundary && length(position - patch.center_mesh) <= patch.extraction_radius_mesh - voxel_size * 2.0f) {
+                const bool inside_patch =
+                    (use_replacement_bounds &&
+                        position.x >= patch.replacement_min.x && position.y >= patch.replacement_min.y && position.z >= patch.replacement_min.z &&
+                        position.x <= patch.replacement_max.x && position.y <= patch.replacement_max.y && position.z <= patch.replacement_max.z) ||
+                    length(position - patch.center_mesh) <= patch.extraction_radius_mesh - voxel_size * 2.0f;
+                if (boundary && inside_patch) {
                     occupied_keys.push_back({x, y, z});
                 }
             }
@@ -3314,9 +4210,18 @@ LocalSurfaceNetGrid local_surface_net_grid_for_patch(
     float grid_radius
 ) {
     LocalSurfaceNetGrid grid;
-    grid.depth = std::clamp(patch.depth, 1u, 15u);
+    grid.depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
     const uint32_t global_resolution = 1u << grid.depth;
     grid.voxel_size = (grid_radius * 2.0f) / static_cast<float>(global_resolution);
+    if (!patch.promoted_depth8_keys.empty()) {
+        const Vec3 extent = patch.replacement_max - patch.replacement_min;
+        const float longest_extent = std::max(extent.x, std::max(extent.y, extent.z));
+        grid.resolution = static_cast<uint32_t>(std::ceil(longest_extent / grid.voxel_size)) + 3u;
+        grid.resolution = std::clamp(grid.resolution, 4u, LocalSurfaceNetMaxResolution);
+        grid.radius = grid.voxel_size * static_cast<float>(grid.resolution) * 0.5f;
+        grid.origin = patch.replacement_min - Vec3{grid.voxel_size, grid.voxel_size, grid.voxel_size};
+        return grid;
+    }
     grid.resolution = static_cast<uint32_t>(std::ceil((patch.extraction_radius_mesh * 2.0f) / grid.voxel_size)) + 4u;
     grid.resolution = std::clamp(grid.resolution, 4u, 192u);
     grid.radius = grid.voxel_size * static_cast<float>(grid.resolution) * 0.5f;
@@ -3332,15 +4237,226 @@ std::vector<LocalSurfaceNetPatch> realized_local_surface_net_patches(
     realized.reserve(patches.size());
     for (LocalSurfaceNetPatch patch : patches) {
         const LocalSurfaceNetGrid grid = local_surface_net_grid_for_patch(patch, grid_radius);
-        const float realized_radius = std::max(
+        const float realized_detail_radius = std::max(
             patch.suppress_radius_mesh,
-            grid.radius - grid.voxel_size * 3.0f
+            std::max(0.0f, grid.radius - grid.voxel_size * 3.0f)
         );
-        patch.suppress_radius_mesh = std::min(patch.extraction_radius_mesh, realized_radius);
-        patch.extraction_radius_mesh = patch.suppress_radius_mesh;
+        const float requested_extraction_radius = patch.extraction_radius_mesh;
+        patch.extraction_radius_mesh = std::min(requested_extraction_radius, realized_detail_radius);
+        patch.suppress_radius_mesh = patch.replace_surface
+            ? patch.extraction_radius_mesh
+            : patch.suppress_radius_mesh;
         realized.push_back(patch);
     }
     return realized;
+}
+
+SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
+    const QuantizedMesh& mesh,
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    SurfaceNetMesh surface_net;
+    if (!config.enable_surface_net_generation ||
+        patch.promoted_depth8_keys.empty() ||
+        length(patch.dig_center_mesh) <= 0.000001f) {
+        return surface_net;
+    }
+
+    const uint32_t depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << depth);
+    const float root_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << SurfacePromotionRootDepth);
+    const Vec3 axis = normalize(patch.dig_center_mesh);
+    const Vec3 reference = std::fabs(axis.y) < 0.9f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference, axis));
+    const Vec3 bitangent = cross(axis, tangent);
+    const float replacement_pad = std::max(root_voxel_size * 0.75f, voxel_size * 8.0f);
+    const float fallback_surface_radius = std::max(0.000001f, length(patch.dig_center_mesh));
+
+    float replaced_surface_radius = fallback_surface_radius;
+    uint32_t replaced_sample_count = 0;
+    for (const Vec3& vertex : mesh.surface_net_base_cache.vertices) {
+        if (vertex.x < patch.replacement_min.x - replacement_pad ||
+            vertex.y < patch.replacement_min.y - replacement_pad ||
+            vertex.z < patch.replacement_min.z - replacement_pad ||
+            vertex.x > patch.replacement_max.x + replacement_pad ||
+            vertex.y > patch.replacement_max.y + replacement_pad ||
+            vertex.z > patch.replacement_max.z + replacement_pad) {
+            continue;
+        }
+
+        const float radius = length(vertex);
+        if (radius > replaced_surface_radius) {
+            replaced_surface_radius = radius;
+        }
+        ++replaced_sample_count;
+    }
+    if (replaced_sample_count == 0u) {
+        replaced_surface_radius = std::min(grid_radius, fallback_surface_radius + root_voxel_size * 0.5f);
+    }
+    replaced_surface_radius = std::clamp(replaced_surface_radius, fallback_surface_radius, grid_radius);
+
+    const Vec3 plane_origin = axis * replaced_surface_radius;
+
+    float min_u = 1000000.0f;
+    float max_u = -1000000.0f;
+    float min_v = 1000000.0f;
+    float max_v = -1000000.0f;
+    for (uint32_t corner = 0; corner < 8u; ++corner) {
+        const Vec3 p{
+            (corner & 1u) != 0u ? patch.replacement_max.x : patch.replacement_min.x,
+            (corner & 2u) != 0u ? patch.replacement_max.y : patch.replacement_min.y,
+            (corner & 4u) != 0u ? patch.replacement_max.z : patch.replacement_min.z,
+        };
+        const Vec3 relative = p - plane_origin;
+        const float u = dot(relative, tangent);
+        const float v = dot(relative, bitangent);
+        min_u = std::min(min_u, u);
+        max_u = std::max(max_u, u);
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+    }
+
+    if (max_u <= min_u || max_v <= min_v) {
+        return surface_net;
+    }
+
+    const float sample_step = std::max(voxel_size * 2.0f, kilometers_to_world_units(0.35f));
+    const uint32_t u_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((max_u - min_u) / sample_step)),
+        2u,
+        320u
+    );
+    const uint32_t v_segments = std::clamp(
+        static_cast<uint32_t>(std::ceil((max_v - min_v) / sample_step)),
+        2u,
+        320u
+    );
+    const float bounds_pad = replacement_pad;
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    const std::vector<PreparedVoxelDig> digs = prepare_exact_voxel_digs(config.voxel_edits);
+
+    surface_net.source_depth = depth;
+    surface_net.bounds_radius = grid_radius;
+    surface_net.material_id = config.surface_net_material_id;
+    surface_net.vertices.reserve(std::min<uint32_t>((u_segments + 1u) * (v_segments + 1u), max_vertices));
+    surface_net.normals.reserve(surface_net.vertices.capacity());
+    surface_net.vertex_depths.reserve(surface_net.vertices.capacity());
+    surface_net.triangle_indices.reserve(static_cast<size_t>(u_segments) * static_cast<size_t>(v_segments) * 6u);
+
+    auto sample = [&](float u, float v) {
+        return normalize(plane_origin + tangent * u + bitangent * v) * replaced_surface_radius;
+    };
+    auto sample_carved = [&](Vec3 position) {
+        for (const PreparedVoxelDig& dig : digs) {
+            if (length(dig.center_mesh) <= 0.000001f) {
+                continue;
+            }
+            const Vec3 dig_axis = normalize(dig.center_mesh);
+            const float axial = dot(position - dig.center_mesh, dig_axis);
+            const Vec3 axis_point = dig.center_mesh + dig_axis * axial;
+            const float tangent_distance = length(position - axis_point);
+            const float allowed_axial = std::max(dig.radius_mesh * 0.35f, root_voxel_size * 1.25f);
+            if (axial <= allowed_axial && tangent_distance <= dig.radius_mesh) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto inside_replacement_bounds = [&](Vec3 p) {
+        return p.x >= patch.replacement_min.x - bounds_pad &&
+               p.y >= patch.replacement_min.y - bounds_pad &&
+               p.z >= patch.replacement_min.z - bounds_pad &&
+               p.x <= patch.replacement_max.x + bounds_pad &&
+               p.y <= patch.replacement_max.y + bounds_pad &&
+               p.z <= patch.replacement_max.z + bounds_pad;
+    };
+
+    std::vector<int32_t> grid_vertices(static_cast<size_t>(u_segments + 1u) * static_cast<size_t>(v_segments + 1u), -1);
+    auto grid_index = [&](uint32_t x, uint32_t y) {
+        return static_cast<size_t>(y) * static_cast<size_t>(u_segments + 1u) + static_cast<size_t>(x);
+    };
+
+    for (uint32_t y = 0; y <= v_segments; ++y) {
+        const float ty = static_cast<float>(y) / static_cast<float>(v_segments);
+        const float v = min_v + (max_v - min_v) * ty;
+        for (uint32_t x = 0; x <= u_segments; ++x) {
+            if (surface_net.vertices.size() >= max_vertices) {
+                break;
+            }
+            const float tx = static_cast<float>(x) / static_cast<float>(u_segments);
+            const float u = min_u + (max_u - min_u) * tx;
+            const Vec3 p = sample(u, v);
+            if (!inside_replacement_bounds(p) || sample_carved(p)) {
+                continue;
+            }
+
+            const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
+            surface_net.vertices.push_back(p);
+            surface_net.normals.push_back(p);
+            surface_net.vertex_depths.push_back(depth);
+            grid_vertices[grid_index(x, y)] = static_cast<int32_t>(vertex_index);
+        }
+    }
+
+    for (uint32_t y = 0; y < v_segments; ++y) {
+        for (uint32_t x = 0; x < u_segments; ++x) {
+            const int32_t a = grid_vertices[grid_index(x, y)];
+            const int32_t b = grid_vertices[grid_index(x + 1u, y)];
+            const int32_t c = grid_vertices[grid_index(x + 1u, y + 1u)];
+            const int32_t d = grid_vertices[grid_index(x, y + 1u)];
+            append_surface_net_quad(surface_net, a, b, c, d);
+        }
+    }
+
+    const float wall_depth = std::max(root_voxel_size * 0.95f, voxel_size * 8.0f);
+    auto cell_has_surface = [&](uint32_t x, uint32_t y) {
+        if (x >= u_segments || y >= v_segments) {
+            return false;
+        }
+        return grid_vertices[grid_index(x, y)] >= 0 &&
+               grid_vertices[grid_index(x + 1u, y)] >= 0 &&
+               grid_vertices[grid_index(x + 1u, y + 1u)] >= 0 &&
+               grid_vertices[grid_index(x, y + 1u)] >= 0;
+    };
+    auto append_wall = [&](int32_t ia, int32_t ib) {
+        if (ia < 0 || ib < 0 || surface_net.vertices.size() + 6u > max_vertices) {
+            return;
+        }
+        const Vec3 top_a = surface_net.vertices[static_cast<uint32_t>(ia)];
+        const Vec3 top_b = surface_net.vertices[static_cast<uint32_t>(ib)];
+        const Vec3 bottom_a = normalize(top_a) * std::max(0.0f, length(top_a) - wall_depth);
+        const Vec3 bottom_b = normalize(top_b) * std::max(0.0f, length(top_b) - wall_depth);
+        const Vec3 preferred_normal = normalize(cross(top_b - top_a, bottom_a - top_a));
+        append_surface_net_triangle(surface_net, top_a, bottom_a, bottom_b, preferred_normal, max_vertices, depth);
+        append_surface_net_triangle(surface_net, top_a, bottom_b, top_b, preferred_normal, max_vertices, depth);
+    };
+
+    for (uint32_t y = 0; y <= v_segments; ++y) {
+        for (uint32_t x = 0; x < u_segments; ++x) {
+            const bool below = y > 0u && cell_has_surface(x, y - 1u);
+            const bool above = y < v_segments && cell_has_surface(x, y);
+            if (below == above) {
+                continue;
+            }
+            append_wall(grid_vertices[grid_index(x, y)], grid_vertices[grid_index(x + 1u, y)]);
+        }
+    }
+    for (uint32_t y = 0; y < v_segments; ++y) {
+        for (uint32_t x = 0; x <= u_segments; ++x) {
+            const bool left = x > 0u && cell_has_surface(x - 1u, y);
+            const bool right = x < u_segments && cell_has_surface(x, y);
+            if (left == right) {
+                continue;
+            }
+            append_wall(grid_vertices[grid_index(x, y)], grid_vertices[grid_index(x, y + 1u)]);
+        }
+    }
+
+    surface_net.occupied_voxel_count = static_cast<uint32_t>(surface_net.vertices.size());
+    surface_net.candidate_cube_count = static_cast<uint32_t>(u_segments * v_segments);
+    return surface_net;
 }
 
 SurfaceNetMesh build_local_surface_net_patch_mesh(
@@ -3352,6 +4468,10 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
     SurfaceNetMesh surface_net;
     if (!config.enable_surface_net_generation) {
         return surface_net;
+    }
+
+    if (!config.enable_fractures && !patch.promoted_depth8_keys.empty()) {
+        return build_fast_local_radial_surface_patch_mesh(mesh, patch, grid_radius, config);
     }
 
     const LocalSurfaceNetGrid grid = local_surface_net_grid_for_patch(patch, grid_radius);
@@ -3472,30 +4592,28 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
             continue;
         }
 
-        Vec3 average = {};
-        Vec3 normal = {};
-        uint32_t crossing_count = 0;
-        for (const auto& edge : edges) {
-            const uint32_t a = edge[0];
-            const uint32_t b = edge[1];
-            if (inside[a] == inside[b]) {
-                continue;
-            }
-            average = average + (positions[a] + positions[b]) * 0.5f;
-            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
-            ++crossing_count;
-        }
-        if (crossing_count == 0u) {
+        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
+            inside,
+            positions,
+            edges,
+            config.enable_surface_net_dual_contouring
+        );
+        if (length(placement.normal) <= 0.000001f) {
             continue;
         }
 
-        const Vec3 vertex = average / static_cast<float>(crossing_count);
-        if (length(vertex - patch.center_mesh) > patch.extraction_radius_mesh - voxel_size * 2.0f) {
+        const Vec3 vertex = placement.position;
+        const bool use_replacement_bounds = !patch.promoted_depth8_keys.empty();
+        if ((!use_replacement_bounds && length(vertex - patch.center_mesh) > patch.extraction_radius_mesh - voxel_size * 2.0f) ||
+            (use_replacement_bounds &&
+                (vertex.x < patch.replacement_min.x - voxel_size || vertex.y < patch.replacement_min.y - voxel_size || vertex.z < patch.replacement_min.z - voxel_size ||
+                 vertex.x > patch.replacement_max.x + voxel_size || vertex.y > patch.replacement_max.y + voxel_size || vertex.z > patch.replacement_max.z + voxel_size))) {
             continue;
         }
         const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
         surface_net.vertices.push_back(vertex);
-        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(vertex));
+        surface_net.normals.push_back(placement.normal);
+        surface_net.vertex_depths.push_back(depth);
         cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
     }
 
@@ -3553,16 +4671,41 @@ void append_local_surface_net_patches(
 
     surface_net.local_patch_depth = patches.front().depth;
     for (const LocalSurfaceNetPatch& patch : patches) {
-        const uint32_t vertex_count_before = static_cast<uint32_t>(surface_net.vertices.size());
-        const uint32_t triangle_count_before = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
-        SurfaceNetMesh patch_mesh = build_local_surface_net_patch_mesh(mesh, patch, grid_radius, config);
-        if (patch_mesh.vertices.empty() || patch_mesh.triangle_indices.empty()) {
-            continue;
+        std::vector<LocalSurfaceNetPatch> root_patches;
+        root_patches.push_back(patch);
+
+        for (const LocalSurfaceNetPatch& root_patch : root_patches) {
+            const uint32_t vertex_count_before = static_cast<uint32_t>(surface_net.vertices.size());
+            const uint32_t triangle_count_before = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
+            SurfaceNetMesh patch_mesh = build_local_surface_net_patch_mesh(mesh, root_patch, grid_radius, config);
+            if (!patch_mesh.vertices.empty() && !patch_mesh.triangle_indices.empty()) {
+                const uint32_t patch_depth = std::clamp(root_patch.depth, 1u, MaxSvoDepth);
+                const float depth_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << patch_depth);
+                if (root_patch.promoted_depth8_keys.empty()) {
+                    suppress_surface_net_triangles_for_patches(
+                        patch_mesh,
+                        patches,
+                        std::max(depth_voxel_size * 2.0f, kilometers_to_world_units(0.25f)),
+                        false
+                    );
+                }
+                if (root_patch.promoted_depth8_keys.empty()) {
+                    bias_surface_net_outward(patch_mesh, depth_voxel_size * 0.25f);
+                }
+                if (!patch_mesh.triangle_indices.empty()) {
+                    append_surface_net_mesh(surface_net, patch_mesh);
+                }
+            }
+
+            const uint32_t added_vertices = static_cast<uint32_t>(surface_net.vertices.size()) - vertex_count_before;
+            const uint32_t added_triangles = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u) - triangle_count_before;
+            if (added_vertices == 0u || added_triangles == 0u) {
+                continue;
+            }
+            ++surface_net.local_patch_count;
+            surface_net.local_vertex_count += added_vertices;
+            surface_net.local_triangle_count += added_triangles;
         }
-        append_surface_net_mesh(surface_net, patch_mesh);
-        ++surface_net.local_patch_count;
-        surface_net.local_vertex_count += static_cast<uint32_t>(surface_net.vertices.size()) - vertex_count_before;
-        surface_net.local_triangle_count += static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u) - triangle_count_before;
     }
 }
 
@@ -3684,13 +4827,15 @@ float mesh_voxel_bounds_radius(const QuantizedMesh& mesh) {
 }
 
 void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig& config) {
+    validate_morton_helpers_once();
+
     mesh.svo = {};
     mesh.surface_net = {};
     if (!config.enable_svo_generation || mesh.vertices.empty()) {
         return;
     }
 
-    const uint32_t depth = std::clamp(config.svo_depth, 1u, 15u);
+    const uint32_t depth = std::clamp(config.svo_depth, 1u, MaxSvoDepth);
     const uint32_t resolution = 1u << depth;
     float grid_radius = mesh.voxel_occupancy_cache.depth == depth && mesh.voxel_occupancy_cache.bounds_radius > 0.0f
         ? mesh.voxel_occupancy_cache.bounds_radius
@@ -3708,10 +4853,17 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     }
 
     const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = realized_local_surface_net_patches(
-        build_local_surface_net_patches(config),
+        build_local_surface_net_patches(config, grid_radius),
         grid_radius
     );
-    const uint32_t surface_net_depth = std::clamp(std::min(config.surface_net_depth, depth), 1u, 15u);
+    const bool has_promoted_depth8_roots = std::any_of(
+        local_surface_net_patches.begin(),
+        local_surface_net_patches.end(),
+        [](const LocalSurfaceNetPatch& patch) {
+            return patch.replace_surface && !patch.promoted_depth8_keys.empty();
+        }
+    );
+    const uint32_t surface_net_depth = std::clamp(std::min(config.surface_net_depth, depth), 1u, MaxSvoDepth);
     if (mesh.surface_net_base_cache.source_depth != surface_net_depth ||
         std::fabs(mesh.surface_net_base_cache.bounds_radius - grid_radius) > 0.000001f ||
         mesh.surface_net_base_cache.material_id != config.surface_net_material_id ||
@@ -3725,15 +4877,24 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
             base_surface_config
         );
     }
-    mesh.surface_net = mesh.surface_net_base_cache;
+    if (has_promoted_depth8_roots) {
+        MarchingCubesConfig promoted_surface_config = config;
+        promoted_surface_config.voxel_edits.digs.clear();
+        mesh.surface_net = build_surface_net_mesh_from_occupancy(
+            mesh.voxel_occupancy_cache.leaf_keys,
+            depth,
+            grid_radius,
+            promoted_surface_config,
+            local_surface_net_patches
+        );
+    } else {
+        mesh.surface_net = mesh.surface_net_base_cache;
+    }
     mesh.surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
     mesh.surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
-    suppress_surface_net_triangles_for_patches(
-        mesh.surface_net,
-        local_surface_net_patches,
-        kilometers_to_world_units(1.0f)
-    );
-    append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
+    if (has_promoted_depth8_roots) {
+        append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
+    }
 
     std::vector<VoxelKey> keys = mesh.voxel_occupancy_cache.leaf_keys;
     const uint32_t dig_removed_leaf_count = apply_exact_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
@@ -3847,6 +5008,7 @@ QuantizedMeshValidation validate_quantized_mesh(const QuantizedMesh& mesh) {
     if (mesh.surface_net.source_depth > 0u) {
         require(!mesh.surface_net.vertices.empty(), "surface net vertex buffer is empty");
         require(mesh.surface_net.normals.size() == mesh.surface_net.vertices.size(), "surface net normal count does not match vertex count");
+        require(mesh.surface_net.vertex_depths.empty() || mesh.surface_net.vertex_depths.size() == mesh.surface_net.vertices.size(), "surface net depth tag count does not match vertex count");
         require(!mesh.surface_net.triangle_indices.empty(), "surface net index buffer is empty");
         require(mesh.surface_net.triangle_indices.size() % 3 == 0, "surface net index count is not divisible by 3");
     }
