@@ -1,5 +1,6 @@
 #include "aetheronus/debug_renderer.hpp"
 #include "aetheronus/meshing.hpp"
+#include "aetheronus/planet_scale.hpp"
 #include "aetheronus/point_cloud.hpp"
 #include "aetheronus/spaceship.hpp"
 #include "aetheronus/topology.hpp"
@@ -15,6 +16,10 @@
 #include <vector>
 
 namespace {
+
+constexpr uint32_t DefaultSvoDepth = 8;
+constexpr uint32_t ScreamSvoDepth = 13;
+constexpr uint32_t SvoDebugDrawDepth = 8;
 
 void print_gl_string(GLenum name, const char* label) {
     const GLubyte* value = glGetString(name);
@@ -43,9 +48,13 @@ ae::Vec3 free_camera_right(const ae::FreeCamera& camera) {
     return ae::normalize(ae::cross(free_camera_forward(camera), {0.0f, 1.0f, 0.0f}));
 }
 
+ae::Vec3 free_camera_eye(const ae::FreeCamera& camera) {
+    return camera.target - free_camera_forward(camera) * camera.distance;
+}
+
 ae::CameraView make_free_camera_view(const ae::FreeCamera& camera) {
     const ae::Vec3 forward = free_camera_forward(camera);
-    return {camera.position, camera.position + forward, {0.0f, 1.0f, 0.0f}};
+    return {free_camera_eye(camera), camera.target, {0.0f, 1.0f, 0.0f}};
 }
 
 ae::CameraView make_ship_follow_view(const ae::SpaceshipState& ship) {
@@ -59,6 +68,27 @@ ae::CameraView make_ship_follow_view(const ae::SpaceshipState& ship) {
     };
 }
 
+bool ray_sphere_intersection(ae::Vec3 origin, ae::Vec3 direction, float radius, ae::Vec3& hit) {
+    direction = ae::normalize(direction);
+    const float b = 2.0f * ae::dot(origin, direction);
+    const float c = ae::dot(origin, origin) - radius * radius;
+    const float discriminant = b * b - 4.0f * c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+
+    const float root = std::sqrt(discriminant);
+    const float t0 = (-b - root) * 0.5f;
+    const float t1 = (-b + root) * 0.5f;
+    const float t = t0 > 0.0f ? t0 : t1;
+    if (t <= 0.0f) {
+        return false;
+    }
+
+    hit = origin + direction * t;
+    return true;
+}
+
 struct MeshBuildResult {
     ae::QuantizedMesh mesh;
     ae::QuantizedMeshValidation validation;
@@ -69,7 +99,7 @@ struct MeshBuildResult {
 
 MeshBuildResult build_lod_mesh_async(
     const ae::GoldbergTopology& topology,
-    const std::vector<ae::PointSample>& points,
+    const ae::PointCloud& points,
     ae::MarchingCubesConfig config,
     uint32_t revision
 ) {
@@ -143,9 +173,12 @@ int main() {
     print_gl_string(GL_RENDERER, "GL_RENDERER");
     print_gl_string(GL_VERSION, "GL_VERSION");
     SDL_GL_SetSwapInterval(0);
+    std::cout << "Planet scale: " << ae::PlanetCircumferenceKilometers << " km circumference, "
+              << ae::PlanetRadiusKilometers << " km radius, "
+              << ae::KilometersPerWorldUnit << " km/mesh-unit, rendered in kilometer-space." << std::endl;
 
     const ae::GoldbergTopology topology = ae::build_goldberg_topology(2);
-    const std::vector<ae::PointSample> points = ae::build_surface_point_cloud(topology);
+    const ae::PointCloud points = ae::build_surface_point_cloud(topology);
     ae::FreeCamera camera;
     ae::MarchingCubesConfig mesh_config;
     mesh_config.enable_camera_proximity_lod = true;
@@ -154,9 +187,18 @@ int main() {
     mesh_config.lod_levels = 4;
     mesh_config.lod_inner_patch_radius = 0.18f;
     mesh_config.lod_outer_patch_radius = 0.95f;
-    mesh_config.lod_camera_position = camera.position;
-    mesh_config.enable_fractures = true;
+    mesh_config.lod_camera_position = free_camera_eye(camera);
+    mesh_config.enable_fractures = false;
     mesh_config.fracture_seed = 1;
+    mesh_config.fracture_gap = 0.026f;
+    mesh_config.fracture_depth = 0.018f;
+    mesh_config.fracture_wall_depth = 0.64f;
+    mesh_config.fracture_chunk_outward_min = 0.08f;
+    mesh_config.fracture_chunk_outward_max = 0.72f;
+    mesh_config.svo_depth = DefaultSvoDepth;
+    mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
+    ae::VoxelEditSet voxel_edits;
+    mesh_config.voxel_edits = voxel_edits;
     const ae::QuantizedMesh mesh = ae::build_quantized_marching_cubes(topology, points, mesh_config);
     const ae::TopologyValidation validation = ae::validate_topology(topology, static_cast<uint32_t>(points.size()));
     const ae::PointCloudValidation point_validation = ae::validate_point_cloud(topology, points);
@@ -197,6 +239,12 @@ int main() {
     uint64_t last_update_time = fps_update_start;
     constexpr float LodRebuildDistance = 0.12f;
     constexpr std::chrono::milliseconds NoWait{0};
+    auto request_mesh_rebuild = [&]() {
+        requested_mesh_revision = ++mesh_revision;
+        requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
+        requested_mesh_camera_position = mesh_config.lod_camera_position;
+        mesh_rebuild_requested = true;
+    };
 
     bool running = true;
     while (running) {
@@ -211,7 +259,7 @@ int main() {
                     running = false;
                 } else if (event.key.key == SDLK_R) {
                     camera = ae::FreeCamera{};
-                    mesh_config.lod_camera_position = camera.position;
+                    mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
                         requested_mesh_lod_focus = new_lod_focus;
@@ -230,6 +278,20 @@ int main() {
                 } else if (event.key.key == SDLK_F8) {
                     render_options.show_points = !render_options.show_points;
                     std::cout << "Point samples " << (render_options.show_points ? "shown" : "hidden") << std::endl;
+                } else if (event.key.key == SDLK_F10) {
+                    render_options.show_voxels = !render_options.show_voxels;
+                    std::cout << "Voxels " << (render_options.show_voxels ? "shown" : "hidden") << std::endl;
+                } else if (event.key.key == SDLK_F12) {
+                    render_options.show_surface_net = !render_options.show_surface_net;
+                    std::cout << "Surface nets " << (render_options.show_surface_net ? "shown" : "hidden") << std::endl;
+                } else if (event.key.key == SDLK_F11) {
+                    const bool enable_scream_mode = mesh_config.svo_depth < ScreamSvoDepth;
+                    mesh_config.svo_depth = enable_scream_mode ? ScreamSvoDepth : DefaultSvoDepth;
+                    mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
+                    request_mesh_rebuild();
+                    std::cout << "SVO depth " << mesh_config.svo_depth
+                              << " rebuild requested (debug draw depth " << mesh_config.svo_debug_draw_depth
+                              << ")" << std::endl;
                 } else if (event.key.key == SDLK_F9) {
                     render_options.follow_ship = !render_options.follow_ship;
                     if (render_options.follow_ship != relative_mouse_enabled) {
@@ -248,19 +310,34 @@ int main() {
                     std::cout << "Ship follow camera " << (render_options.follow_ship ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F4) {
                     mesh_config.enable_fractures = !mesh_config.enable_fractures;
-                    requested_mesh_revision = ++mesh_revision;
-                    requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-                    requested_mesh_camera_position = mesh_config.lod_camera_position;
-                    mesh_rebuild_requested = true;
+                    request_mesh_rebuild();
                     std::cout << "Fractures " << (mesh_config.enable_fractures ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F5) {
                     ++mesh_config.fracture_seed;
                     mesh_config.enable_fractures = true;
-                    requested_mesh_revision = ++mesh_revision;
-                    requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-                    requested_mesh_camera_position = mesh_config.lod_camera_position;
-                    mesh_rebuild_requested = true;
+                    request_mesh_rebuild();
                     std::cout << "Fracture seed " << mesh_config.fracture_seed << std::endl;
+                } else if (event.key.key == SDLK_F13) {
+                    voxel_edits.digs.clear();
+                    mesh_config.voxel_edits = voxel_edits;
+                    request_mesh_rebuild();
+                    std::cout << "Cleared dig edits; rebuild requested" << std::endl;
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+                const ae::CameraView dig_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
+                ae::Vec3 hit_km = {};
+                if (ray_sphere_intersection(dig_view.eye, dig_view.target - dig_view.eye, ae::PlanetRadiusKilometers, hit_km)) {
+                    voxel_edits.digs.push_back({
+                        hit_km / ae::PlanetRadiusKilometers,
+                        8.0f,
+                        voxel_edits.local_depth,
+                    });
+                    mesh_config.voxel_edits = voxel_edits;
+                    mesh_config.lod_camera_position = dig_view.eye;
+                    request_mesh_rebuild();
+                    std::cout << "Dig edit " << voxel_edits.digs.size()
+                              << ": radius 8 km, local depth " << voxel_edits.local_depth
+                              << " rebuild requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_MOTION && render_options.follow_ship) {
                 ship_mouse_yaw += static_cast<float>(event.motion.xrel);
@@ -268,7 +345,7 @@ int main() {
             } else if (event.type == SDL_EVENT_MOUSE_MOTION && (event.motion.state & SDL_BUTTON_RMASK) != 0) {
                 camera.yaw += static_cast<float>(event.motion.xrel) * 0.0035f;
                 camera.pitch = std::clamp(camera.pitch - static_cast<float>(event.motion.yrel) * 0.0035f, -1.48f, 1.48f);
-                mesh_config.lod_camera_position = camera.position;
+                mesh_config.lod_camera_position = free_camera_eye(camera);
                 const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                 if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
                     requested_mesh_lod_focus = new_lod_focus;
@@ -277,7 +354,11 @@ int main() {
                     mesh_rebuild_requested = true;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-                camera.move_speed = std::clamp(camera.move_speed + event.wheel.y * 0.20f, 0.4f, 8.0f);
+                camera.distance = std::clamp(
+                    camera.distance * std::pow(0.88f, event.wheel.y),
+                    ae::PlanetRadiusKilometers * 1.02f,
+                    ae::PlanetRadiusKilometers * 12.0f
+                );
             }
         }
 
@@ -309,8 +390,8 @@ int main() {
                 movement.y += key_down(SDL_SCANCODE_E) ? 1.0f : 0.0f;
                 movement.y -= key_down(SDL_SCANCODE_Q) ? 1.0f : 0.0f;
                 if (ae::length(movement) > 0.000001f) {
-                    camera.position = camera.position + ae::normalize(movement) * (camera.move_speed * dt);
-                    mesh_config.lod_camera_position = camera.position;
+                    camera.target = camera.target + ae::normalize(movement) * (camera.move_speed * dt);
+                    mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
                         requested_mesh_lod_focus = new_lod_focus;
@@ -322,6 +403,15 @@ int main() {
             }
         }
         ae::update_spaceship(spaceship, ship_input, dt);
+        const ae::CameraView camera_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
+        mesh_config.lod_camera_position = camera_view.eye;
+        const ae::Vec3 frame_lod_focus = ae::normalize(mesh_config.lod_camera_position);
+        if (ae::length(frame_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
+            requested_mesh_lod_focus = frame_lod_focus;
+            requested_mesh_camera_position = mesh_config.lod_camera_position;
+            requested_mesh_revision = ++mesh_revision;
+            mesh_rebuild_requested = true;
+        }
 
         if (mesh_build_pending && pending_mesh_build.wait_for(NoWait) == std::future_status::ready) {
             MeshBuildResult result = pending_mesh_build.get();
@@ -356,7 +446,6 @@ int main() {
         int height = 540;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         renderer.resize(width, height);
-        const ae::CameraView camera_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
         renderer.render(camera_view, spaceship, render_options, show_fps, displayed_fps);
         SDL_GL_SwapWindow(window);
 

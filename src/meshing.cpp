@@ -1,8 +1,10 @@
 #include "aetheronus/meshing.hpp"
 #include "aetheronus/marching_cubes_tables.hpp"
+#include "aetheronus/planet_scale.hpp"
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <map>
 #include <vector>
@@ -46,6 +48,10 @@ struct FracturedLocalSample {
     bool is_internal = false;
 };
 
+struct FractureBuildCache {
+    std::vector<float> chunk_lifts;
+};
+
 struct PositionKey {
     int32_t x = 0;
     int32_t y = 0;
@@ -69,6 +75,7 @@ struct CellEdgeKey {
 
 struct BoundaryEdgeRecord {
     uint32_t cell_id = 0;
+    EdgeKey edge;
     Vec3 a;
     Vec3 b;
     uint32_t material_id = 0;
@@ -121,7 +128,39 @@ struct CorridorPoint {
     uint32_t fracture_chunk_id = 0;
 };
 
-using BoundaryEdgeMap = std::map<CellEdgeKey, BoundaryEdgeRecord>;
+struct JunctionCapPoint {
+    Vec3 position;
+    Vec3 direction;
+    uint32_t cell_id = 0;
+    float angle = 0.0f;
+};
+
+struct VoxelKey {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t z = 0;
+};
+
+struct SurfaceNetEdgeKey {
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t z = 0;
+    uint32_t axis = 0;
+};
+
+struct PreparedVoxelDig {
+    Vec3 center_mesh;
+    float radius_with_leaf_mesh = 0.0f;
+};
+
+struct LocalSurfaceNetPatch {
+    Vec3 center_mesh;
+    float suppress_radius_mesh = 0.0f;
+    float extraction_radius_mesh = 0.0f;
+    uint32_t depth = 13;
+};
+
+using BoundaryEdgeMap = std::vector<BoundaryEdgeRecord>;
 using BoundaryPairMap = std::map<BoundaryPairKey, BoundaryPairChains>;
 using BoundaryPairRunMap = std::map<BoundaryPairKey, BoundaryPairRuns>;
 
@@ -159,6 +198,42 @@ bool operator<(const BoundaryPairKey& lhs, const BoundaryPairKey& rhs) {
         return lhs.a < rhs.a;
     }
     return lhs.b < rhs.b;
+}
+
+uint64_t voxel_morton_code(VoxelKey key) {
+    uint64_t code = 0;
+    for (uint32_t bit = 0; bit < 21; ++bit) {
+        code |= (static_cast<uint64_t>((key.z >> bit) & 1u) << (bit * 3u));
+        code |= (static_cast<uint64_t>((key.y >> bit) & 1u) << (bit * 3u + 1u));
+        code |= (static_cast<uint64_t>((key.x >> bit) & 1u) << (bit * 3u + 2u));
+    }
+    return code;
+}
+
+bool operator<(const VoxelKey& lhs, const VoxelKey& rhs) {
+    const uint64_t lhs_code = voxel_morton_code(lhs);
+    const uint64_t rhs_code = voxel_morton_code(rhs);
+    if (lhs_code != rhs_code) {
+        return lhs_code < rhs_code;
+    }
+    if (lhs.x != rhs.x) return lhs.x < rhs.x;
+    if (lhs.y != rhs.y) return lhs.y < rhs.y;
+    return lhs.z < rhs.z;
+}
+
+bool operator==(const VoxelKey& lhs, const VoxelKey& rhs) {
+    return lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
+}
+
+bool operator<(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
+    if (lhs.axis != rhs.axis) return lhs.axis < rhs.axis;
+    if (lhs.x != rhs.x) return lhs.x < rhs.x;
+    if (lhs.y != rhs.y) return lhs.y < rhs.y;
+    return lhs.z < rhs.z;
+}
+
+bool operator==(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
+    return lhs.axis == rhs.axis && lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
 }
 
 Frame build_frame(Vec3 normal) {
@@ -342,16 +417,8 @@ GridSample interpolate_projected(
     return sample;
 }
 
-float owned_surface_radius(const std::vector<PointSample>& points, uint32_t cell_id) {
-    float radius_sum = 0.0f;
-    uint32_t count = 0;
-    for (const PointSample& point : points) {
-        if (point.owner_cell_id == cell_id) {
-            radius_sum += length(point.position);
-            ++count;
-        }
-    }
-    return count > 0 ? radius_sum / static_cast<float>(count) : 1.0f;
+float owned_surface_radius(const PointCloud& points, uint32_t cell_id) {
+    return cell_id < points.owned_radius_by_cell.size() ? points.owned_radius_by_cell[cell_id] : 1.0f;
 }
 
 float cell_tangent_extent(const GoldbergTopology& topology, const GoldbergCell& cell, const Frame& frame) {
@@ -412,16 +479,15 @@ void record_triangle_edge(
     uint32_t material_id,
     uint32_t fracture_chunk_id
 ) {
-    const CellEdgeKey key = {cell_id, edge_key(a, b)};
-    BoundaryEdgeRecord& record = edges[key];
-    if (record.count == 0) {
-        record.cell_id = cell_id;
-        record.a = a;
-        record.b = b;
-        record.material_id = material_id;
-        record.fracture_chunk_id = fracture_chunk_id;
-    }
-    ++record.count;
+    edges.push_back({
+        cell_id,
+        edge_key(a, b),
+        a,
+        b,
+        material_id,
+        fracture_chunk_id,
+        1u,
+    });
 }
 
 void record_triangle_edges(
@@ -557,8 +623,38 @@ uint32_t hash_u32(uint32_t value) {
     return value;
 }
 
+uint32_t global_fracture_seed_count(const MarchingCubesConfig& config);
+
 float hash_unit(uint32_t value) {
     return static_cast<float>(hash_u32(value) & 0x00ffffffu) / static_cast<float>(0x01000000u);
+}
+
+float compute_fracture_chunk_lift(uint32_t chunk_id, const MarchingCubesConfig& config) {
+    const float outward_min = std::max(0.0f, std::min(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
+    const float outward_max = std::max(outward_min, std::max(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
+    const float outward_t = hash_unit(config.fracture_seed ^ (chunk_id * 0x9e3779b9u) ^ 0x68bc21ebu);
+    return config.fracture_seams_use_max_lift ? outward_max : outward_min + (outward_max - outward_min) * outward_t;
+}
+
+FractureBuildCache build_fracture_build_cache(const MarchingCubesConfig& config) {
+    FractureBuildCache cache;
+    if (!config.enable_fractures || !config.connect_fractures_across_cells) {
+        return cache;
+    }
+
+    const uint32_t seed_count = global_fracture_seed_count(config);
+    cache.chunk_lifts.resize(seed_count + 1u, 0.0f);
+    for (uint32_t chunk_id = 1; chunk_id <= seed_count; ++chunk_id) {
+        cache.chunk_lifts[chunk_id] = compute_fracture_chunk_lift(chunk_id, config);
+    }
+    return cache;
+}
+
+float fracture_chunk_lift(uint32_t chunk_id, const MarchingCubesConfig& config, const FractureBuildCache& cache) {
+    if (chunk_id < cache.chunk_lifts.size()) {
+        return cache.chunk_lifts[chunk_id];
+    }
+    return compute_fracture_chunk_lift(chunk_id, config);
 }
 
 bool point_in_convex_polygon(Vec2 point, const std::vector<Vec2>& polygon) {
@@ -734,57 +830,76 @@ Vec2 deterministic_point_in_polygon(const std::vector<Vec2>& polygon, uint32_t s
     return center;
 }
 
-Vec3 global_fracture_seed_position(const GoldbergTopology& topology, uint32_t source_cell_id, uint32_t copy_index, const MarchingCubesConfig& config) {
-    const GoldbergCell& source_cell = topology.cells[source_cell_id];
-    const Frame source_frame = build_frame(source_cell.normal);
-    const std::vector<Vec2> source_polygon = cell_clip_polygon(topology, source_cell, source_cell.center, source_frame);
-    const Vec2 local_seed = deterministic_point_in_polygon(
-        source_polygon,
-        config.fracture_seed ^ (source_cell_id * 0x9e3779b9u) ^ (copy_index * 0x85ebca6bu)
-    );
-    return normalize(local_to_world(source_cell.center, source_frame, {local_seed.x, local_seed.y, 0.0f}));
+Vec3 global_fracture_seed_position(uint32_t seed_id, uint32_t seed_count, const MarchingCubesConfig& config) {
+    const float count = static_cast<float>(std::max(1u, seed_count));
+    const float index = static_cast<float>(seed_id);
+    const float z = 1.0f - 2.0f * ((index + 0.5f) / count);
+    const float radius = std::sqrt(std::max(0.0f, 1.0f - z * z));
+    constexpr float GoldenAngle = 2.39996323f;
+    const float phase = hash_unit(config.fracture_seed ^ 0x7f4a7c15u) * 2.0f * Pi;
+    const float theta = index * GoldenAngle + phase;
+    return normalize({std::cos(theta) * radius, z, std::sin(theta) * radius});
 }
 
-std::vector<FractureSeed> build_global_fracture_seeds(
+uint32_t global_fracture_seed_count(const MarchingCubesConfig& config) {
+    return std::max(4u, config.global_fracture_seed_count * std::max(1u, config.global_fracture_seed_copies));
+}
+
+uint32_t nearest_global_fracture_chunk_id(Vec3 direction, const MarchingCubesConfig& config) {
+    const uint32_t seed_count = global_fracture_seed_count(config);
+    const Vec3 sample_direction = normalize(direction);
+    uint32_t nearest_seed = 0;
+    float best_score = -2.0f;
+    for (uint32_t seed_id = 0; seed_id < seed_count; ++seed_id) {
+        const float score = dot(sample_direction, global_fracture_seed_position(seed_id, seed_count, config));
+        if (score > best_score) {
+            best_score = score;
+            nearest_seed = seed_id;
+        }
+    }
+    return nearest_seed + 1u;
+}
+
+void build_global_fracture_seeds(
     const GoldbergTopology& topology,
     Vec3 cell_center,
     const Frame& frame,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    std::vector<FractureSeed>& seeds
 ) {
-    std::vector<FractureSeed> seeds;
-    const uint32_t seed_copies = std::max(1u, config.global_fracture_seed_copies);
-    seeds.reserve(topology.cells.size() * seed_copies);
-    for (uint32_t source_cell_id = 0; source_cell_id < topology.cells.size(); ++source_cell_id) {
-        for (uint32_t copy_index = 0; copy_index < seed_copies; ++copy_index) {
-            const Vec3 seed_position = global_fracture_seed_position(topology, source_cell_id, copy_index, config);
-            const Vec2 local_seed = project_to_cell_plane(cell_center, frame, seed_position);
-            const uint32_t chunk_id = source_cell_id * seed_copies + copy_index + 1u;
-            seeds.push_back({
-                local_seed,
-                seed_position,
-                chunk_id,
-                length2(local_seed),
-            });
-        }
+    (void)topology;
+    seeds.clear();
+    const uint32_t seed_count = global_fracture_seed_count(config);
+    seeds.reserve(seed_count);
+    for (uint32_t seed_id = 0; seed_id < seed_count; ++seed_id) {
+        const Vec3 seed_position = global_fracture_seed_position(seed_id, seed_count, config);
+        const Vec2 local_seed = project_to_cell_plane(cell_center, frame, seed_position);
+        seeds.push_back({
+            local_seed,
+            seed_position,
+            seed_id + 1u,
+            length2(local_seed),
+        });
     }
-    return seeds;
 }
 
-std::vector<FractureShard> build_fracture_shards(
+void build_fracture_shards(
     const GoldbergTopology& topology,
     const GoldbergCell& cell,
     uint32_t cell_id,
     Vec3 cell_center,
     const Frame& frame,
     const std::vector<Vec2>& cell_polygon,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    std::vector<FractureSeed>& seeds,
+    std::vector<FractureShard>& shards
 ) {
     const uint32_t shard_count = std::max(1u, cell.kind == GoldbergCellKind::Pentagon ? config.shards_per_pent : config.shards_per_hex);
-    std::vector<FractureSeed> seeds;
+    seeds.clear();
     seeds.reserve(shard_count);
 
     if (config.connect_fractures_across_cells) {
-        seeds = build_global_fracture_seeds(topology, cell_center, frame, config);
+        build_global_fracture_seeds(topology, cell_center, frame, config, seeds);
     } else {
         seeds.push_back({polygon_centroid(cell_polygon), cell_center, cell_id * 32u + 1u, 0.0f});
         uint32_t attempt = 0;
@@ -816,7 +931,7 @@ std::vector<FractureShard> build_fracture_shards(
         }
     }
 
-    std::vector<FractureShard> shards;
+    shards.clear();
     shards.reserve(seeds.size());
     for (uint32_t seed_index = 0; seed_index < seeds.size(); ++seed_index) {
         std::vector<Vec2> shard_polygon = cell_polygon;
@@ -849,8 +964,6 @@ std::vector<FractureShard> build_fracture_shards(
             seeds[seed_index].chunk_id,
         });
     }
-
-    return shards;
 }
 
 FracturedLocalSample fractured_local_sample(
@@ -859,7 +972,8 @@ FracturedLocalSample fractured_local_sample(
     uint32_t chunk_id,
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
     Vec2 adjusted = local;
     float radius = surface_radius;
@@ -870,13 +984,15 @@ FracturedLocalSample fractured_local_sample(
         adjusted = adjusted + to_center * (std::min(config.fracture_gap, to_center_length * 0.45f) / to_center_length);
         is_internal = true;
     }
-    const float outward_min = std::max(0.0f, std::min(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
-    const float outward_max = std::max(outward_min, std::max(config.fracture_chunk_outward_min, config.fracture_chunk_outward_max));
-    const float outward_t = hash_unit(config.fracture_seed ^ (chunk_id * 0x9e3779b9u) ^ 0x68bc21ebu);
-    const float deterministic_lift = config.fracture_seams_use_max_lift ? outward_max : outward_min + (outward_max - outward_min) * outward_t;
+    const float deterministic_lift = fracture_chunk_lift(chunk_id, config, cache);
     radius = std::max(0.1f, radius - config.fracture_depth + deterministic_lift);
 
     return {adjusted, radius, is_internal};
+}
+
+float fracture_chunk_top_radius(float surface_radius, uint32_t chunk_id, const MarchingCubesConfig& config, const FractureBuildCache& cache) {
+    const float deterministic_lift = fracture_chunk_lift(chunk_id, config, cache);
+    return std::max(0.1f, surface_radius - config.fracture_depth + deterministic_lift);
 }
 
 Vec3 fractured_sample_to_world(Vec2 adjusted, Vec3 cell_center, const Frame& frame, float radius) {
@@ -891,9 +1007,10 @@ Vec3 fractured_local_to_world(
     const Frame& frame,
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
-    const FracturedLocalSample sample = fractured_local_sample(local, shard_center, chunk_id, cell_polygon, surface_radius, config);
+    const FracturedLocalSample sample = fractured_local_sample(local, shard_center, chunk_id, cell_polygon, surface_radius, config, cache);
     return fractured_sample_to_world(sample.adjusted, cell_center, frame, sample.top_radius);
 }
 
@@ -944,6 +1061,14 @@ bool fracture_wall_point_is_internal(Vec2 point, const std::vector<Vec2>& cell_p
     return point_in_convex_polygon(point, cell_polygon) && distance_to_polygon_boundary(point, cell_polygon) > 0.000001f;
 }
 
+bool edge_lies_on_cell_boundary(Vec2 a, Vec2 b, const std::vector<Vec2>& cell_polygon) {
+    constexpr float BoundaryEpsilon = 0.0015f;
+    const Vec2 midpoint = (a + b) * 0.5f;
+    return distance_to_polygon_boundary(a, cell_polygon) <= BoundaryEpsilon &&
+        distance_to_polygon_boundary(b, cell_polygon) <= BoundaryEpsilon &&
+        distance_to_polygon_boundary(midpoint, cell_polygon) <= BoundaryEpsilon;
+}
+
 Vec2 fracture_wall_guard_crossing(
     Vec2 internal_point,
     Vec2 guarded_point,
@@ -974,10 +1099,11 @@ void emit_fracture_wall_segment(
     const Frame& frame,
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
-    const FracturedLocalSample sample_a = fractured_local_sample(a, shard.center, shard.chunk_id, cell_polygon, surface_radius, config);
-    const FracturedLocalSample sample_b = fractured_local_sample(b, shard.center, shard.chunk_id, cell_polygon, surface_radius, config);
+    const FracturedLocalSample sample_a = fractured_local_sample(a, shard.center, shard.chunk_id, cell_polygon, surface_radius, config, cache);
+    const FracturedLocalSample sample_b = fractured_local_sample(b, shard.center, shard.chunk_id, cell_polygon, surface_radius, config, cache);
     if (!sample_a.is_internal || !sample_b.is_internal) {
         return;
     }
@@ -1009,7 +1135,8 @@ void emit_trimmed_fracture_wall_edge(
     const Frame& frame,
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
     constexpr uint32_t SegmentCount = 48;
     for (uint32_t step = 0; step < SegmentCount; ++step) {
@@ -1039,7 +1166,8 @@ void emit_trimmed_fracture_wall_edge(
                 frame,
                 cell_polygon,
                 surface_radius,
-                config
+                config,
+                cache
             );
         }
     }
@@ -1053,7 +1181,8 @@ void emit_fracture_shard_walls(
     const Frame& frame,
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
     if (!config.enable_fracture_walls || shard.polygon.size() < 3 || config.fracture_wall_depth <= 0.0f) {
         return;
@@ -1062,6 +1191,9 @@ void emit_fracture_shard_walls(
     for (uint32_t i = 0; i < shard.polygon.size(); ++i) {
         const Vec2 a = shard.polygon[i];
         const Vec2 b = shard.polygon[(i + 1) % shard.polygon.size()];
+        if (edge_lies_on_cell_boundary(a, b, cell_polygon)) {
+            continue;
+        }
         emit_trimmed_fracture_wall_edge(
             mesh,
             cell_id,
@@ -1072,7 +1204,8 @@ void emit_fracture_shard_walls(
             frame,
             cell_polygon,
             surface_radius,
-            config
+            config,
+            cache
         );
     }
 }
@@ -1089,6 +1222,7 @@ void emit_fractured_local_triangle(
     const std::vector<Vec2>& cell_polygon,
     float surface_radius,
     const MarchingCubesConfig& config,
+    const FractureBuildCache& cache,
     uint32_t material_id
 ) {
     const std::array<GridSample, 3> clip_triangle = {{
@@ -1102,12 +1236,12 @@ void emit_fractured_local_triangle(
     }
 
     const Vec2 origin_local = {clipped.front().local.x, clipped.front().local.y};
-    const Vec3 fan_origin = fractured_local_to_world(origin_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config);
+    const Vec3 fan_origin = fractured_local_to_world(origin_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config, cache);
     for (uint32_t i = 1; i + 1 < clipped.size(); ++i) {
         const Vec2 b_local = {clipped[i].local.x, clipped[i].local.y};
         const Vec2 c_local = {clipped[i + 1].local.x, clipped[i + 1].local.y};
-        const Vec3 b = fractured_local_to_world(b_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config);
-        const Vec3 c = fractured_local_to_world(c_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config);
+        const Vec3 b = fractured_local_to_world(b_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config, cache);
+        const Vec3 c = fractured_local_to_world(c_local, shard.center, shard.chunk_id, cell_center, frame, cell_polygon, surface_radius, config, cache);
 
         std::array<Vec2, 3> local_points = {{origin_local, b_local, c_local}};
         std::array<Vec3, 3> world_points = {{fan_origin, b, c}};
@@ -1151,7 +1285,10 @@ void emit_subdivided_goldberg_cell_plane(
     uint32_t subdivisions,
     float surface_radius,
     uint32_t material_id,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache,
+    std::vector<FractureSeed>& fracture_seed_scratch,
+    std::vector<FractureShard>& fracture_shard_scratch
 ) {
     const GoldbergCell& cell = topology.cells[cell_id];
     if (cell.corner_indices.size() < 3 || subdivisions == 0) {
@@ -1160,12 +1297,14 @@ void emit_subdivided_goldberg_cell_plane(
 
     const Frame frame = build_frame(cell.normal);
     const std::vector<Vec2> cell_polygon = cell_clip_polygon(topology, cell, cell.center, frame);
-    const std::vector<FractureShard> shards = config.enable_fractures
-        ? build_fracture_shards(topology, cell, cell_id, cell.center, frame, cell_polygon, config)
-        : std::vector<FractureShard>{};
+    std::vector<FractureShard>& shards = fracture_shard_scratch;
+    shards.clear();
+    if (config.enable_fractures) {
+        build_fracture_shards(topology, cell, cell_id, cell.center, frame, cell_polygon, config, fracture_seed_scratch, shards);
+    }
     if (config.enable_fractures && config.enable_fracture_walls) {
         for (const FractureShard& shard : shards) {
-            emit_fracture_shard_walls(mesh, cell_id, shard, cell.center, frame, cell_polygon, surface_radius, config);
+            emit_fracture_shard_walls(mesh, cell_id, shard, cell.center, frame, cell_polygon, surface_radius, config, cache);
         }
     }
 
@@ -1186,7 +1325,7 @@ void emit_subdivided_goldberg_cell_plane(
                         subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                     }};
                     for (const FractureShard& shard : shards) {
-                        emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri0, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, material_id);
+                            emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri0, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, cache, material_id);
                     }
                 } else {
                     const Vec3 p0 = subdivided_cell_vertex(center, edge_a, edge_b, a_step, b_step, subdivisions, surface_radius);
@@ -1203,7 +1342,7 @@ void emit_subdivided_goldberg_cell_plane(
                             subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                         }};
                         for (const FractureShard& shard : shards) {
-                            emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri1, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, material_id);
+                            emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri1, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, cache, material_id);
                         }
                     } else {
                         const Vec3 p1 = subdivided_cell_vertex(center, edge_a, edge_b, a_step + 1, b_step, subdivisions, surface_radius);
@@ -1560,15 +1699,48 @@ bool segment_is_near_shared_boundary(
     return std::fabs(current_dot - neighbor_dot) <= max_bisector_delta;
 }
 
+bool boundary_edge_record_less(const BoundaryEdgeRecord& lhs, const BoundaryEdgeRecord& rhs) {
+    if (lhs.cell_id != rhs.cell_id) {
+        return lhs.cell_id < rhs.cell_id;
+    }
+    return lhs.edge < rhs.edge;
+}
+
+bool boundary_edge_record_same_key(const BoundaryEdgeRecord& lhs, const BoundaryEdgeRecord& rhs) {
+    return lhs.cell_id == rhs.cell_id &&
+        !(lhs.edge < rhs.edge) &&
+        !(rhs.edge < lhs.edge);
+}
+
+void sort_and_merge_boundary_edges(BoundaryEdgeMap& boundary_edges) {
+    if (boundary_edges.empty()) {
+        return;
+    }
+
+    std::sort(boundary_edges.begin(), boundary_edges.end(), boundary_edge_record_less);
+    uint32_t write_index = 0;
+    for (uint32_t read_index = 1; read_index < boundary_edges.size(); ++read_index) {
+        if (boundary_edge_record_same_key(boundary_edges[write_index], boundary_edges[read_index])) {
+            boundary_edges[write_index].count += boundary_edges[read_index].count;
+            continue;
+        }
+        ++write_index;
+        if (write_index != read_index) {
+            boundary_edges[write_index] = boundary_edges[read_index];
+        }
+    }
+    boundary_edges.resize(write_index + 1);
+}
+
 BoundaryPairMap build_boundary_pair_chains(
     QuantizedMesh& mesh,
     const GoldbergTopology& topology,
-    const BoundaryEdgeMap& boundary_edges
+    const BoundaryEdgeMap& boundary_edges,
+    const MarchingCubesConfig& config
 ) {
     BoundaryPairMap pairs;
 
-    for (const auto& entry : boundary_edges) {
-        const BoundaryEdgeRecord& record = entry.second;
+    for (const BoundaryEdgeRecord& record : boundary_edges) {
         if (record.count != 1) {
             continue;
         }
@@ -1603,7 +1775,11 @@ BoundaryPairMap build_boundary_pair_chains(
         }
 
         const BoundaryPairKey pair_key = boundary_pair_key(record.cell_id, accepted_neighbor);
-        BoundarySegment segment = {record.a, record.b, midpoint, 0.0f, record.material_id, record.fracture_chunk_id};
+        uint32_t fracture_chunk_id = record.fracture_chunk_id;
+        if (config.enable_fractures && config.connect_fractures_across_cells && fracture_chunk_id != 0u) {
+            fracture_chunk_id = nearest_global_fracture_chunk_id(midpoint, config);
+        }
+        BoundarySegment segment = {record.a, record.b, midpoint, 0.0f, record.material_id, fracture_chunk_id};
         BoundaryPairChains& chains = pairs[pair_key];
         if (record.cell_id == pair_key.a) {
             chains.a_segments.push_back(segment);
@@ -1802,12 +1978,233 @@ bool append_greedy_corridor_stitches(
     return emitted;
 }
 
+uint32_t shared_edge_plate_id(Vec3 direction, const MarchingCubesConfig& config) {
+    if (!config.enable_fractures || !config.connect_fractures_across_cells) {
+        return 0;
+    }
+    return nearest_global_fracture_chunk_id(direction, config);
+}
+
+Vec3 same_plate_edge_sample(
+    const GoldbergCell& cell,
+    const Frame& frame,
+    Vec3 edge_direction,
+    uint32_t chunk_id,
+    float inset,
+    float surface_radius,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
+) {
+    const Vec3 sample_direction = normalize(lerp(edge_direction, cell.center, inset));
+    const Vec2 local = project_to_cell_plane(cell.center, frame, sample_direction);
+    const uint32_t seed_count = global_fracture_seed_count(config);
+    const Vec3 seed_direction = global_fracture_seed_position(chunk_id - 1u, seed_count, config);
+    const Vec2 shard_center = project_to_cell_plane(cell.center, frame, seed_direction);
+    const float top_radius = fracture_chunk_top_radius(surface_radius, chunk_id, config, cache);
+    Vec2 adjusted = local;
+    const Vec2 to_center = shard_center - local;
+    const float to_center_length = length2(to_center);
+    if (to_center_length > 0.000001f) {
+        adjusted = adjusted + to_center * (std::min(config.fracture_gap, to_center_length * 0.45f) / to_center_length);
+    }
+    return fractured_sample_to_world(adjusted, cell.center, frame, top_radius);
+}
+
+bool shared_edge_interval_stays_on_plate(
+    const GoldbergCell& cell_a,
+    const GoldbergCell& cell_b,
+    Vec3 edge0,
+    Vec3 edge1,
+    uint32_t chunk_id,
+    float landing_inset,
+    const MarchingCubesConfig& config
+) {
+    const Vec3 edge_mid = normalize(edge0 + edge1);
+    const std::array<Vec3, 5> probes = {{
+        edge0,
+        edge_mid,
+        edge1,
+        normalize(lerp(edge_mid, cell_a.center, landing_inset)),
+        normalize(lerp(edge_mid, cell_b.center, landing_inset)),
+    }};
+
+    for (Vec3 probe : probes) {
+        if (shared_edge_plate_id(probe, config) != chunk_id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool append_same_plate_shared_edge_fill(
+    QuantizedMesh& mesh,
+    const GoldbergTopology& topology,
+    const PointCloud& points,
+    const BoundaryPairKey& pair_key,
+    const BoundaryPairGeometry& geometry,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
+) {
+    if (!config.enable_fractures || !config.connect_fractures_across_cells) {
+        return false;
+    }
+
+    const GoldbergCell& cell_a = topology.cells[pair_key.a];
+    const GoldbergCell& cell_b = topology.cells[pair_key.b];
+    const Frame frame_a = build_frame(cell_a.normal);
+    const Frame frame_b = build_frame(cell_b.normal);
+    const float surface_radius = (owned_surface_radius(points, pair_key.a) + owned_surface_radius(points, pair_key.b)) * 0.5f;
+    constexpr uint32_t SamplesPerSharedEdge = 64;
+    constexpr float LipInset = 0.0f;
+    constexpr float LandingInset = 0.060f;
+    bool emitted = false;
+
+    for (uint32_t i = 0; i < SamplesPerSharedEdge; ++i) {
+        const float t0 = static_cast<float>(i) / static_cast<float>(SamplesPerSharedEdge);
+        const float t1 = static_cast<float>(i + 1) / static_cast<float>(SamplesPerSharedEdge);
+        const float tm = (t0 + t1) * 0.5f;
+        const Vec3 edge0 = normalize(lerp(geometry.edge_a, geometry.edge_b, t0));
+        const Vec3 edge1 = normalize(lerp(geometry.edge_a, geometry.edge_b, t1));
+        const Vec3 edge_mid = normalize(lerp(geometry.edge_a, geometry.edge_b, tm));
+        const uint32_t chunk_id = shared_edge_plate_id(edge_mid, config);
+        if (chunk_id == 0u || !shared_edge_interval_stays_on_plate(cell_a, cell_b, edge0, edge1, chunk_id, LandingInset, config)) {
+            continue;
+        }
+
+        const Vec3 a_landing0 = same_plate_edge_sample(cell_a, frame_a, edge0, chunk_id, LandingInset, surface_radius, config, cache);
+        const Vec3 a_landing1 = same_plate_edge_sample(cell_a, frame_a, edge1, chunk_id, LandingInset, surface_radius, config, cache);
+        const Vec3 a_lip0 = same_plate_edge_sample(cell_a, frame_a, edge0, chunk_id, LipInset, surface_radius, config, cache);
+        const Vec3 a_lip1 = same_plate_edge_sample(cell_a, frame_a, edge1, chunk_id, LipInset, surface_radius, config, cache);
+        const Vec3 b_lip0 = same_plate_edge_sample(cell_b, frame_b, edge0, chunk_id, LipInset, surface_radius, config, cache);
+        const Vec3 b_lip1 = same_plate_edge_sample(cell_b, frame_b, edge1, chunk_id, LipInset, surface_radius, config, cache);
+        const Vec3 b_landing0 = same_plate_edge_sample(cell_b, frame_b, edge0, chunk_id, LandingInset, surface_radius, config, cache);
+        const Vec3 b_landing1 = same_plate_edge_sample(cell_b, frame_b, edge1, chunk_id, LandingInset, surface_radius, config, cache);
+
+        const uint32_t material_id = cell_a.kind == GoldbergCellKind::Pentagon ? 1u : 0u;
+        append_chain_stitch_triangle(mesh, a_landing0, a_lip0, a_landing1, pair_key.a, material_id, chunk_id);
+        append_chain_stitch_triangle(mesh, a_landing1, a_lip0, a_lip1, pair_key.a, material_id, chunk_id);
+        append_chain_stitch_triangle(mesh, a_lip0, b_lip0, a_lip1, pair_key.a, material_id, chunk_id);
+        append_chain_stitch_triangle(mesh, a_lip1, b_lip0, b_lip1, pair_key.a, material_id, chunk_id);
+        append_chain_stitch_triangle(mesh, b_lip0, b_landing0, b_lip1, pair_key.a, material_id, chunk_id);
+        append_chain_stitch_triangle(mesh, b_lip1, b_landing0, b_landing1, pair_key.a, material_id, chunk_id);
+        mesh.greedy_path_step_count += 3;
+        emitted = true;
+    }
+
+    return emitted;
+}
+
+bool append_same_plate_junction_cap(
+    QuantizedMesh& mesh,
+    const GoldbergTopology& topology,
+    const PointCloud& points,
+    uint32_t corner_index,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
+) {
+    if (!config.enable_fractures || !config.connect_fractures_across_cells || corner_index >= topology.vertices.size()) {
+        return false;
+    }
+
+    const Vec3 corner_direction = normalize(topology.vertices[corner_index].position);
+    const uint32_t chunk_id = shared_edge_plate_id(corner_direction, config);
+    if (chunk_id == 0u) {
+        return false;
+    }
+
+    constexpr float JunctionInset = 0.070f;
+    std::vector<JunctionCapPoint> cap_points;
+    cap_points.reserve(3);
+    float radius_sum = 0.0f;
+    uint32_t radius_count = 0;
+    for (uint32_t cell_id = 0; cell_id < topology.cells.size(); ++cell_id) {
+        const GoldbergCell& cell = topology.cells[cell_id];
+        if (std::find(cell.corner_indices.begin(), cell.corner_indices.end(), corner_index) == cell.corner_indices.end()) {
+            continue;
+        }
+
+        const Vec3 sample_direction = normalize(lerp(corner_direction, cell.center, JunctionInset));
+        if (shared_edge_plate_id(sample_direction, config) != chunk_id) {
+            continue;
+        }
+
+        const Frame frame = build_frame(cell.normal);
+        const float surface_radius = owned_surface_radius(points, cell_id);
+        cap_points.push_back({
+            same_plate_edge_sample(cell, frame, corner_direction, chunk_id, JunctionInset, surface_radius, config, cache),
+            sample_direction,
+            cell_id,
+            0.0f,
+        });
+        radius_sum += surface_radius;
+        ++radius_count;
+    }
+
+    if (cap_points.size() < 2 || radius_count == 0) {
+        return false;
+    }
+
+    const Vec3 reference_axis = std::fabs(corner_direction.y) < 0.92f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
+    const Vec3 tangent = normalize(cross(reference_axis, corner_direction));
+    const Vec3 bitangent = cross(corner_direction, tangent);
+    for (JunctionCapPoint& point : cap_points) {
+        point.angle = std::atan2(dot(point.direction, bitangent), dot(point.direction, tangent));
+    }
+    std::sort(cap_points.begin(), cap_points.end(), [](const JunctionCapPoint& lhs, const JunctionCapPoint& rhs) {
+        return lhs.angle < rhs.angle;
+    });
+
+    const float surface_radius = radius_sum / static_cast<float>(radius_count);
+    const Vec3 center = corner_direction * fracture_chunk_top_radius(surface_radius, chunk_id, config, cache);
+    const uint32_t material_id = topology.cells[cap_points.front().cell_id].kind == GoldbergCellKind::Pentagon ? 1u : 0u;
+    bool emitted = false;
+
+    for (uint32_t i = 0; i < cap_points.size(); ++i) {
+        const JunctionCapPoint& a = cap_points[i];
+        const JunctionCapPoint& b = cap_points[(i + 1u) % cap_points.size()];
+        const Vec3 midpoint_direction = normalize(a.direction + b.direction);
+        if (shared_edge_plate_id(midpoint_direction, config) != chunk_id) {
+            continue;
+        }
+
+        Vec3 p0 = center;
+        Vec3 p1 = a.position;
+        Vec3 p2 = b.position;
+        if (dot(cross(p1 - p0, p2 - p0), corner_direction) < 0.0f) {
+            std::swap(p1, p2);
+        }
+        append_chain_stitch_triangle(mesh, p0, p1, p2, a.cell_id, material_id, chunk_id);
+        ++mesh.greedy_path_step_count;
+        emitted = true;
+    }
+
+    return emitted;
+}
+
+void append_same_plate_junction_caps(
+    QuantizedMesh& mesh,
+    const GoldbergTopology& topology,
+    const PointCloud& points,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
+) {
+    if (!config.enable_fractures || !config.connect_fractures_across_cells) {
+        return;
+    }
+
+    for (uint32_t corner_index = 0; corner_index < topology.vertices.size(); ++corner_index) {
+        append_same_plate_junction_cap(mesh, topology, points, corner_index, config, cache);
+    }
+}
+
 void append_chain_stitches_for_pair(
     QuantizedMesh& mesh,
     const GoldbergTopology& topology,
-    const std::vector<PointSample>& points,
+    const PointCloud& points,
     const BoundaryPairKey& pair_key,
-    const BoundaryPairChains& chains
+    const BoundaryPairChains& chains,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
     BoundaryPairGeometry geometry;
     if (!shared_boundary_geometry(topology, pair_key.a, pair_key.b, geometry)) {
@@ -1817,8 +2214,15 @@ void append_chain_stitches_for_pair(
     const float radius = (owned_surface_radius(points, pair_key.a) + owned_surface_radius(points, pair_key.b)) * 0.5f;
     std::vector<CorridorPoint> side_a = collect_corridor_points(chains.a_segments, geometry, radius);
     std::vector<CorridorPoint> side_b = collect_corridor_points(chains.b_segments, geometry, radius);
+    const bool emitted_same_plate_fill = append_same_plate_shared_edge_fill(mesh, topology, points, pair_key, geometry, config, cache);
 
     if (side_a.size() < 2 || side_b.size() < 2) {
+        if (emitted_same_plate_fill) {
+            ++mesh.shared_edge_path_count;
+            ++mesh.boundary_run_count;
+            ++mesh.paired_boundary_run_count;
+            return;
+        }
         ++mesh.unstitched_gap_count;
         return;
     }
@@ -1826,23 +2230,27 @@ void append_chain_stitches_for_pair(
     ++mesh.shared_edge_path_count;
     ++mesh.boundary_run_count;
     ++mesh.paired_boundary_run_count;
-    append_greedy_corridor_stitches(
-        mesh,
-        side_a,
-        side_b,
-        geometry,
-        pair_key.a,
-        radius
-    );
+    if (!emitted_same_plate_fill) {
+        append_greedy_corridor_stitches(
+            mesh,
+            side_a,
+            side_b,
+            geometry,
+            pair_key.a,
+            radius
+        );
+    }
 }
 
 void build_transition_stitches(
     QuantizedMesh& mesh,
     const GoldbergTopology& topology,
-    const std::vector<PointSample>& points,
-    const BoundaryEdgeMap& boundary_edges
+    const PointCloud& points,
+    const BoundaryEdgeMap& boundary_edges,
+    const MarchingCubesConfig& config,
+    const FractureBuildCache& cache
 ) {
-    BoundaryPairMap boundary_pairs = build_boundary_pair_chains(mesh, topology, boundary_edges);
+    BoundaryPairMap boundary_pairs = build_boundary_pair_chains(mesh, topology, boundary_edges, config);
 
     for (uint32_t cell_id = 0; cell_id < topology.cells.size(); ++cell_id) {
         const GoldbergCell& cell = topology.cells[cell_id];
@@ -1858,10 +2266,11 @@ void build_transition_stitches(
                 continue;
             }
 
-            append_chain_stitches_for_pair(mesh, topology, points, pair_key, found->second);
+            append_chain_stitches_for_pair(mesh, topology, points, pair_key, found->second, config, cache);
         }
     }
 
+    append_same_plate_junction_caps(mesh, topology, points, config, cache);
 }
 
 void polygonize_cube(
@@ -1934,20 +2343,989 @@ void polygonize_cube(
     }
 }
 
+VoxelKey voxel_key_for_position(Vec3 position, float grid_radius, float voxel_size, uint32_t resolution) {
+    auto key_component = [&](float value) {
+        const float normalized = (value + grid_radius) / voxel_size;
+        const int32_t index = static_cast<int32_t>(std::floor(normalized));
+        return static_cast<uint32_t>(std::clamp(index, 0, static_cast<int32_t>(resolution - 1u)));
+    };
+    return {
+        key_component(position.x),
+        key_component(position.y),
+        key_component(position.z),
+    };
+}
+
+Vec3 voxel_center_from_key(VoxelKey key, float grid_radius, float voxel_size) {
+    return {
+        -grid_radius + (static_cast<float>(key.x) + 0.5f) * voxel_size,
+        -grid_radius + (static_cast<float>(key.y) + 0.5f) * voxel_size,
+        -grid_radius + (static_cast<float>(key.z) + 0.5f) * voxel_size,
+    };
+}
+
+std::vector<PreparedVoxelDig> prepare_voxel_digs(const VoxelEditSet& edits, float voxel_size) {
+    std::vector<PreparedVoxelDig> prepared;
+    prepared.reserve(edits.digs.size());
+    const float leaf_radius = std::sqrt(3.0f) * voxel_size * 0.5f;
+    for (const VoxelDigEdit& dig : edits.digs) {
+        if (dig.radius_km <= 0.0f) {
+            continue;
+        }
+        const float radius_mesh = kilometers_to_world_units(dig.radius_km);
+        prepared.push_back({
+            dig.center_mesh,
+            radius_mesh + leaf_radius,
+        });
+    }
+    return prepared;
+}
+
+uint32_t apply_voxel_dig_edits(
+    std::vector<VoxelKey>& keys,
+    float grid_radius,
+    float voxel_size,
+    const VoxelEditSet& edits
+) {
+    if (keys.empty() || edits.digs.empty()) {
+        return 0;
+    }
+
+    const std::vector<PreparedVoxelDig> digs = prepare_voxel_digs(edits, voxel_size);
+    if (digs.empty()) {
+        return 0;
+    }
+
+    const size_t original_size = keys.size();
+    keys.erase(
+        std::remove_if(
+            keys.begin(),
+            keys.end(),
+            [&](VoxelKey key) {
+                const Vec3 center = voxel_center_from_key(key, grid_radius, voxel_size);
+                for (const PreparedVoxelDig& dig : digs) {
+                    const float distance_to_dig = length(center - dig.center_mesh);
+                    if (distance_to_dig <= dig.radius_with_leaf_mesh) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        ),
+        keys.end()
+    );
+
+    return static_cast<uint32_t>(original_size - keys.size());
+}
+
+uint32_t child_index_for_voxel(VoxelKey key, uint32_t origin_x, uint32_t origin_y, uint32_t origin_z, uint32_t child_size) {
+    const uint32_t x_bit = key.x >= origin_x + child_size ? 4u : 0u;
+    const uint32_t y_bit = key.y >= origin_y + child_size ? 2u : 0u;
+    const uint32_t z_bit = key.z >= origin_z + child_size ? 1u : 0u;
+    return x_bit | y_bit | z_bit;
+}
+
+uint32_t child_origin_x(uint32_t origin, uint32_t child_index, uint32_t child_size) {
+    return origin + ((child_index & 4u) != 0u ? child_size : 0u);
+}
+
+uint32_t child_origin_y(uint32_t origin, uint32_t child_index, uint32_t child_size) {
+    return origin + ((child_index & 2u) != 0u ? child_size : 0u);
+}
+
+uint32_t child_origin_z(uint32_t origin, uint32_t child_index, uint32_t child_size) {
+    return origin + ((child_index & 1u) != 0u ? child_size : 0u);
+}
+
+void add_voxelized_triangles(
+    std::vector<VoxelKey>& keys,
+    const QuantizedMesh& mesh,
+    const std::vector<uint32_t>& indices,
+    float grid_radius,
+    float voxel_size,
+    uint32_t resolution
+) {
+    for (uint32_t i = 0; i + 2 < indices.size(); i += 3) {
+        const Vec3 a = mesh.vertices[indices[i]].position;
+        const Vec3 b = mesh.vertices[indices[i + 1]].position;
+        const Vec3 c = mesh.vertices[indices[i + 2]].position;
+        const float longest_edge = std::max(length(b - a), std::max(length(c - b), length(a - c)));
+        const float sample_spacing = std::max(voxel_size * 2.0f, 0.0001f);
+        const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(longest_edge / sample_spacing)), 1u, 10u);
+        for (uint32_t u_step = 0; u_step <= steps; ++u_step) {
+            for (uint32_t v_step = 0; v_step + u_step <= steps; ++v_step) {
+                const float u = static_cast<float>(u_step) / static_cast<float>(steps);
+                const float v = static_cast<float>(v_step) / static_cast<float>(steps);
+                const float w = 1.0f - u - v;
+                keys.push_back(voxel_key_for_position(a * u + b * v + c * w, grid_radius, voxel_size, resolution));
+            }
+        }
+        keys.push_back(voxel_key_for_position((a + b + c) / 3.0f, grid_radius, voxel_size, resolution));
+        keys.push_back(voxel_key_for_position((a + b) * 0.5f, grid_radius, voxel_size, resolution));
+        keys.push_back(voxel_key_for_position((b + c) * 0.5f, grid_radius, voxel_size, resolution));
+        keys.push_back(voxel_key_for_position((c + a) * 0.5f, grid_radius, voxel_size, resolution));
+    }
+}
+
+uint32_t surface_net_grid_index(uint32_t x, uint32_t y, uint32_t z, uint32_t resolution) {
+    return (z * resolution + y) * resolution + x;
+}
+
+uint32_t surface_net_cube_index(uint32_t x, uint32_t y, uint32_t z, uint32_t cube_resolution) {
+    return (z * cube_resolution + y) * cube_resolution + x;
+}
+
+bool surface_net_bit(const std::vector<uint64_t>& bits, uint32_t index) {
+    return (bits[index / 64u] & (uint64_t{1} << (index % 64u))) != 0u;
+}
+
+void set_surface_net_bit(std::vector<uint64_t>& bits, uint32_t index) {
+    bits[index / 64u] |= (uint64_t{1} << (index % 64u));
+}
+
+Vec3 surface_net_sample_position(uint32_t x, uint32_t y, uint32_t z, float grid_radius, float voxel_size) {
+    return {
+        -grid_radius + (static_cast<float>(x) + 0.5f) * voxel_size,
+        -grid_radius + (static_cast<float>(y) + 0.5f) * voxel_size,
+        -grid_radius + (static_cast<float>(z) + 0.5f) * voxel_size,
+    };
+}
+
+std::vector<VoxelKey> coarsen_surface_net_keys(const std::vector<VoxelKey>& keys, uint32_t source_depth, uint32_t target_depth) {
+    std::vector<VoxelKey> result;
+    result.reserve(keys.size());
+    const uint32_t shift = source_depth > target_depth ? source_depth - target_depth : 0u;
+    for (VoxelKey key : keys) {
+        if (shift > 0u) {
+            key.x >>= shift;
+            key.y >>= shift;
+            key.z >>= shift;
+        }
+        result.push_back(key);
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const MarchingCubesConfig& config) {
+    std::vector<LocalSurfaceNetPatch> patches;
+    if (!config.enable_local_surface_net_detail || config.local_surface_net_max_patches == 0u) {
+        return patches;
+    }
+
+    const float suppress_radius = kilometers_to_world_units(std::max(0.0f, config.local_surface_net_patch_radius_km));
+    const float overlap = kilometers_to_world_units(std::max(0.0f, config.local_surface_net_patch_overlap_km));
+    if (suppress_radius <= 0.0f) {
+        return patches;
+    }
+
+    const float extraction_radius = suppress_radius + overlap;
+    const uint32_t depth = std::clamp(config.local_surface_net_depth, 1u, 13u);
+    auto add_patch = [&](Vec3 center) {
+        if (patches.size() >= config.local_surface_net_max_patches || length(center) <= 0.000001f) {
+            return;
+        }
+        center = normalize(center);
+        for (const LocalSurfaceNetPatch& patch : patches) {
+            if (length(patch.center_mesh - center) < suppress_radius * 0.5f) {
+                return;
+            }
+        }
+        patches.push_back({center, suppress_radius, extraction_radius, depth});
+    };
+
+    add_patch(config.lod_camera_position);
+
+    struct DigCandidate {
+        Vec3 center;
+        float distance_to_camera = 0.0f;
+        uint32_t newest_rank = 0;
+    };
+
+    const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
+        ? normalize(config.lod_camera_position)
+        : Vec3{0.0f, 0.0f, 1.0f};
+    std::vector<DigCandidate> dig_candidates;
+    dig_candidates.reserve(config.voxel_edits.digs.size());
+    for (uint32_t i = 0; i < config.voxel_edits.digs.size(); ++i) {
+        const VoxelDigEdit& dig = config.voxel_edits.digs[i];
+        if (length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        dig_candidates.push_back({
+            normalize(dig.center_mesh),
+            length(normalize(dig.center_mesh) - camera_center),
+            static_cast<uint32_t>(config.voxel_edits.digs.size() - i),
+        });
+    }
+    std::sort(
+        dig_candidates.begin(),
+        dig_candidates.end(),
+        [](const DigCandidate& lhs, const DigCandidate& rhs) {
+            if (std::fabs(lhs.distance_to_camera - rhs.distance_to_camera) > 0.000001f) {
+                return lhs.distance_to_camera < rhs.distance_to_camera;
+            }
+            return lhs.newest_rank < rhs.newest_rank;
+        }
+    );
+    for (const DigCandidate& dig : dig_candidates) {
+        add_patch(dig.center);
+    }
+
+    return patches;
+}
+
+bool surface_net_key_in_patch(Vec3 center, float leaf_radius, const std::vector<LocalSurfaceNetPatch>& patches) {
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        if (length(center - patch.center_mesh) <= patch.suppress_radius_mesh + leaf_radius) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void add_surface_net_edge_candidate(
+    std::vector<SurfaceNetEdgeKey>& edges,
+    const std::vector<uint64_t>& occupancy,
+    uint32_t resolution,
+    uint32_t x,
+    uint32_t y,
+    uint32_t z,
+    uint32_t axis,
+    bool negative_direction
+) {
+    if (axis == 0u) {
+        if (negative_direction) {
+            if (x == 0u) return;
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x - 1u, y, z, resolution));
+            if (!neighbor) edges.push_back({x - 1u, y, z, axis});
+        } else if (x + 1u < resolution) {
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x + 1u, y, z, resolution));
+            if (!neighbor) edges.push_back({x, y, z, axis});
+        }
+    } else if (axis == 1u) {
+        if (negative_direction) {
+            if (y == 0u) return;
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y - 1u, z, resolution));
+            if (!neighbor) edges.push_back({x, y - 1u, z, axis});
+        } else if (y + 1u < resolution) {
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y + 1u, z, resolution));
+            if (!neighbor) edges.push_back({x, y, z, axis});
+        }
+    } else {
+        if (negative_direction) {
+            if (z == 0u) return;
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y, z - 1u, resolution));
+            if (!neighbor) edges.push_back({x, y, z - 1u, axis});
+        } else if (z + 1u < resolution) {
+            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y, z + 1u, resolution));
+            if (!neighbor) edges.push_back({x, y, z, axis});
+        }
+    }
+}
+
+int32_t surface_net_cube_vertex(
+    const std::vector<int32_t>& cube_vertices,
+    uint32_t cube_resolution,
+    uint32_t x,
+    uint32_t y,
+    uint32_t z
+) {
+    if (x >= cube_resolution || y >= cube_resolution || z >= cube_resolution) {
+        return -1;
+    }
+    return cube_vertices[surface_net_cube_index(x, y, z, cube_resolution)];
+}
+
+void append_surface_net_quad(
+    SurfaceNetMesh& surface_net,
+    int32_t a,
+    int32_t b,
+    int32_t c,
+    int32_t d
+) {
+    if (a < 0 || b < 0 || c < 0 || d < 0) {
+        return;
+    }
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(a));
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(b));
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(c));
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(a));
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(c));
+    surface_net.triangle_indices.push_back(static_cast<uint32_t>(d));
+}
+
+SurfaceNetMesh build_surface_net_mesh_from_occupancy(
+    const std::vector<VoxelKey>& sorted_occupied_keys,
+    uint32_t source_depth,
+    float grid_radius,
+    const MarchingCubesConfig& config,
+    const std::vector<LocalSurfaceNetPatch>& suppression_patches = {}
+) {
+    SurfaceNetMesh surface_net;
+    if (!config.enable_surface_net_generation || sorted_occupied_keys.empty()) {
+        return surface_net;
+    }
+
+    const uint32_t target_depth = std::clamp(std::min(config.surface_net_depth, source_depth), 1u, 8u);
+    const uint32_t resolution = 1u << target_depth;
+    const uint32_t cube_resolution = resolution - 1u;
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
+    const float voxel_radius = std::sqrt(3.0f) * voxel_size * 0.5f;
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    std::vector<VoxelKey> occupied_keys = coarsen_surface_net_keys(sorted_occupied_keys, source_depth, target_depth);
+    if (!suppression_patches.empty()) {
+        occupied_keys.erase(
+            std::remove_if(
+                occupied_keys.begin(),
+                occupied_keys.end(),
+                [&](VoxelKey key) {
+                    return surface_net_key_in_patch(
+                        voxel_center_from_key(key, grid_radius, voxel_size),
+                        voxel_radius,
+                        suppression_patches
+                    );
+                }
+            ),
+            occupied_keys.end()
+        );
+    }
+    const uint32_t grid_count = resolution * resolution * resolution;
+    std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
+    for (VoxelKey key : occupied_keys) {
+        if (key.x < resolution && key.y < resolution && key.z < resolution) {
+            set_surface_net_bit(occupancy, surface_net_grid_index(key.x, key.y, key.z, resolution));
+        }
+    }
+
+    std::vector<VoxelKey> cube_candidates;
+    cube_candidates.reserve(occupied_keys.size() * 8u);
+    std::vector<SurfaceNetEdgeKey> edge_candidates;
+    edge_candidates.reserve(occupied_keys.size() * 6u);
+    for (VoxelKey key : occupied_keys) {
+        if (key.x >= resolution || key.y >= resolution || key.z >= resolution) {
+            continue;
+        }
+        for (uint32_t dz = 0; dz < 2; ++dz) {
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    if ((dx == 1u && key.x == 0u) || (dy == 1u && key.y == 0u) || (dz == 1u && key.z == 0u)) {
+                        continue;
+                    }
+                    const uint32_t cube_x = key.x - dx;
+                    const uint32_t cube_y = key.y - dy;
+                    const uint32_t cube_z = key.z - dz;
+                    if (cube_x < cube_resolution && cube_y < cube_resolution && cube_z < cube_resolution) {
+                        cube_candidates.push_back({cube_x, cube_y, cube_z});
+                    }
+                }
+            }
+        }
+
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, true);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, true);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, true);
+    }
+
+    std::sort(cube_candidates.begin(), cube_candidates.end());
+    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
+    std::sort(edge_candidates.begin(), edge_candidates.end());
+    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+
+    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
+    std::vector<int32_t> cube_vertices(cube_count, -1);
+    surface_net.source_depth = target_depth;
+    surface_net.bounds_radius = grid_radius;
+    surface_net.occupied_voxel_count = static_cast<uint32_t>(occupied_keys.size());
+    surface_net.candidate_cube_count = static_cast<uint32_t>(cube_candidates.size());
+    surface_net.material_id = config.surface_net_material_id;
+    surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
+    surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
+    surface_net.normals.reserve(surface_net.vertices.capacity());
+
+    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
+        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
+        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
+    }};
+    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
+        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
+        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+
+    for (VoxelKey cube : cube_candidates) {
+        if (surface_net.vertices.size() >= max_vertices) {
+            break;
+        }
+
+        std::array<bool, 8> inside = {};
+        std::array<Vec3, 8> positions = {};
+        uint32_t inside_count = 0;
+        for (uint32_t i = 0; i < corners.size(); ++i) {
+            const uint32_t x = cube.x + corners[i][0];
+            const uint32_t y = cube.y + corners[i][1];
+            const uint32_t z = cube.z + corners[i][2];
+            inside[i] = surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
+            inside_count += inside[i] ? 1u : 0u;
+            positions[i] = surface_net_sample_position(x, y, z, grid_radius, voxel_size);
+        }
+        if (inside_count == 0u || inside_count == 8u) {
+            continue;
+        }
+
+        Vec3 average = {};
+        Vec3 normal = {};
+        uint32_t crossing_count = 0;
+        for (const auto& edge : edges) {
+            const uint32_t a = edge[0];
+            const uint32_t b = edge[1];
+            if (inside[a] == inside[b]) {
+                continue;
+            }
+            average = average + (positions[a] + positions[b]) * 0.5f;
+            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
+            ++crossing_count;
+        }
+        if (crossing_count == 0u) {
+            continue;
+        }
+
+        const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
+        surface_net.vertices.push_back(average / static_cast<float>(crossing_count));
+        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(average));
+        cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
+    }
+
+    surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    for (SurfaceNetEdgeKey edge : edge_candidates) {
+        if (edge.axis == 0u) {
+            if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z)
+            );
+        } else if (edge.axis == 1u) {
+            if (edge.y >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z)
+            );
+        } else {
+            if (edge.z >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y - 1u, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z)
+            );
+        }
+    }
+
+    return surface_net;
+}
+
+void append_surface_net_mesh(SurfaceNetMesh& destination, const SurfaceNetMesh& source) {
+    const uint32_t vertex_offset = static_cast<uint32_t>(destination.vertices.size());
+    destination.vertices.insert(destination.vertices.end(), source.vertices.begin(), source.vertices.end());
+    destination.normals.insert(destination.normals.end(), source.normals.begin(), source.normals.end());
+    destination.triangle_indices.reserve(destination.triangle_indices.size() + source.triangle_indices.size());
+    for (uint32_t index : source.triangle_indices) {
+        destination.triangle_indices.push_back(vertex_offset + index);
+    }
+}
+
+bool local_voxel_key_for_position(Vec3 position, Vec3 origin, float voxel_size, uint32_t resolution, VoxelKey& key) {
+    auto key_component = [&](float value, float offset, uint32_t& out) {
+        const float normalized = (value - offset) / voxel_size;
+        const int32_t index = static_cast<int32_t>(std::floor(normalized));
+        if (index < 0 || index >= static_cast<int32_t>(resolution)) {
+            return false;
+        }
+        out = static_cast<uint32_t>(index);
+        return true;
+    };
+
+    return key_component(position.x, origin.x, key.x) &&
+           key_component(position.y, origin.y, key.y) &&
+           key_component(position.z, origin.z, key.z);
+}
+
+Vec3 local_surface_net_sample_position(uint32_t x, uint32_t y, uint32_t z, Vec3 origin, float voxel_size) {
+    return {
+        origin.x + (static_cast<float>(x) + 0.5f) * voxel_size,
+        origin.y + (static_cast<float>(y) + 0.5f) * voxel_size,
+        origin.z + (static_cast<float>(z) + 0.5f) * voxel_size,
+    };
+}
+
+bool local_surface_net_sample_carved(Vec3 position, const std::vector<PreparedVoxelDig>& digs) {
+    for (const PreparedVoxelDig& dig : digs) {
+        if (length(position - dig.center_mesh) <= dig.radius_with_leaf_mesh) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void push_local_voxel_key(
+    std::vector<VoxelKey>& keys,
+    Vec3 position,
+    const LocalSurfaceNetPatch& patch,
+    Vec3 origin,
+    float voxel_size,
+    uint32_t resolution,
+    const std::vector<PreparedVoxelDig>& digs
+) {
+    if (length(position - patch.center_mesh) > patch.extraction_radius_mesh || local_surface_net_sample_carved(position, digs)) {
+        return;
+    }
+
+    VoxelKey key;
+    if (local_voxel_key_for_position(position, origin, voxel_size, resolution, key)) {
+        keys.push_back(key);
+    }
+}
+
+void add_local_voxelized_triangles(
+    std::vector<VoxelKey>& keys,
+    const QuantizedMesh& mesh,
+    const std::vector<uint32_t>& indices,
+    const LocalSurfaceNetPatch& patch,
+    Vec3 origin,
+    float voxel_size,
+    uint32_t resolution,
+    const std::vector<PreparedVoxelDig>& digs
+) {
+    const Vec3 patch_min = origin;
+    const Vec3 patch_max = origin + Vec3{
+        voxel_size * static_cast<float>(resolution),
+        voxel_size * static_cast<float>(resolution),
+        voxel_size * static_cast<float>(resolution),
+    };
+    const float sample_spacing = std::max(voxel_size * 1.25f, 0.00001f);
+
+    for (uint32_t i = 0; i + 2 < indices.size(); i += 3) {
+        const Vec3 a = mesh.vertices[indices[i]].position;
+        const Vec3 b = mesh.vertices[indices[i + 1]].position;
+        const Vec3 c = mesh.vertices[indices[i + 2]].position;
+        const Vec3 tri_min = {
+            std::min(a.x, std::min(b.x, c.x)),
+            std::min(a.y, std::min(b.y, c.y)),
+            std::min(a.z, std::min(b.z, c.z)),
+        };
+        const Vec3 tri_max = {
+            std::max(a.x, std::max(b.x, c.x)),
+            std::max(a.y, std::max(b.y, c.y)),
+            std::max(a.z, std::max(b.z, c.z)),
+        };
+        if (tri_max.x < patch_min.x || tri_min.x > patch_max.x ||
+            tri_max.y < patch_min.y || tri_min.y > patch_max.y ||
+            tri_max.z < patch_min.z || tri_min.z > patch_max.z) {
+            continue;
+        }
+
+        const float longest_edge = std::max(length(b - a), std::max(length(c - b), length(a - c)));
+        const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(longest_edge / sample_spacing)), 1u, 64u);
+        for (uint32_t u_step = 0; u_step <= steps; ++u_step) {
+            for (uint32_t v_step = 0; v_step + u_step <= steps; ++v_step) {
+                const float u = static_cast<float>(u_step) / static_cast<float>(steps);
+                const float v = static_cast<float>(v_step) / static_cast<float>(steps);
+                const float w = 1.0f - u - v;
+                push_local_voxel_key(keys, a * u + b * v + c * w, patch, origin, voxel_size, resolution, digs);
+            }
+        }
+        push_local_voxel_key(keys, (a + b + c) / 3.0f, patch, origin, voxel_size, resolution, digs);
+        push_local_voxel_key(keys, (a + b) * 0.5f, patch, origin, voxel_size, resolution, digs);
+        push_local_voxel_key(keys, (b + c) * 0.5f, patch, origin, voxel_size, resolution, digs);
+        push_local_voxel_key(keys, (c + a) * 0.5f, patch, origin, voxel_size, resolution, digs);
+    }
+}
+
+SurfaceNetMesh build_local_surface_net_patch_mesh(
+    const QuantizedMesh& mesh,
+    const LocalSurfaceNetPatch& patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    SurfaceNetMesh surface_net;
+    if (!config.enable_surface_net_generation) {
+        return surface_net;
+    }
+
+    const uint32_t depth = std::clamp(patch.depth, 1u, 13u);
+    const uint32_t global_resolution = 1u << depth;
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(global_resolution);
+    uint32_t resolution = static_cast<uint32_t>(std::ceil((patch.extraction_radius_mesh * 2.0f) / voxel_size)) + 4u;
+    resolution = std::clamp(resolution, 4u, 256u);
+    const Vec3 origin = patch.center_mesh - Vec3{
+        voxel_size * static_cast<float>(resolution) * 0.5f,
+        voxel_size * static_cast<float>(resolution) * 0.5f,
+        voxel_size * static_cast<float>(resolution) * 0.5f,
+    };
+
+    std::vector<VoxelKey> occupied_keys;
+    occupied_keys.reserve(32768);
+    const std::vector<PreparedVoxelDig> digs = prepare_voxel_digs(config.voxel_edits, voxel_size);
+    add_local_voxelized_triangles(occupied_keys, mesh, mesh.triangle_indices, patch, origin, voxel_size, resolution, digs);
+    add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs);
+    std::sort(occupied_keys.begin(), occupied_keys.end());
+    occupied_keys.erase(std::unique(occupied_keys.begin(), occupied_keys.end()), occupied_keys.end());
+    if (occupied_keys.empty()) {
+        return surface_net;
+    }
+
+    const uint32_t cube_resolution = resolution - 1u;
+    const uint32_t grid_count = resolution * resolution * resolution;
+    std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
+    for (VoxelKey key : occupied_keys) {
+        if (key.x < resolution && key.y < resolution && key.z < resolution) {
+            set_surface_net_bit(occupancy, surface_net_grid_index(key.x, key.y, key.z, resolution));
+        }
+    }
+
+    std::vector<VoxelKey> cube_candidates;
+    cube_candidates.reserve(occupied_keys.size() * 8u);
+    std::vector<SurfaceNetEdgeKey> edge_candidates;
+    edge_candidates.reserve(occupied_keys.size() * 6u);
+    for (VoxelKey key : occupied_keys) {
+        for (uint32_t dz = 0; dz < 2; ++dz) {
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    if ((dx == 1u && key.x == 0u) || (dy == 1u && key.y == 0u) || (dz == 1u && key.z == 0u)) {
+                        continue;
+                    }
+                    const uint32_t cube_x = key.x - dx;
+                    const uint32_t cube_y = key.y - dy;
+                    const uint32_t cube_z = key.z - dz;
+                    if (cube_x < cube_resolution && cube_y < cube_resolution && cube_z < cube_resolution) {
+                        cube_candidates.push_back({cube_x, cube_y, cube_z});
+                    }
+                }
+            }
+        }
+
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, true);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, true);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, false);
+        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, true);
+    }
+
+    std::sort(cube_candidates.begin(), cube_candidates.end());
+    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
+    std::sort(edge_candidates.begin(), edge_candidates.end());
+    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
+    std::vector<int32_t> cube_vertices(cube_count, -1);
+    surface_net.source_depth = depth;
+    surface_net.bounds_radius = grid_radius;
+    surface_net.occupied_voxel_count = static_cast<uint32_t>(occupied_keys.size());
+    surface_net.candidate_cube_count = static_cast<uint32_t>(cube_candidates.size());
+    surface_net.material_id = config.surface_net_material_id;
+    surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
+    surface_net.normals.reserve(surface_net.vertices.capacity());
+
+    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
+        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
+        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
+    }};
+    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
+        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
+        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+
+    for (VoxelKey cube : cube_candidates) {
+        if (surface_net.vertices.size() >= max_vertices) {
+            break;
+        }
+
+        std::array<bool, 8> inside = {};
+        std::array<Vec3, 8> positions = {};
+        uint32_t inside_count = 0;
+        for (uint32_t i = 0; i < corners.size(); ++i) {
+            const uint32_t x = cube.x + corners[i][0];
+            const uint32_t y = cube.y + corners[i][1];
+            const uint32_t z = cube.z + corners[i][2];
+            inside[i] = surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
+            inside_count += inside[i] ? 1u : 0u;
+            positions[i] = local_surface_net_sample_position(x, y, z, origin, voxel_size);
+        }
+        if (inside_count == 0u || inside_count == 8u) {
+            continue;
+        }
+
+        Vec3 average = {};
+        Vec3 normal = {};
+        uint32_t crossing_count = 0;
+        for (const auto& edge : edges) {
+            const uint32_t a = edge[0];
+            const uint32_t b = edge[1];
+            if (inside[a] == inside[b]) {
+                continue;
+            }
+            average = average + (positions[a] + positions[b]) * 0.5f;
+            normal = normal + (inside[a] ? positions[b] - positions[a] : positions[a] - positions[b]);
+            ++crossing_count;
+        }
+        if (crossing_count == 0u) {
+            continue;
+        }
+
+        const Vec3 vertex = average / static_cast<float>(crossing_count);
+        if (length(vertex - patch.center_mesh) > patch.extraction_radius_mesh) {
+            continue;
+        }
+        const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
+        surface_net.vertices.push_back(vertex);
+        surface_net.normals.push_back(length(normal) > 0.000001f ? normalize(normal) : normalize(vertex));
+        cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
+    }
+
+    surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    for (SurfaceNetEdgeKey edge : edge_candidates) {
+        if (edge.axis == 0u) {
+            if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z)
+            );
+        } else if (edge.axis == 1u) {
+            if (edge.y >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z - 1u),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z)
+            );
+        } else {
+            if (edge.z >= cube_resolution || edge.x == 0u || edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution) {
+                continue;
+            }
+            append_surface_net_quad(
+                surface_net,
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y - 1u, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y - 1u, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x, edge.y, edge.z),
+                surface_net_cube_vertex(cube_vertices, cube_resolution, edge.x - 1u, edge.y, edge.z)
+            );
+        }
+    }
+
+    return surface_net;
+}
+
+void append_local_surface_net_patches(
+    SurfaceNetMesh& surface_net,
+    const QuantizedMesh& mesh,
+    const std::vector<LocalSurfaceNetPatch>& patches,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    if (patches.empty()) {
+        return;
+    }
+
+    surface_net.local_patch_depth = patches.front().depth;
+    for (const LocalSurfaceNetPatch& patch : patches) {
+        const uint32_t vertex_count_before = static_cast<uint32_t>(surface_net.vertices.size());
+        const uint32_t triangle_count_before = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
+        SurfaceNetMesh patch_mesh = build_local_surface_net_patch_mesh(mesh, patch, grid_radius, config);
+        if (patch_mesh.vertices.empty() || patch_mesh.triangle_indices.empty()) {
+            continue;
+        }
+        append_surface_net_mesh(surface_net, patch_mesh);
+        ++surface_net.local_patch_count;
+        surface_net.local_vertex_count += static_cast<uint32_t>(surface_net.vertices.size()) - vertex_count_before;
+        surface_net.local_triangle_count += static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u) - triangle_count_before;
+    }
+}
+
+void build_svo_node_at(
+    std::vector<SparseVoxelOctreeNode>& nodes,
+    uint32_t node_index,
+    const std::vector<VoxelKey>& keys,
+    uint32_t begin,
+    uint32_t end,
+    uint32_t depth,
+    uint32_t origin_x,
+    uint32_t origin_y,
+    uint32_t origin_z,
+    uint32_t size,
+    uint32_t max_depth
+) {
+    SparseVoxelOctreeNode& node = nodes[node_index];
+    node.occupied_leaf_count = end - begin;
+    node.depth = depth;
+    node.origin_x = origin_x;
+    node.origin_y = origin_y;
+    node.origin_z = origin_z;
+    node.size = size;
+
+    if (begin >= end || depth >= max_depth || size <= 1u) {
+        return;
+    }
+
+    const uint32_t child_size = size / 2u;
+    std::array<uint32_t, 8> child_begin = {};
+    std::array<uint32_t, 8> child_end = {};
+    std::array<bool, 8> has_child = {};
+    for (uint32_t i = begin; i < end; ++i) {
+        const uint32_t child = child_index_for_voxel(keys[i], origin_x, origin_y, origin_z, child_size);
+        if (!has_child[child]) {
+            child_begin[child] = i;
+            has_child[child] = true;
+            node.child_mask |= (1u << child);
+        }
+        child_end[child] = i + 1u;
+    }
+
+    const uint32_t child_count = static_cast<uint32_t>(std::popcount(node.child_mask));
+    node.first_child = static_cast<uint32_t>(nodes.size());
+    const uint32_t first_child = node.first_child;
+    nodes.resize(nodes.size() + child_count);
+
+    uint32_t child_slot = 0;
+    for (uint32_t child = 0; child < 8; ++child) {
+        if (!has_child[child]) {
+            continue;
+        }
+        build_svo_node_at(
+            nodes,
+            first_child + child_slot,
+            keys,
+            child_begin[child],
+            child_end[child],
+            depth + 1u,
+            child_origin_x(origin_x, child, child_size),
+            child_origin_y(origin_y, child, child_size),
+            child_origin_z(origin_z, child, child_size),
+            child_size,
+            max_depth
+        );
+        ++child_slot;
+    }
+}
+
+void count_svo_debug_boxes_recursive(
+    const SparseVoxelOctree& svo,
+    uint32_t node_index,
+    uint32_t draw_depth,
+    uint32_t max_boxes,
+    uint32_t& count
+) {
+    if (node_index >= svo.nodes.size() || count >= max_boxes) {
+        return;
+    }
+
+    const SparseVoxelOctreeNode& node = svo.nodes[node_index];
+    if (node.child_mask == 0u || node.depth >= draw_depth) {
+        ++count;
+        return;
+    }
+
+    uint32_t child_slot = 0;
+    for (uint32_t child = 0; child < 8; ++child) {
+        if ((node.child_mask & (1u << child)) == 0u) {
+            continue;
+        }
+        count_svo_debug_boxes_recursive(svo, node.first_child + child_slot, draw_depth, max_boxes, count);
+        ++child_slot;
+    }
+}
+
+void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig& config) {
+    mesh.svo = {};
+    mesh.surface_net = {};
+    if (!config.enable_svo_generation || mesh.vertices.empty()) {
+        return;
+    }
+
+    const uint32_t depth = std::clamp(config.svo_depth, 1u, 13u);
+    const uint32_t resolution = 1u << depth;
+    float max_radius = 1.0f;
+    for (const QuantizedMeshVertex& vertex : mesh.vertices) {
+        max_radius = std::max(max_radius, length(vertex.position));
+    }
+
+    const float grid_radius = max_radius * 1.025f;
+    const float voxel_size = (grid_radius * 2.0f) / static_cast<float>(resolution);
+    std::vector<VoxelKey> keys;
+    const uint32_t triangle_count = static_cast<uint32_t>((mesh.triangle_indices.size() + mesh.stitch_triangle_indices.size()) / 3u);
+    keys.reserve(static_cast<size_t>(triangle_count) * 16u);
+    add_voxelized_triangles(keys, mesh, mesh.triangle_indices, grid_radius, voxel_size, resolution);
+    add_voxelized_triangles(keys, mesh, mesh.stitch_triangle_indices, grid_radius, voxel_size, resolution);
+
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    const uint32_t dig_removed_leaf_count = apply_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
+    const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = build_local_surface_net_patches(config);
+    mesh.surface_net = build_surface_net_mesh_from_occupancy(keys, depth, grid_radius, config, local_surface_net_patches);
+    append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
+
+    mesh.svo.bounds_radius = grid_radius;
+    mesh.svo.depth = depth;
+    mesh.svo.max_depth = depth;
+    mesh.svo.debug_draw_depth = std::min(config.svo_debug_draw_depth, depth);
+    mesh.svo.debug_max_boxes = std::max(1u, config.svo_debug_max_boxes);
+    mesh.svo.occupied_leaf_count = static_cast<uint32_t>(keys.size());
+    mesh.svo.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
+    mesh.svo.dig_removed_leaf_count = dig_removed_leaf_count;
+    mesh.svo.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    if (!keys.empty()) {
+        mesh.svo.nodes.resize(1);
+        build_svo_node_at(mesh.svo.nodes, 0, keys, 0, static_cast<uint32_t>(keys.size()), 0, 0, 0, 0, resolution, depth);
+        count_svo_debug_boxes_recursive(mesh.svo, 0, mesh.svo.debug_draw_depth, mesh.svo.debug_max_boxes, mesh.svo.debug_box_count);
+    }
+}
+
 } // namespace
 
 QuantizedMesh build_quantized_marching_cubes(
     const GoldbergTopology& topology,
-    const std::vector<PointSample>& points,
+    const PointCloud& points,
     const MarchingCubesConfig& config
 ) {
     QuantizedMesh mesh;
     mesh.cell_count = static_cast<uint32_t>(topology.cells.size());
     BoundaryEdgeMap boundary_edges;
+    boundary_edges.reserve(topology.cells.size() * 4096u);
+    const FractureBuildCache fracture_cache = build_fracture_build_cache(config);
     const uint32_t plane_subdivisions = std::max(1u, std::max(config.resolution_x, config.resolution_y));
     mesh.min_cell_subdivisions = UINT32_MAX;
     mesh.max_cell_subdivisions = 0;
     mesh.lod_level_count = (config.enable_lod_subdivision_test || config.enable_camera_proximity_lod) ? std::max(1u, config.lod_levels) : 1u;
+    std::vector<FractureSeed> fracture_seed_scratch;
+    std::vector<FractureShard> fracture_shard_scratch;
 
     for (uint32_t cell_id = 0; cell_id < topology.cells.size(); ++cell_id) {
         const GoldbergCell& cell = topology.cells[cell_id];
@@ -1956,13 +3334,27 @@ QuantizedMesh build_quantized_marching_cubes(
         const uint32_t cell_subdivisions = cell_lod_subdivisions(cell, config, plane_subdivisions);
         mesh.min_cell_subdivisions = std::min(mesh.min_cell_subdivisions, cell_subdivisions);
         mesh.max_cell_subdivisions = std::max(mesh.max_cell_subdivisions, cell_subdivisions);
-        emit_subdivided_goldberg_cell_plane(mesh, boundary_edges, topology, cell_id, cell_subdivisions, surface_radius, material_id, config);
+        emit_subdivided_goldberg_cell_plane(
+            mesh,
+            boundary_edges,
+            topology,
+            cell_id,
+            cell_subdivisions,
+            surface_radius,
+            material_id,
+            config,
+            fracture_cache,
+            fracture_seed_scratch,
+            fracture_shard_scratch
+        );
     }
 
     if (topology.cells.empty()) {
         mesh.min_cell_subdivisions = 0;
     }
-    build_transition_stitches(mesh, topology, points, boundary_edges);
+    sort_and_merge_boundary_edges(boundary_edges);
+    build_transition_stitches(mesh, topology, points, boundary_edges, config, fracture_cache);
+    generate_sparse_voxel_octree(mesh, config);
 
     return mesh;
 }
@@ -1998,6 +3390,12 @@ QuantizedMeshValidation validate_quantized_mesh(const QuantizedMesh& mesh) {
     require(mesh.fallback_stitch_triangle_count == 0, "fallback stitch triangle count is nonzero");
     require(mesh.min_cell_subdivisions > 0, "minimum cell subdivision count is zero");
     require(mesh.max_cell_subdivisions >= mesh.min_cell_subdivisions, "cell subdivision range is invalid");
+    if (mesh.surface_net.source_depth > 0u) {
+        require(!mesh.surface_net.vertices.empty(), "surface net vertex buffer is empty");
+        require(mesh.surface_net.normals.size() == mesh.surface_net.vertices.size(), "surface net normal count does not match vertex count");
+        require(!mesh.surface_net.triangle_indices.empty(), "surface net index buffer is empty");
+        require(mesh.surface_net.triangle_indices.size() % 3 == 0, "surface net index count is not divisible by 3");
+    }
 
     for (uint32_t index : mesh.triangle_indices) {
         require(index < mesh.vertices.size(), "triangle index out of range");
@@ -2010,6 +3408,9 @@ QuantizedMeshValidation validate_quantized_mesh(const QuantizedMesh& mesh) {
     }
     for (uint32_t index : mesh.stitch_line_indices) {
         require(index < mesh.vertices.size(), "stitch line index out of range");
+    }
+    for (uint32_t index : mesh.surface_net.triangle_indices) {
+        require(index < mesh.surface_net.vertices.size(), "surface net index out of range");
     }
 
     if (ok) {
@@ -2031,7 +3432,36 @@ QuantizedMeshValidation validate_quantized_mesh(const QuantizedMesh& mesh) {
                << mesh.greedy_path_step_count << " greedy path steps, "
                << mesh.rejected_greedy_jump_count << " rejected greedy jumps, "
                << mesh.rejected_stitch_run_count << " rejected stitch runs, "
-               << mesh.unstitched_gap_count << " unstitched gaps.";
+               << mesh.unstitched_gap_count << " unstitched gaps, SVO depth "
+               << mesh.svo.depth << ", "
+               << mesh.svo.debug_draw_depth << " debug draw depth, "
+               << mesh.svo.occupied_leaf_count << " occupied leaves, "
+               << mesh.svo.nodes.size() << " SVO nodes, "
+               << mesh.svo.debug_box_count << " debug boxes";
+        if (mesh.svo.dig_edit_count > 0u) {
+            report << ", " << mesh.svo.dig_edit_count << " dig edits, "
+                   << mesh.svo.dig_removed_leaf_count << " carved leaves, local edit depth "
+                   << mesh.svo.local_edit_depth;
+        }
+        if (mesh.svo.depth > 0 && mesh.svo.bounds_radius > 0.0f) {
+            const float leaf_world_units = (mesh.svo.bounds_radius * 2.0f) / static_cast<float>(1u << mesh.svo.depth);
+            report << ", " << world_units_to_kilometers(leaf_world_units) << " km SVO leaf size";
+        }
+        if (mesh.surface_net.source_depth > 0u) {
+            report << ", surface net depth " << mesh.surface_net.source_depth
+                   << ", " << mesh.surface_net.vertices.size() << " surface net vertices, "
+                   << (mesh.surface_net.triangle_indices.size() / 3u) << " surface net triangles";
+            if (mesh.surface_net.local_patch_count > 0u) {
+                report << ", " << mesh.surface_net.local_patch_count << " local surface patches at depth "
+                       << mesh.surface_net.local_patch_depth << " ("
+                       << mesh.surface_net.local_vertex_count << " vertices, "
+                       << mesh.surface_net.local_triangle_count << " triangles)";
+            }
+            if (mesh.surface_net.dig_edit_count > 0u) {
+                report << ", surface net digs " << mesh.surface_net.dig_edit_count;
+            }
+        }
+        report << '.';
     }
 
     return {ok, report.str()};

@@ -1,7 +1,6 @@
 #include "aetheronus/spaceship.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <cmath>
 
 namespace ae {
@@ -54,14 +53,14 @@ void update_spaceship(SpaceshipState& ship, const SpaceshipInput& input, float d
     ship.up = rotate_around_axis(ship.up, ship.forward, ship.roll_velocity * clamped_dt);
     orthonormalize_ship_basis(ship);
 
-    const float speed = ship.throttle * 2.15f;
+    const float speed = ship.throttle * 80.0f;
     ship.position = ship.position + ship.forward * (speed * clamped_dt);
 
-    if (ship.trail.empty() || length(ship.position - ship.trail.back()) > 0.025f) {
-        ship.trail.push_back(ship.position);
-        if (ship.trail.size() > 64) {
-            ship.trail.erase(ship.trail.begin(), ship.trail.begin() + static_cast<std::ptrdiff_t>(ship.trail.size() - 64));
-        }
+    const uint32_t newest_index = (ship.trail_head + SpaceshipState::TrailCapacity - 1u) % SpaceshipState::TrailCapacity;
+    if (ship.trail_count == 0 || length(ship.position - ship.trail[newest_index]) > 10.0f) {
+        ship.trail[ship.trail_head] = ship.position;
+        ship.trail_head = (ship.trail_head + 1u) % SpaceshipState::TrailCapacity;
+        ship.trail_count = std::min(ship.trail_count + 1u, SpaceshipState::TrailCapacity);
     }
 }
 

@@ -10,6 +10,17 @@
 
 namespace ae {
 
+struct VoxelDigEdit {
+    Vec3 center_mesh;
+    float radius_km = 8.0f;
+    uint32_t depth = 15;
+};
+
+struct VoxelEditSet {
+    std::vector<VoxelDigEdit> digs;
+    uint32_t local_depth = 15;
+};
+
 struct MarchingCubesConfig {
     uint32_t resolution_x = 8;
     uint32_t resolution_y = 8;
@@ -27,6 +38,7 @@ struct MarchingCubesConfig {
     bool enable_fractures = false;
     bool connect_fractures_across_cells = true;
     uint32_t fracture_seed = 1;
+    uint32_t global_fracture_seed_count = 48;
     uint32_t global_fracture_seed_copies = 1;
     uint32_t shards_per_hex = 7;
     uint32_t shards_per_pent = 6;
@@ -40,6 +52,20 @@ struct MarchingCubesConfig {
     uint32_t fracture_wall_material_id = 4;
     float fracture_chunk_outward_min = 0.004f;
     float fracture_chunk_outward_max = 0.024f;
+    bool enable_svo_generation = true;
+    uint32_t svo_depth = 8;
+    uint32_t svo_debug_draw_depth = 8;
+    uint32_t svo_debug_max_boxes = 2000000;
+    bool enable_surface_net_generation = true;
+    uint32_t surface_net_depth = 8;
+    uint32_t surface_net_max_vertices = 2000000;
+    uint32_t surface_net_material_id = 5;
+    bool enable_local_surface_net_detail = true;
+    uint32_t local_surface_net_depth = 13;
+    float local_surface_net_patch_radius_km = 96.0f;
+    float local_surface_net_patch_overlap_km = 16.0f;
+    uint32_t local_surface_net_max_patches = 8;
+    VoxelEditSet voxel_edits;
 };
 
 struct QuantizedMeshVertex {
@@ -50,12 +76,56 @@ struct QuantizedMeshVertex {
     uint32_t fracture_chunk_id = 0;
 };
 
+struct SparseVoxelOctreeNode {
+    uint32_t child_mask = 0;
+    uint32_t first_child = 0;
+    uint32_t occupied_leaf_count = 0;
+    uint32_t depth = 0;
+    uint32_t origin_x = 0;
+    uint32_t origin_y = 0;
+    uint32_t origin_z = 0;
+    uint32_t size = 0;
+};
+
+struct SparseVoxelOctree {
+    std::vector<SparseVoxelOctreeNode> nodes;
+    float bounds_radius = 0.0f;
+    uint32_t depth = 0;
+    uint32_t occupied_leaf_count = 0;
+    uint32_t max_depth = 0;
+    uint32_t debug_draw_depth = 0;
+    uint32_t debug_max_boxes = 0;
+    uint32_t debug_box_count = 0;
+    uint32_t dig_edit_count = 0;
+    uint32_t dig_removed_leaf_count = 0;
+    uint32_t local_edit_depth = 0;
+};
+
+struct SurfaceNetMesh {
+    std::vector<Vec3> vertices;
+    std::vector<Vec3> normals;
+    std::vector<uint32_t> triangle_indices;
+    float bounds_radius = 0.0f;
+    uint32_t source_depth = 0;
+    uint32_t occupied_voxel_count = 0;
+    uint32_t candidate_cube_count = 0;
+    uint32_t material_id = 5;
+    uint32_t dig_edit_count = 0;
+    uint32_t local_edit_depth = 0;
+    uint32_t local_patch_count = 0;
+    uint32_t local_patch_depth = 0;
+    uint32_t local_vertex_count = 0;
+    uint32_t local_triangle_count = 0;
+};
+
 struct QuantizedMesh {
     std::vector<QuantizedMeshVertex> vertices;
     std::vector<uint32_t> triangle_indices;
     std::vector<uint32_t> line_indices;
     std::vector<uint32_t> stitch_triangle_indices;
     std::vector<uint32_t> stitch_line_indices;
+    SparseVoxelOctree svo;
+    SurfaceNetMesh surface_net;
     uint32_t triangle_count = 0;
     uint32_t rejected_triangle_count = 0;
     uint32_t stitch_triangle_count = 0;
@@ -84,7 +154,7 @@ struct QuantizedMeshValidation {
 
 QuantizedMesh build_quantized_marching_cubes(
     const GoldbergTopology& topology,
-    const std::vector<PointSample>& points,
+    const PointCloud& points,
     const MarchingCubesConfig& config = {}
 );
 

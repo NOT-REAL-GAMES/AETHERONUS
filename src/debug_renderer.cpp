@@ -1,5 +1,7 @@
 #include "aetheronus/debug_renderer.hpp"
 
+#include "aetheronus/planet_scale.hpp"
+
 #include <glad/glad.h>
 
 #include <algorithm>
@@ -16,6 +18,38 @@ struct DebugVertex {
     Vec3 position;
     Vec3 color;
 };
+
+struct SurfaceNetVertex {
+    Vec3 position;
+    Vec3 normal;
+    Vec3 color;
+};
+
+struct VoxelDebugView {
+    Vec3 eye;
+    Vec3 range_center;
+    Vec3 forward;
+    Vec3 right;
+    Vec3 up;
+    float tan_half_fov_y = 1.0f;
+    float tan_half_fov_x = 1.0f;
+    float near_plane = 0.05f;
+    float far_plane = 1.0f;
+    float occlusion_radius = PlanetRadiusKilometers;
+    float range_radius = 100.0f;
+    float debug_box_size = 2.0f;
+};
+
+Vec3 planet_to_world(Vec3 position) {
+    return position * PlanetRadiusKilometers;
+}
+
+Vec3 camera_surface_focus(Vec3 eye) {
+    if (length(eye) <= 0.0001f) {
+        return {0.0f, PlanetRadiusKilometers, 0.0f};
+    }
+    return normalize(eye) * PlanetRadiusKilometers;
+}
 
 const char* VertexShaderSource = R"glsl(
 #version 330 core
@@ -44,6 +78,51 @@ void main() {
 }
 )glsl";
 
+const char* SurfaceNetVertexShaderSource = R"glsl(
+#version 330 core
+layout (location = 0) in vec3 a_position;
+layout (location = 1) in vec3 a_normal;
+layout (location = 2) in vec3 a_color;
+
+uniform mat4 u_mvp;
+
+out vec3 v_position;
+out vec3 v_normal;
+out vec3 v_color;
+
+void main() {
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+    v_position = a_position;
+    v_normal = normalize(a_normal);
+    v_color = a_color;
+}
+)glsl";
+
+const char* SurfaceNetFragmentShaderSource = R"glsl(
+#version 330 core
+in vec3 v_position;
+in vec3 v_normal;
+in vec3 v_color;
+
+uniform vec3 u_camera_position;
+uniform vec3 u_light_direction;
+
+out vec4 frag_color;
+
+void main() {
+    vec3 n = normalize(v_normal);
+    vec3 l = normalize(-u_light_direction);
+    vec3 v = normalize(u_camera_position - v_position);
+    vec3 h = normalize(l + v);
+
+    float diffuse = max(dot(n, l), 0.0);
+    float specular = pow(max(dot(n, h), 0.0), 48.0) * 0.34;
+    vec3 ambient = v_color * 0.18;
+    vec3 lit = ambient + v_color * diffuse * 0.82 + vec3(1.0, 0.90, 0.68) * specular;
+    frag_color = vec4(lit, 1.0);
+}
+)glsl";
+
 uint32_t compile_shader(uint32_t type, const char* source) {
     const uint32_t shader = glCreateShader(type);
     glShaderSource(shader, 1, &source, nullptr);
@@ -62,9 +141,9 @@ uint32_t compile_shader(uint32_t type, const char* source) {
     return shader;
 }
 
-uint32_t build_shader_program() {
-    const uint32_t vertex = compile_shader(GL_VERTEX_SHADER, VertexShaderSource);
-    const uint32_t fragment = compile_shader(GL_FRAGMENT_SHADER, FragmentShaderSource);
+uint32_t build_shader_program_from_sources(const char* vertex_source, const char* fragment_source) {
+    const uint32_t vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
+    const uint32_t fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
     if (vertex == 0 || fragment == 0) {
         glDeleteShader(vertex);
         glDeleteShader(fragment);
@@ -92,12 +171,20 @@ uint32_t build_shader_program() {
     return program;
 }
 
-Vec3 point_color(const PointSample& point) {
-    if (point.source_cell_id != point.owner_cell_id) {
+uint32_t build_shader_program() {
+    return build_shader_program_from_sources(VertexShaderSource, FragmentShaderSource);
+}
+
+uint32_t build_surface_net_shader_program() {
+    return build_shader_program_from_sources(SurfaceNetVertexShaderSource, SurfaceNetFragmentShaderSource);
+}
+
+Vec3 point_color(uint32_t source_cell_id, uint32_t owner_cell_id, uint32_t material_id) {
+    if (source_cell_id != owner_cell_id) {
         return {1.0f, 0.12f, 0.22f};
     }
 
-    switch (point.material_id) {
+    switch (material_id) {
         case 1:
             return {1.0f, 0.58f, 0.18f};
         case 2:
@@ -143,8 +230,8 @@ void append_goldberg_cell_ring_band(
             continue;
         }
         const Vec3 corner = topology.vertices[corner_index].position;
-        outer_loop.push_back(corner * RibbonRadius);
-        inner_loop.push_back(normalize(lerp(corner, cell.center, InnerInset)) * RibbonRadius);
+        outer_loop.push_back(planet_to_world(corner * RibbonRadius));
+        inner_loop.push_back(planet_to_world(normalize(lerp(corner, cell.center, InnerInset)) * RibbonRadius));
     }
 
     if (outer_loop.size() < 3 || inner_loop.size() != outer_loop.size()) {
@@ -177,6 +264,212 @@ void append_goldberg_cell_ring_band(
     }
 }
 
+void append_voxel_wire_cube(std::vector<DebugVertex>& vertices, Vec3 center, float size) {
+    const Vec3 color = {0.95f, 0.34f, 0.96f};
+    const float h = size * 0.48f;
+    const std::array<Vec3, 8> corners = {{
+        {center.x - h, center.y - h, center.z - h},
+        {center.x + h, center.y - h, center.z - h},
+        {center.x + h, center.y + h, center.z - h},
+        {center.x - h, center.y + h, center.z - h},
+        {center.x - h, center.y - h, center.z + h},
+        {center.x + h, center.y - h, center.z + h},
+        {center.x + h, center.y + h, center.z + h},
+        {center.x - h, center.y + h, center.z + h},
+    }};
+    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
+        {{0, 1}}, {{1, 2}}, {{2, 3}}, {{3, 0}},
+        {{4, 5}}, {{5, 6}}, {{6, 7}}, {{7, 4}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+    for (const auto& edge : edges) {
+        vertices.push_back({corners[edge[0]], color});
+        vertices.push_back({corners[edge[1]], color});
+    }
+}
+
+Vec3 svo_node_center(const SparseVoxelOctree& svo, const SparseVoxelOctreeNode& node) {
+    const float cell_size = (svo.bounds_radius * 2.0f) / static_cast<float>(1u << svo.depth);
+    return {
+        -svo.bounds_radius + (static_cast<float>(node.origin_x) + static_cast<float>(node.size) * 0.5f) * cell_size,
+        -svo.bounds_radius + (static_cast<float>(node.origin_y) + static_cast<float>(node.size) * 0.5f) * cell_size,
+        -svo.bounds_radius + (static_cast<float>(node.origin_z) + static_cast<float>(node.size) * 0.5f) * cell_size,
+    };
+}
+
+float svo_node_world_size(const SparseVoxelOctree& svo, const SparseVoxelOctreeNode& node) {
+    const float cell_size = (svo.bounds_radius * 2.0f) / static_cast<float>(1u << svo.depth);
+    return static_cast<float>(node.size) * cell_size;
+}
+
+bool voxel_box_visible(Vec3 center, float radius, const VoxelDebugView& view) {
+    if (length(center - view.range_center) > view.range_radius + radius) {
+        return false;
+    }
+
+    const Vec3 relative = center - view.eye;
+    const float z = dot(relative, view.forward);
+    if (z + radius < view.near_plane || z - radius > view.far_plane) {
+        return false;
+    }
+
+    const float x = dot(relative, view.right);
+    const float y = dot(relative, view.up);
+    const float perspective_z = std::max(z, view.near_plane);
+    if (std::fabs(x) - radius > perspective_z * view.tan_half_fov_x ||
+        std::fabs(y) - radius > perspective_z * view.tan_half_fov_y) {
+        return false;
+    }
+
+    const float eye_radius = length(view.eye);
+    if (eye_radius > view.occlusion_radius + 1.0f) {
+        const float horizon_limit = view.occlusion_radius * view.occlusion_radius;
+        const float box_margin = radius * eye_radius;
+        if (dot(center, view.eye) + box_margin < horizon_limit) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void append_subdivided_voxel_wire_cubes(
+    std::vector<DebugVertex>& vertices,
+    Vec3 center,
+    float size,
+    const VoxelDebugView& view,
+    uint32_t& emitted_boxes,
+    uint32_t max_boxes
+) {
+    const float target_size = std::max(0.25f, view.debug_box_size);
+    const uint32_t steps = std::max(1u, static_cast<uint32_t>(std::ceil(size / target_size)));
+    const float box_size = size / static_cast<float>(steps);
+    const float box_radius = box_size * 0.8661f;
+    const Vec3 min_corner = center - Vec3{size * 0.5f, size * 0.5f, size * 0.5f};
+    const Vec3 range_min = view.range_center - Vec3{view.range_radius + box_radius, view.range_radius + box_radius, view.range_radius + box_radius};
+    const Vec3 range_max = view.range_center + Vec3{view.range_radius + box_radius, view.range_radius + box_radius, view.range_radius + box_radius};
+
+    auto first_step = [&](float minimum, float range_minimum) {
+        return std::clamp(static_cast<int32_t>(std::floor((range_minimum - minimum) / box_size)), 0, static_cast<int32_t>(steps - 1u));
+    };
+    auto last_step = [&](float minimum, float range_maximum) {
+        return std::clamp(static_cast<int32_t>(std::ceil((range_maximum - minimum) / box_size)), 0, static_cast<int32_t>(steps - 1u));
+    };
+
+    const int32_t ix0 = first_step(min_corner.x, range_min.x);
+    const int32_t iy0 = first_step(min_corner.y, range_min.y);
+    const int32_t iz0 = first_step(min_corner.z, range_min.z);
+    const int32_t ix1 = last_step(min_corner.x, range_max.x);
+    const int32_t iy1 = last_step(min_corner.y, range_max.y);
+    const int32_t iz1 = last_step(min_corner.z, range_max.z);
+
+    for (int32_t z = iz0; z <= iz1 && emitted_boxes < max_boxes; ++z) {
+        for (int32_t y = iy0; y <= iy1 && emitted_boxes < max_boxes; ++y) {
+            for (int32_t x = ix0; x <= ix1 && emitted_boxes < max_boxes; ++x) {
+                const Vec3 box_center = {
+                    min_corner.x + (static_cast<float>(x) + 0.5f) * box_size,
+                    min_corner.y + (static_cast<float>(y) + 0.5f) * box_size,
+                    min_corner.z + (static_cast<float>(z) + 0.5f) * box_size,
+                };
+                if (!voxel_box_visible(box_center, box_radius, view)) {
+                    continue;
+                }
+                append_voxel_wire_cube(vertices, box_center, box_size);
+                ++emitted_boxes;
+            }
+        }
+    }
+}
+
+void append_svo_debug_boxes(
+    std::vector<DebugVertex>& vertices,
+    const SparseVoxelOctree& svo,
+    uint32_t node_index,
+    const VoxelDebugView& view,
+    uint32_t& emitted_boxes
+) {
+    if (node_index >= svo.nodes.size() || emitted_boxes >= svo.debug_max_boxes) {
+        return;
+    }
+
+    const SparseVoxelOctreeNode& node = svo.nodes[node_index];
+    const Vec3 center = planet_to_world(svo_node_center(svo, node));
+    const float size = svo_node_world_size(svo, node) * PlanetRadiusKilometers;
+    const float radius = size * 0.8661f;
+    if (!voxel_box_visible(center, radius, view)) {
+        return;
+    }
+
+    if (node.child_mask == 0u || node.depth >= svo.debug_draw_depth) {
+        if (size > view.debug_box_size * 1.5f) {
+            append_subdivided_voxel_wire_cubes(vertices, center, size, view, emitted_boxes, svo.debug_max_boxes);
+        } else {
+            append_voxel_wire_cube(vertices, center, size);
+            ++emitted_boxes;
+        }
+        return;
+    }
+
+    struct ChildCandidate {
+        uint32_t index = 0;
+        float distance2 = 0.0f;
+    };
+    std::array<ChildCandidate, 8> children = {};
+    uint32_t child_count = 0;
+    uint32_t child_slot = 0;
+    for (uint32_t child = 0; child < 8; ++child) {
+        if ((node.child_mask & (1u << child)) == 0u) {
+            continue;
+        }
+        const uint32_t child_index = node.first_child + child_slot;
+        const Vec3 child_center = planet_to_world(svo_node_center(svo, svo.nodes[child_index]));
+        const Vec3 to_child = child_center - view.range_center;
+        children[child_count++] = {child_index, dot(to_child, to_child)};
+        ++child_slot;
+    }
+
+    std::sort(children.begin(), children.begin() + child_count, [](const ChildCandidate& lhs, const ChildCandidate& rhs) {
+        return lhs.distance2 < rhs.distance2;
+    });
+    for (uint32_t i = 0; i < child_count && emitted_boxes < svo.debug_max_boxes; ++i) {
+        append_svo_debug_boxes(vertices, svo, children[i].index, view, emitted_boxes);
+    }
+}
+
+std::vector<DebugVertex> build_visible_voxel_vertices(
+    const SparseVoxelOctree& svo,
+    const CameraView& camera,
+    float aspect,
+    float far_plane
+) {
+    std::vector<DebugVertex> vertices;
+    vertices.reserve(static_cast<size_t>(std::min(svo.debug_box_count, 65536u)) * 24u);
+    if (svo.nodes.empty() || svo.bounds_radius <= 0.0f || svo.depth == 0u) {
+        return vertices;
+    }
+
+    constexpr float FovY = 50.0f * Pi / 180.0f;
+    const Vec3 forward = normalize(camera.target - camera.eye);
+    const Vec3 right = normalize(cross(forward, camera.up));
+    const Vec3 up = cross(right, forward);
+    VoxelDebugView view;
+    view.eye = camera.eye;
+    view.range_center = camera_surface_focus(camera.eye);
+    view.forward = forward;
+    view.right = right;
+    view.up = up;
+    view.tan_half_fov_y = std::tan(FovY * 0.5f);
+    view.tan_half_fov_x = view.tan_half_fov_y * aspect;
+    view.far_plane = far_plane;
+    view.occlusion_radius = PlanetRadiusKilometers * 0.995f;
+    view.range_radius = 100.0f;
+    view.debug_box_size = 2.0f;
+
+    uint32_t emitted_boxes = 0;
+    append_svo_debug_boxes(vertices, svo, 0, view, emitted_boxes);
+    return vertices;
+}
+
 void upload_vertex_buffer(uint32_t& vao, uint32_t& vbo, const std::vector<DebugVertex>& vertices) {
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
@@ -187,6 +480,35 @@ void upload_vertex_buffer(uint32_t& vao, uint32_t& vbo, const std::vector<DebugV
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(DebugVertex), reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(DebugVertex), reinterpret_cast<void*>(sizeof(Vec3)));
+    glBindVertexArray(0);
+}
+
+void upload_surface_net_buffer(
+    uint32_t& vao,
+    uint32_t& vbo,
+    uint32_t& ebo,
+    const std::vector<SurfaceNetVertex>& vertices,
+    const std::vector<uint32_t>& indices
+) {
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    glGenBuffers(1, &ebo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(SurfaceNetVertex)), vertices.data(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(SurfaceNetVertex), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(SurfaceNetVertex), reinterpret_cast<void*>(sizeof(Vec3)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(SurfaceNetVertex), reinterpret_cast<void*>(sizeof(Vec3) * 2u));
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(
+        GL_ELEMENT_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
+        indices.data(),
+        GL_STATIC_DRAW
+    );
     glBindVertexArray(0);
 }
 
@@ -274,7 +596,18 @@ std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
                 0.175f + cool * 0.040f,
             };
         }
-        vertices.push_back({vertex.position, color});
+        vertices.push_back({planet_to_world(vertex.position), color});
+    }
+    return vertices;
+}
+
+std::vector<SurfaceNetVertex> build_surface_net_vertices(const SurfaceNetMesh& surface_net) {
+    std::vector<SurfaceNetVertex> vertices;
+    vertices.reserve(surface_net.vertices.size());
+    const Vec3 color = surface_net.material_id == 5u ? Vec3{0.95f, 0.62f, 0.18f} : Vec3{0.86f, 0.74f, 0.42f};
+    for (uint32_t i = 0; i < surface_net.vertices.size(); ++i) {
+        const Vec3 normal = i < surface_net.normals.size() ? normalize(surface_net.normals[i]) : normalize(surface_net.vertices[i]);
+        vertices.push_back({planet_to_world(surface_net.vertices[i]), normal, color});
     }
     return vertices;
 }
@@ -319,16 +652,20 @@ std::vector<DebugVertex> build_spaceship_vertices(const SpaceshipState& ship) {
 
 std::vector<DebugVertex> build_spaceship_trail_vertices(const SpaceshipState& ship) {
     std::vector<DebugVertex> vertices;
-    if (ship.trail.size() < 2) {
+    if (ship.trail_count < 2) {
         return vertices;
     }
 
-    vertices.reserve((ship.trail.size() - 1) * 2);
-    for (uint32_t i = 1; i < ship.trail.size(); ++i) {
-        const float t = static_cast<float>(i) / static_cast<float>(ship.trail.size() - 1);
+    vertices.reserve((ship.trail_count - 1u) * 2u);
+    const uint32_t first_index = (ship.trail_head + SpaceshipState::TrailCapacity - ship.trail_count) % SpaceshipState::TrailCapacity;
+    auto trail_point = [&](uint32_t index) {
+        return ship.trail[(first_index + index) % SpaceshipState::TrailCapacity];
+    };
+    for (uint32_t i = 1; i < ship.trail_count; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(ship.trail_count - 1u);
         const Vec3 color = {0.16f + t * 0.42f, 0.38f + t * 0.42f, 0.58f + t * 0.38f};
-        vertices.push_back({ship.trail[i - 1], color});
-        vertices.push_back({ship.trail[i], color});
+        vertices.push_back({trail_point(i - 1u), color});
+        vertices.push_back({trail_point(i), color});
     }
     return vertices;
 }
@@ -424,11 +761,15 @@ DebugRenderer::~DebugRenderer() {
     shutdown();
 }
 
-bool DebugRenderer::initialize(const GoldbergTopology& topology, const std::vector<PointSample>& points, const QuantizedMesh& mesh) {
+bool DebugRenderer::initialize(const GoldbergTopology& topology, const PointCloud& points, const QuantizedMesh& mesh) {
     shutdown();
 
     shader_ = build_shader_program();
     if (shader_ == 0) {
+        return false;
+    }
+    surface_net_shader_ = build_surface_net_shader_program();
+    if (surface_net_shader_ == 0) {
         return false;
     }
 
@@ -444,8 +785,11 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const std::vect
 
     std::vector<DebugVertex> point_vertices;
     point_vertices.reserve(points.size());
-    for (const PointSample& point : points) {
-        point_vertices.push_back({point.position * 1.018f, point_color(point)});
+    for (uint32_t i = 0; i < points.size(); ++i) {
+        point_vertices.push_back({
+            planet_to_world(points.positions[i] * 1.018f),
+            point_color(points.source_cell_ids[i], points.owner_cell_ids[i], points.material_ids[i]),
+        });
     }
 
     update_mesh(mesh);
@@ -479,6 +823,9 @@ void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
     release_mesh_buffers();
 
     const std::vector<DebugVertex> mesh_vertices = build_debug_mesh_vertices(mesh);
+    const std::vector<DebugVertex> voxel_vertices;
+    const std::vector<SurfaceNetVertex> surface_net_vertices = build_surface_net_vertices(mesh.surface_net);
+    current_svo_ = mesh.svo;
     upload_indexed_mesh_buffer(
         mesh_vao_,
         mesh_vbo_,
@@ -492,11 +839,21 @@ void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
         mesh.stitch_triangle_indices,
         mesh.stitch_line_indices
     );
+    upload_vertex_buffer(voxel_vao_, voxel_vbo_, voxel_vertices);
+    upload_surface_net_buffer(
+        surface_net_vao_,
+        surface_net_vbo_,
+        surface_net_ebo_,
+        surface_net_vertices,
+        mesh.surface_net.triangle_indices
+    );
 
     mesh_triangle_index_count_ = static_cast<int>(mesh.triangle_indices.size());
     mesh_line_index_count_ = static_cast<int>(mesh.line_indices.size());
     stitch_triangle_index_count_ = static_cast<int>(mesh.stitch_triangle_indices.size());
     stitch_line_index_count_ = static_cast<int>(mesh.stitch_line_indices.size());
+    voxel_line_vertex_count_ = 0;
+    surface_net_index_count_ = static_cast<int>(mesh.surface_net.triangle_indices.size());
 }
 
 void DebugRenderer::resize(int width, int height) {
@@ -508,7 +865,9 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
     glViewport(0, 0, width_, height_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    const Mat4 projection = perspective(50.0f * Pi / 180.0f, static_cast<float>(width_) / static_cast<float>(height_), 0.05f, 32.0f);
+    const float aspect = static_cast<float>(width_) / static_cast<float>(height_);
+    const float far_plane = std::max(PlanetRadiusKilometers * 16.0f, length(view.eye) + PlanetRadiusKilometers * 4.0f);
+    const Mat4 projection = perspective(50.0f * Pi / 180.0f, aspect, 0.05f, far_plane);
     const Mat4 view_matrix = look_at(view.eye, view.target, view.up);
     const Mat4 mvp = projection * view_matrix;
 
@@ -536,6 +895,26 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_triangle_ebo_);
     glDrawElements(GL_TRIANGLES, stitch_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
 
+    if (options.show_surface_net) {
+        glUseProgram(surface_net_shader_);
+        const int surface_mvp_location = glGetUniformLocation(surface_net_shader_, "u_mvp");
+        const int surface_camera_location = glGetUniformLocation(surface_net_shader_, "u_camera_position");
+        const int surface_light_location = glGetUniformLocation(surface_net_shader_, "u_light_direction");
+        const Vec3 light_direction = normalize(Vec3{-0.35f, -0.75f, -0.50f});
+        glUniformMatrix4fv(surface_mvp_location, 1, GL_FALSE, mvp.m);
+        glUniform3f(surface_camera_location, view.eye.x, view.eye.y, view.eye.z);
+        glUniform3f(surface_light_location, light_direction.x, light_direction.y, light_direction.z);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.0f, -1.0f);
+        glBindVertexArray(surface_net_vao_);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, surface_net_ebo_);
+        glDrawElements(GL_TRIANGLES, surface_net_index_count_, GL_UNSIGNED_INT, nullptr);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glUseProgram(shader_);
+        glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp.m);
+        glUniform1f(point_size_location, 1.0f);
+    }
+
     if (options.show_goldberg_grid) {
         glDepthFunc(GL_LEQUAL);
         glBindVertexArray(grid_ribbon_vao_);
@@ -554,6 +933,20 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
         glUniform1f(point_size_location, 6.0f);
         glBindVertexArray(point_vao_);
         glDrawArrays(GL_POINTS, 0, point_vertex_count_);
+    }
+
+    if (options.show_voxels) {
+        const std::vector<DebugVertex> voxel_vertices = build_visible_voxel_vertices(current_svo_, view, aspect, far_plane);
+        voxel_line_vertex_count_ = static_cast<int>(voxel_vertices.size());
+        glBindVertexArray(voxel_vao_);
+        glBindBuffer(GL_ARRAY_BUFFER, voxel_vbo_);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(voxel_vertices.size() * sizeof(DebugVertex)),
+            voxel_vertices.data(),
+            GL_DYNAMIC_DRAW
+        );
+        glDrawArrays(GL_LINES, 0, voxel_line_vertex_count_);
     }
 
     const std::vector<DebugVertex> trail_vertices = build_spaceship_trail_vertices(ship);
@@ -634,11 +1027,34 @@ void DebugRenderer::release_mesh_buffers() {
         glDeleteVertexArrays(1, &mesh_vao_);
         mesh_vao_ = 0;
     }
+    if (voxel_vbo_ != 0) {
+        glDeleteBuffers(1, &voxel_vbo_);
+        voxel_vbo_ = 0;
+    }
+    if (voxel_vao_ != 0) {
+        glDeleteVertexArrays(1, &voxel_vao_);
+        voxel_vao_ = 0;
+    }
+    if (surface_net_ebo_ != 0) {
+        glDeleteBuffers(1, &surface_net_ebo_);
+        surface_net_ebo_ = 0;
+    }
+    if (surface_net_vbo_ != 0) {
+        glDeleteBuffers(1, &surface_net_vbo_);
+        surface_net_vbo_ = 0;
+    }
+    if (surface_net_vao_ != 0) {
+        glDeleteVertexArrays(1, &surface_net_vao_);
+        surface_net_vao_ = 0;
+    }
 
     mesh_triangle_index_count_ = 0;
     mesh_line_index_count_ = 0;
     stitch_triangle_index_count_ = 0;
     stitch_line_index_count_ = 0;
+    voxel_line_vertex_count_ = 0;
+    surface_net_index_count_ = 0;
+    current_svo_ = {};
 }
 
 void DebugRenderer::shutdown() {
@@ -686,6 +1102,10 @@ void DebugRenderer::shutdown() {
     if (shader_ != 0) {
         glDeleteProgram(shader_);
         shader_ = 0;
+    }
+    if (surface_net_shader_ != 0) {
+        glDeleteProgram(surface_net_shader_);
+        surface_net_shader_ = 0;
     }
     line_vertex_count_ = 0;
     point_vertex_count_ = 0;
