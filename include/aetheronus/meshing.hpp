@@ -6,6 +6,7 @@
 #include "aetheronus/topology.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -89,6 +90,7 @@ struct MarchingCubesConfig {
     float local_surface_net_patch_overlap_km = 24.0f;
     uint32_t local_surface_net_max_patches = 8;
     VoxelEditSet voxel_edits;
+    std::function<void(double, const char*)> progress_callback;
 };
 
 struct QuantizedMeshVertex {

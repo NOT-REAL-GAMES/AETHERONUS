@@ -11,6 +11,10 @@
 #include <vector>
 #include <sstream>
 
+#if defined(__SSE__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
+#include <immintrin.h>
+#endif
+
 namespace ae {
 namespace {
 
@@ -180,6 +184,16 @@ struct SurfaceNetPlacement {
     Vec3 normal;
 };
 
+struct MortonVoxelKey {
+    uint64_t code = 0;
+    VoxelKey key;
+};
+
+struct MortonSurfaceNetEdgeKey {
+    uint64_t code = 0;
+    SurfaceNetEdgeKey key;
+};
+
 using BoundaryEdgeMap = std::vector<BoundaryEdgeRecord>;
 using BoundaryPairMap = std::map<BoundaryPairKey, BoundaryPairChains>;
 using BoundaryPairRunMap = std::map<BoundaryPairKey, BoundaryPairRuns>;
@@ -231,8 +245,104 @@ bool operator==(const SurfaceNetEdgeKey& lhs, const SurfaceNetEdgeKey& rhs) {
     return lhs.axis == rhs.axis && lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
 }
 
+uint64_t surface_net_edge_morton_code(SurfaceNetEdgeKey key) {
+    return (morton_encode(key.x, key.y, key.z) << 2u) | static_cast<uint64_t>(key.axis & 3u);
+}
+
+bool voxel_key_morton_less(VoxelKey lhs, VoxelKey rhs) {
+    const uint64_t lhs_code = morton_encode(lhs.x, lhs.y, lhs.z);
+    const uint64_t rhs_code = morton_encode(rhs.x, rhs.y, rhs.z);
+    if (lhs_code != rhs_code) return lhs_code < rhs_code;
+    if (lhs.x != rhs.x) return lhs.x < rhs.x;
+    if (lhs.y != rhs.y) return lhs.y < rhs.y;
+    return lhs.z < rhs.z;
+}
+
 bool contains_voxel_key(const std::vector<VoxelKey>& sorted_keys, VoxelKey key) {
-    return std::binary_search(sorted_keys.begin(), sorted_keys.end(), key);
+    const auto found = std::lower_bound(sorted_keys.begin(), sorted_keys.end(), key, voxel_key_morton_less);
+    return found != sorted_keys.end() && *found == key;
+}
+
+void sort_and_unique_voxel_keys(std::vector<VoxelKey>& keys) {
+    if (keys.size() < 2u) {
+        return;
+    }
+
+    std::vector<MortonVoxelKey> coded_keys;
+    coded_keys.reserve(keys.size());
+    for (VoxelKey key : keys) {
+        coded_keys.push_back({morton_encode(key.x, key.y, key.z), key});
+    }
+    std::sort(coded_keys.begin(), coded_keys.end(), [](const MortonVoxelKey& lhs, const MortonVoxelKey& rhs) {
+        if (lhs.code != rhs.code) return lhs.code < rhs.code;
+        if (lhs.key.x != rhs.key.x) return lhs.key.x < rhs.key.x;
+        if (lhs.key.y != rhs.key.y) return lhs.key.y < rhs.key.y;
+        return lhs.key.z < rhs.key.z;
+    });
+
+    keys.clear();
+    keys.reserve(coded_keys.size());
+    VoxelKey previous = coded_keys.front().key;
+    keys.push_back(previous);
+    for (size_t i = 1; i < coded_keys.size(); ++i) {
+        const VoxelKey key = coded_keys[i].key;
+        if (!(key == previous)) {
+            keys.push_back(key);
+            previous = key;
+        }
+    }
+}
+
+void sort_and_unique_surface_net_edge_keys(std::vector<SurfaceNetEdgeKey>& keys) {
+    if (keys.size() < 2u) {
+        return;
+    }
+
+    std::vector<MortonSurfaceNetEdgeKey> coded_keys;
+    coded_keys.reserve(keys.size());
+    for (SurfaceNetEdgeKey key : keys) {
+        coded_keys.push_back({surface_net_edge_morton_code(key), key});
+    }
+    std::sort(coded_keys.begin(), coded_keys.end(), [](const MortonSurfaceNetEdgeKey& lhs, const MortonSurfaceNetEdgeKey& rhs) {
+        if (lhs.code != rhs.code) return lhs.code < rhs.code;
+        if (lhs.key.axis != rhs.key.axis) return lhs.key.axis < rhs.key.axis;
+        if (lhs.key.x != rhs.key.x) return lhs.key.x < rhs.key.x;
+        if (lhs.key.y != rhs.key.y) return lhs.key.y < rhs.key.y;
+        return lhs.key.z < rhs.key.z;
+    });
+
+    keys.clear();
+    keys.reserve(coded_keys.size());
+    SurfaceNetEdgeKey previous = coded_keys.front().key;
+    keys.push_back(previous);
+    for (size_t i = 1; i < coded_keys.size(); ++i) {
+        const SurfaceNetEdgeKey key = coded_keys[i].key;
+        if (!(key == previous)) {
+            keys.push_back(key);
+            previous = key;
+        }
+    }
+}
+
+void report_progress(const MarchingCubesConfig& config, double progress, const char* label) {
+    if (config.progress_callback) {
+        config.progress_callback(std::clamp(progress, 0.0, 1.0), label);
+    }
+}
+
+void report_index_progress(
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end,
+    uint64_t processed,
+    uint64_t total,
+    const char* label
+) {
+    if (total == 0u) {
+        return;
+    }
+    const double t = static_cast<double>(processed) / static_cast<double>(total);
+    report_progress(config, progress_begin + (progress_end - progress_begin) * t, label);
 }
 
 void validate_morton_helpers_once() {
@@ -303,6 +413,28 @@ Vec3 clamp_vec3(Vec3 value, Vec3 minimum, Vec3 maximum) {
         clamp_axis(value.y, minimum.y, maximum.y),
         clamp_axis(value.z, minimum.z, maximum.z),
     };
+}
+
+float fast_rsqrt_positive(float value) {
+#if defined(__SSE__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
+    const __m128 x = _mm_set_ss(value);
+    __m128 y = _mm_rsqrt_ss(x);
+    const __m128 half = _mm_set_ss(0.5f);
+    const __m128 three_halves = _mm_set_ss(1.5f);
+    y = _mm_mul_ss(y, _mm_sub_ss(three_halves, _mm_mul_ss(_mm_mul_ss(half, x), _mm_mul_ss(y, y))));
+    return _mm_cvtss_f32(y);
+#else
+    return 1.0f / std::sqrt(value);
+#endif
+}
+
+Vec3 fast_normalize_vec3(Vec3 value) {
+    const float len_sq = value.x * value.x + value.y * value.y + value.z * value.z;
+    if (len_sq <= 0.000000000001f) {
+        return {0.0f, 1.0f, 0.0f};
+    }
+    const float inv_len = fast_rsqrt_positive(len_sq);
+    return {value.x * inv_len, value.y * inv_len, value.z * inv_len};
 }
 
 float snap(float value, float step) {
@@ -2529,14 +2661,46 @@ uint32_t child_origin_z(uint32_t origin, uint32_t child_index, uint32_t child_si
     return origin + ((child_index & 1u) != 0u ? child_size : 0u);
 }
 
+uint64_t voxelized_triangle_sample_count(
+    const QuantizedMesh& mesh,
+    const std::vector<uint32_t>& indices,
+    float voxel_size
+) {
+    uint64_t count = 0;
+    for (uint32_t i = 0; i + 2 < indices.size(); i += 3) {
+        const Vec3 a = mesh.vertices[indices[i]].position;
+        const Vec3 b = mesh.vertices[indices[i + 1]].position;
+        const Vec3 c = mesh.vertices[indices[i + 2]].position;
+        const float longest_edge = std::max(length(b - a), std::max(length(c - b), length(a - c)));
+        const float sample_spacing = std::max(voxel_size * 2.0f, 0.000001f);
+        const uint32_t steps = std::clamp(static_cast<uint32_t>(std::ceil(longest_edge / sample_spacing)), 1u, 256u);
+        count += (static_cast<uint64_t>(steps) + 1ull) * (static_cast<uint64_t>(steps) + 2ull) / 2ull + 4ull;
+    }
+    return count;
+}
+
 void add_voxelized_triangles(
     std::vector<VoxelKey>& keys,
     const QuantizedMesh& mesh,
     const std::vector<uint32_t>& indices,
     float grid_radius,
     float voxel_size,
-    uint32_t resolution
+    uint32_t resolution,
+    const MarchingCubesConfig& config,
+    float progress_begin,
+    float progress_end,
+    uint64_t& processed_vertices,
+    uint64_t total_vertices
 ) {
+    auto push_voxel_sample = [&](Vec3 position) {
+        keys.push_back(voxel_key_for_position(position, grid_radius, voxel_size, resolution));
+        ++processed_vertices;
+        if (total_vertices > 0u) {
+            const double t = static_cast<double>(processed_vertices) / static_cast<double>(total_vertices);
+            report_progress(config, static_cast<double>(progress_begin) + static_cast<double>(progress_end - progress_begin) * t, nullptr);
+        }
+    };
+
     for (uint32_t i = 0; i + 2 < indices.size(); i += 3) {
         const Vec3 a = mesh.vertices[indices[i]].position;
         const Vec3 b = mesh.vertices[indices[i + 1]].position;
@@ -2549,13 +2713,13 @@ void add_voxelized_triangles(
                 const float u = static_cast<float>(u_step) / static_cast<float>(steps);
                 const float v = static_cast<float>(v_step) / static_cast<float>(steps);
                 const float w = 1.0f - u - v;
-                keys.push_back(voxel_key_for_position(a * u + b * v + c * w, grid_radius, voxel_size, resolution));
+                push_voxel_sample(a * u + b * v + c * w);
             }
         }
-        keys.push_back(voxel_key_for_position((a + b + c) / 3.0f, grid_radius, voxel_size, resolution));
-        keys.push_back(voxel_key_for_position((a + b) * 0.5f, grid_radius, voxel_size, resolution));
-        keys.push_back(voxel_key_for_position((b + c) * 0.5f, grid_radius, voxel_size, resolution));
-        keys.push_back(voxel_key_for_position((c + a) * 0.5f, grid_radius, voxel_size, resolution));
+        push_voxel_sample((a + b + c) / 3.0f);
+        push_voxel_sample((a + b) * 0.5f);
+        push_voxel_sample((b + c) * 0.5f);
+        push_voxel_sample((c + a) * 0.5f);
     }
 }
 
@@ -2573,6 +2737,142 @@ bool surface_net_bit(const std::vector<uint64_t>& bits, uint32_t index) {
 
 void set_surface_net_bit(std::vector<uint64_t>& bits, uint32_t index) {
     bits[index / 64u] |= (uint64_t{1} << (index % 64u));
+}
+
+void set_surface_net_bit64(std::vector<uint64_t>& bits, uint64_t index) {
+    bits[static_cast<size_t>(index / 64u)] |= (uint64_t{1} << (index % 64u));
+}
+
+uint32_t surface_net_bit_pair(const std::vector<uint64_t>& bits, uint64_t index) {
+    const size_t word_index = static_cast<size_t>(index >> 6u);
+    const uint32_t shift = static_cast<uint32_t>(index & 63u);
+    if (shift < 63u) {
+        return static_cast<uint32_t>((bits[word_index] >> shift) & 3ull);
+    }
+    const uint32_t low = static_cast<uint32_t>((bits[word_index] >> 63u) & 1ull);
+    const uint32_t high = static_cast<uint32_t>(bits[word_index + 1u] & 1ull);
+    return low | (high << 1u);
+}
+
+void set_surface_net_cube_candidate(std::vector<uint64_t>& bits, uint32_t cube_resolution, uint32_t x, uint32_t y, uint32_t z) {
+    if (x >= cube_resolution || y >= cube_resolution || z >= cube_resolution) {
+        return;
+    }
+    set_surface_net_bit64(bits, surface_net_cube_index(x, y, z, cube_resolution));
+}
+
+uint64_t surface_net_edge_index(uint32_t x, uint32_t y, uint32_t z, uint32_t axis, uint32_t resolution) {
+    return static_cast<uint64_t>(axis) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) +
+           static_cast<uint64_t>(surface_net_grid_index(x, y, z, resolution));
+}
+
+void set_surface_net_edge_candidate_bit(
+    std::vector<uint64_t>& edges,
+    const std::vector<uint64_t>& occupancy,
+    uint32_t resolution,
+    uint32_t x,
+    uint32_t y,
+    uint32_t z,
+    uint32_t axis,
+    bool negative_direction
+) {
+    if (axis == 0u) {
+        if (negative_direction) {
+            if (x == 0u) return;
+            if (!surface_net_bit(occupancy, surface_net_grid_index(x - 1u, y, z, resolution))) {
+                set_surface_net_bit64(edges, surface_net_edge_index(x - 1u, y, z, axis, resolution));
+            }
+        } else if (x + 1u < resolution && !surface_net_bit(occupancy, surface_net_grid_index(x + 1u, y, z, resolution))) {
+            set_surface_net_bit64(edges, surface_net_edge_index(x, y, z, axis, resolution));
+        }
+    } else if (axis == 1u) {
+        if (negative_direction) {
+            if (y == 0u) return;
+            if (!surface_net_bit(occupancy, surface_net_grid_index(x, y - 1u, z, resolution))) {
+                set_surface_net_bit64(edges, surface_net_edge_index(x, y - 1u, z, axis, resolution));
+            }
+        } else if (y + 1u < resolution && !surface_net_bit(occupancy, surface_net_grid_index(x, y + 1u, z, resolution))) {
+            set_surface_net_bit64(edges, surface_net_edge_index(x, y, z, axis, resolution));
+        }
+    } else {
+        if (negative_direction) {
+            if (z == 0u) return;
+            if (!surface_net_bit(occupancy, surface_net_grid_index(x, y, z - 1u, resolution))) {
+                set_surface_net_bit64(edges, surface_net_edge_index(x, y, z - 1u, axis, resolution));
+            }
+        } else if (z + 1u < resolution && !surface_net_bit(occupancy, surface_net_grid_index(x, y, z + 1u, resolution))) {
+            set_surface_net_bit64(edges, surface_net_edge_index(x, y, z, axis, resolution));
+        }
+    }
+}
+
+std::vector<VoxelKey> compact_surface_net_cube_candidates(
+    const std::vector<uint64_t>& bits,
+    uint32_t cube_resolution,
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end
+) {
+    std::vector<VoxelKey> candidates;
+    const uint64_t cube_count = static_cast<uint64_t>(cube_resolution) * static_cast<uint64_t>(cube_resolution) * static_cast<uint64_t>(cube_resolution);
+    candidates.reserve(static_cast<size_t>(std::min<uint64_t>(cube_count, 1024u)));
+    const uint64_t plane = static_cast<uint64_t>(cube_resolution) * static_cast<uint64_t>(cube_resolution);
+    for (size_t word_index = 0; word_index < bits.size(); ++word_index) {
+        if ((word_index & 4095u) == 0u) {
+            report_index_progress(config, progress_begin, progress_end, static_cast<uint64_t>(word_index), static_cast<uint64_t>(bits.size()), nullptr);
+        }
+        uint64_t word = bits[word_index];
+        while (word != 0u) {
+            const uint32_t bit = static_cast<uint32_t>(std::countr_zero(word));
+            const uint64_t index = static_cast<uint64_t>(word_index) * 64ull + bit;
+            if (index < cube_count) {
+                const uint32_t z = static_cast<uint32_t>(index / plane);
+                const uint64_t remainder = index - static_cast<uint64_t>(z) * plane;
+                const uint32_t y = static_cast<uint32_t>(remainder / cube_resolution);
+                const uint32_t x = static_cast<uint32_t>(remainder - static_cast<uint64_t>(y) * cube_resolution);
+                candidates.push_back({x, y, z});
+            }
+            word &= word - 1u;
+        }
+    }
+    report_progress(config, progress_end, nullptr);
+    return candidates;
+}
+
+std::vector<SurfaceNetEdgeKey> compact_surface_net_edge_candidates(
+    const std::vector<uint64_t>& bits,
+    uint32_t resolution,
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end
+) {
+    std::vector<SurfaceNetEdgeKey> candidates;
+    const uint64_t grid_count = static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution);
+    const uint64_t total_count = grid_count * 3ull;
+    candidates.reserve(static_cast<size_t>(std::min<uint64_t>(total_count, 1024u)));
+    const uint64_t plane = static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution);
+    for (size_t word_index = 0; word_index < bits.size(); ++word_index) {
+        if ((word_index & 4095u) == 0u) {
+            report_index_progress(config, progress_begin, progress_end, static_cast<uint64_t>(word_index), static_cast<uint64_t>(bits.size()), nullptr);
+        }
+        uint64_t word = bits[word_index];
+        while (word != 0u) {
+            const uint32_t bit = static_cast<uint32_t>(std::countr_zero(word));
+            const uint64_t index = static_cast<uint64_t>(word_index) * 64ull + bit;
+            if (index < total_count) {
+                const uint32_t axis = static_cast<uint32_t>(index / grid_count);
+                const uint64_t grid_index = index - static_cast<uint64_t>(axis) * grid_count;
+                const uint32_t z = static_cast<uint32_t>(grid_index / plane);
+                const uint64_t remainder = grid_index - static_cast<uint64_t>(z) * plane;
+                const uint32_t y = static_cast<uint32_t>(remainder / resolution);
+                const uint32_t x = static_cast<uint32_t>(remainder - static_cast<uint64_t>(y) * resolution);
+                candidates.push_back({x, y, z, axis});
+            }
+            word &= word - 1u;
+        }
+    }
+    report_progress(config, progress_end, nullptr);
+    return candidates;
 }
 
 Vec3 surface_net_sample_position(uint32_t x, uint32_t y, uint32_t z, float grid_radius, float voxel_size) {
@@ -2595,8 +2895,7 @@ std::vector<VoxelKey> coarsen_surface_net_keys(const std::vector<VoxelKey>& keys
         }
         result.push_back(key);
     }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
+    sort_and_unique_voxel_keys(result);
     return result;
 }
 
@@ -2674,8 +2973,7 @@ std::vector<VoxelKey> promoted_depth8_keys_for_dig(
         }
     }
 
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    sort_and_unique_voxel_keys(keys);
     return keys;
 }
 
@@ -2821,6 +3119,10 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
     const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
         ? normalize(config.lod_camera_position)
         : Vec3{0.0f, 0.0f, 1.0f};
+    if (config.voxel_edits.digs.empty() && fallback_depth >= MaxSvoDepth) {
+        const float startup_radius = kilometers_to_world_units(config.local_surface_net_patch_radius_km);
+        add_patch(camera_center, startup_radius, fallback_depth, true);
+    }
 
     std::vector<DigCandidate> dig_candidates;
     dig_candidates.reserve(config.voxel_edits.digs.size());
@@ -2870,46 +3172,6 @@ bool surface_net_key_in_patch(Vec3 center, float leaf_radius, const std::vector<
     return false;
 }
 
-void add_surface_net_edge_candidate(
-    std::vector<SurfaceNetEdgeKey>& edges,
-    const std::vector<uint64_t>& occupancy,
-    uint32_t resolution,
-    uint32_t x,
-    uint32_t y,
-    uint32_t z,
-    uint32_t axis,
-    bool negative_direction
-) {
-    if (axis == 0u) {
-        if (negative_direction) {
-            if (x == 0u) return;
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x - 1u, y, z, resolution));
-            if (!neighbor) edges.push_back({x - 1u, y, z, axis});
-        } else if (x + 1u < resolution) {
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x + 1u, y, z, resolution));
-            if (!neighbor) edges.push_back({x, y, z, axis});
-        }
-    } else if (axis == 1u) {
-        if (negative_direction) {
-            if (y == 0u) return;
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y - 1u, z, resolution));
-            if (!neighbor) edges.push_back({x, y - 1u, z, axis});
-        } else if (y + 1u < resolution) {
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y + 1u, z, resolution));
-            if (!neighbor) edges.push_back({x, y, z, axis});
-        }
-    } else {
-        if (negative_direction) {
-            if (z == 0u) return;
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y, z - 1u, resolution));
-            if (!neighbor) edges.push_back({x, y, z - 1u, axis});
-        } else if (z + 1u < resolution) {
-            const bool neighbor = surface_net_bit(occupancy, surface_net_grid_index(x, y, z + 1u, resolution));
-            if (!neighbor) edges.push_back({x, y, z, axis});
-        }
-    }
-}
-
 int32_t surface_net_cube_vertex(
     const std::vector<int32_t>& cube_vertices,
     uint32_t cube_resolution,
@@ -2928,7 +3190,7 @@ int32_t surface_net_sparse_cube_vertex(
     const std::vector<int32_t>& cube_vertices,
     VoxelKey key
 ) {
-    const auto found = std::lower_bound(cube_keys.begin(), cube_keys.end(), key);
+    const auto found = std::lower_bound(cube_keys.begin(), cube_keys.end(), key, voxel_key_morton_less);
     if (found == cube_keys.end() || !(*found == key)) {
         return -1;
     }
@@ -3002,62 +3264,128 @@ bool solve_surface_net_qef(
     return std::isfinite(result.x) && std::isfinite(result.y) && std::isfinite(result.z);
 }
 
-SurfaceNetPlacement surface_net_dual_contour_placement(
-    const std::array<bool, 8>& inside,
-    const std::array<Vec3, 8>& positions,
-    const std::array<std::array<uint32_t, 2>, 12>& edges,
+uint32_t surface_net_dense_corner_mask(
+    const std::vector<uint64_t>& occupancy,
+    uint32_t resolution,
+    uint32_t x,
+    uint32_t y,
+    uint32_t z
+) {
+    const uint64_t row = resolution;
+    const uint64_t slice = row * row;
+    const uint64_t base = (static_cast<uint64_t>(z) * row + y) * row + x;
+    return surface_net_bit_pair(occupancy, base) |
+           (surface_net_bit_pair(occupancy, base + row) << 2u) |
+           (surface_net_bit_pair(occupancy, base + slice) << 4u) |
+           (surface_net_bit_pair(occupancy, base + slice + row) << 6u);
+}
+
+uint32_t surface_net_sparse_corner_mask(const std::vector<VoxelKey>& occupied_keys, VoxelKey cube) {
+    uint32_t mask = 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x, cube.y, cube.z}) ? 1u << 0u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x + 1u, cube.y, cube.z}) ? 1u << 1u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x, cube.y + 1u, cube.z}) ? 1u << 2u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x + 1u, cube.y + 1u, cube.z}) ? 1u << 3u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x, cube.y, cube.z + 1u}) ? 1u << 4u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x + 1u, cube.y, cube.z + 1u}) ? 1u << 5u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x, cube.y + 1u, cube.z + 1u}) ? 1u << 6u : 0u;
+    mask |= contains_voxel_key(occupied_keys, {cube.x + 1u, cube.y + 1u, cube.z + 1u}) ? 1u << 7u : 0u;
+    return mask;
+}
+
+SurfaceNetPlacement surface_net_mask_placement(
+    uint32_t inside_mask,
+    Vec3 base,
+    float voxel_size,
     bool enable_dual_contouring
 ) {
+    static constexpr std::array<std::array<uint8_t, 2>, 12> edge_corners = {{
+        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
+        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
+        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
+    }};
+    static constexpr std::array<std::array<uint8_t, 3>, 8> corner_offsets = {{
+        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
+        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
+    }};
+
     Vec3 average = {};
     Vec3 normal_sum = {};
-    uint32_t crossing_count = 0;
-
+    uint32_t crossing_count = 0u;
     std::array<float, 6> ata = {};
     std::array<float, 3> atb = {};
-    for (const auto& edge : edges) {
+
+    for (const auto& edge : edge_corners) {
         const uint32_t a = edge[0];
         const uint32_t b = edge[1];
-        if (inside[a] == inside[b]) {
+        const bool inside_a = (inside_mask & (1u << a)) != 0u;
+        const bool inside_b = (inside_mask & (1u << b)) != 0u;
+        if (inside_a == inside_b) {
             continue;
         }
 
-        const Vec3 midpoint = (positions[a] + positions[b]) * 0.5f;
-        const Vec3 inside_position = inside[a] ? positions[a] : positions[b];
-        const Vec3 outside_position = inside[a] ? positions[b] : positions[a];
-        Vec3 normal = normalize(outside_position - inside_position);
+        const float ax = static_cast<float>(corner_offsets[a][0]);
+        const float ay = static_cast<float>(corner_offsets[a][1]);
+        const float az = static_cast<float>(corner_offsets[a][2]);
+        const float bx = static_cast<float>(corner_offsets[b][0]);
+        const float by = static_cast<float>(corner_offsets[b][1]);
+        const float bz = static_cast<float>(corner_offsets[b][2]);
+        const Vec3 midpoint = {
+            base.x + (ax + bx) * 0.5f * voxel_size,
+            base.y + (ay + by) * 0.5f * voxel_size,
+            base.z + (az + bz) * 0.5f * voxel_size,
+        };
 
-        // Binary occupancy has no true Hermite gradient. Bias the edge normal with
-        // the radial planet normal to keep smooth spherical regions from becoming
-        // axis-locked while still preserving sharp voxel/dig transitions.
-        if (length(midpoint) > 0.000001f) {
-            const Vec3 radial = normalize(midpoint);
-            if (dot(normal, radial) < 0.0f) {
-                normal = -normal;
+        float nx = (bx - ax) * (inside_a ? 1.0f : -1.0f);
+        float ny = (by - ay) * (inside_a ? 1.0f : -1.0f);
+        float nz = (bz - az) * (inside_a ? 1.0f : -1.0f);
+        const float midpoint_len_sq = midpoint.x * midpoint.x + midpoint.y * midpoint.y + midpoint.z * midpoint.z;
+        if (midpoint_len_sq > 0.000000000001f) {
+            const float inv_midpoint_len = fast_rsqrt_positive(midpoint_len_sq);
+            const float rx = midpoint.x * inv_midpoint_len;
+            const float ry = midpoint.y * inv_midpoint_len;
+            const float rz = midpoint.z * inv_midpoint_len;
+            if (nx * rx + ny * ry + nz * rz < 0.0f) {
+                nx = -nx;
+                ny = -ny;
+                nz = -nz;
             }
-            normal = normalize(normal * 0.75f + radial * 0.25f);
+            const Vec3 biased = {nx * 0.75f + rx * 0.25f, ny * 0.75f + ry * 0.25f, nz * 0.75f + rz * 0.25f};
+            const Vec3 normal = fast_normalize_vec3(biased);
+            nx = normal.x;
+            ny = normal.y;
+            nz = normal.z;
         }
 
-        average = average + midpoint;
-        normal_sum = normal_sum + normal;
+        average.x += midpoint.x;
+        average.y += midpoint.y;
+        average.z += midpoint.z;
+        normal_sum.x += nx;
+        normal_sum.y += ny;
+        normal_sum.z += nz;
         ++crossing_count;
 
-        const float plane_offset = dot(normal, midpoint);
-        ata[0] += normal.x * normal.x;
-        ata[1] += normal.x * normal.y;
-        ata[2] += normal.x * normal.z;
-        ata[3] += normal.y * normal.y;
-        ata[4] += normal.y * normal.z;
-        ata[5] += normal.z * normal.z;
-        atb[0] += normal.x * plane_offset;
-        atb[1] += normal.y * plane_offset;
-        atb[2] += normal.z * plane_offset;
+        const float plane_offset = nx * midpoint.x + ny * midpoint.y + nz * midpoint.z;
+        ata[0] += nx * nx;
+        ata[1] += nx * ny;
+        ata[2] += nx * nz;
+        ata[3] += ny * ny;
+        ata[4] += ny * nz;
+        ata[5] += nz * nz;
+        atb[0] += nx * plane_offset;
+        atb[1] += ny * plane_offset;
+        atb[2] += nz * plane_offset;
     }
 
     if (crossing_count == 0u) {
         return {};
     }
 
-    average = average / static_cast<float>(crossing_count);
+    const float inv_crossings = 1.0f / static_cast<float>(crossing_count);
+    average.x *= inv_crossings;
+    average.y *= inv_crossings;
+    average.z *= inv_crossings;
+
     Vec3 position = average;
     if (enable_dual_contouring) {
         constexpr float AnchorWeight = 0.05f;
@@ -3070,24 +3398,16 @@ SurfaceNetPlacement surface_net_dual_contour_placement(
 
         Vec3 solved = {};
         if (solve_surface_net_qef(ata, atb, solved)) {
-            Vec3 minimum = positions[0];
-            Vec3 maximum = positions[0];
-            for (const Vec3& p : positions) {
-                minimum.x = std::min(minimum.x, p.x);
-                minimum.y = std::min(minimum.y, p.y);
-                minimum.z = std::min(minimum.z, p.z);
-                maximum.x = std::max(maximum.x, p.x);
-                maximum.y = std::max(maximum.y, p.y);
-                maximum.z = std::max(maximum.z, p.z);
-            }
-            position = clamp_vec3(solved, minimum, maximum);
+            const Vec3 maximum = {base.x + voxel_size, base.y + voxel_size, base.z + voxel_size};
+            position = clamp_vec3(solved, base, maximum);
         }
     }
 
-    const Vec3 fallback_normal = length(average) > 0.000001f ? normalize(average) : Vec3{0.0f, 1.0f, 0.0f};
+    const Vec3 fallback_normal = fast_normalize_vec3(average);
+    const float normal_sum_len_sq = normal_sum.x * normal_sum.x + normal_sum.y * normal_sum.y + normal_sum.z * normal_sum.z;
     return {
         position,
-        length(normal_sum) > 0.000001f ? normalize(normal_sum) : fallback_normal,
+        normal_sum_len_sq > 0.000000000001f ? fast_normalize_vec3(normal_sum) : fallback_normal,
     };
 }
 
@@ -3096,7 +3416,9 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
     uint32_t source_depth,
     uint32_t target_depth,
     float grid_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end
 ) {
     SurfaceNetMesh surface_net;
     if (!config.enable_surface_net_generation || occupied_keys.empty()) {
@@ -3115,7 +3437,15 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
     cube_candidates.reserve(std::min<size_t>(occupied_keys.size() * 8u, static_cast<size_t>(max_vertices) * 2u));
     std::vector<SurfaceNetEdgeKey> edge_candidates;
     edge_candidates.reserve(occupied_keys.size() * 6u);
+    const double candidate_progress_end = progress_begin + (progress_end - progress_begin) * 0.30;
+    const double sort_progress_end = progress_begin + (progress_end - progress_begin) * 0.38;
+    const double vertex_progress_end = progress_begin + (progress_end - progress_begin) * 0.78;
+    const uint64_t occupied_total = occupied_keys.size();
+    uint64_t occupied_processed = 0;
+    report_progress(config, progress_begin, "Collecting surface-net candidates");
     for (VoxelKey key : occupied_keys) {
+        ++occupied_processed;
+        report_index_progress(config, progress_begin, candidate_progress_end, occupied_processed, occupied_total, nullptr);
         if (key.x >= resolution || key.y >= resolution || key.z >= resolution) {
             continue;
         }
@@ -3144,10 +3474,10 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
         if (key.z + 1u < resolution && !neighbor_occupied(key.x, key.y, key.z + 1u)) edge_candidates.push_back({key.x, key.y, key.z, 2u});
     }
 
-    std::sort(cube_candidates.begin(), cube_candidates.end());
-    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
-    std::sort(edge_candidates.begin(), edge_candidates.end());
-    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+    report_progress(config, candidate_progress_end, "Morton-sorting surface-net candidates");
+    sort_and_unique_voxel_keys(cube_candidates);
+    sort_and_unique_surface_net_edge_keys(edge_candidates);
+    report_progress(config, sort_progress_end, "Placing surface-net vertices");
 
     std::vector<int32_t> cube_vertices(cube_candidates.size(), -1);
     surface_net.source_depth = target_depth;
@@ -3160,41 +3490,24 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
     surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
     surface_net.normals.reserve(surface_net.vertices.capacity());
 
-    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
-        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
-        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
-    }};
-    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
-        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
-        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
-        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-    }};
-
+    const uint64_t cube_total = cube_candidates.size();
     for (size_t cube_index = 0; cube_index < cube_candidates.size(); ++cube_index) {
+        report_index_progress(config, sort_progress_end, vertex_progress_end, cube_index + 1u, cube_total, nullptr);
         if (surface_net.vertices.size() >= max_vertices) {
             break;
         }
         const VoxelKey cube = cube_candidates[cube_index];
 
-        std::array<bool, 8> inside = {};
-        std::array<Vec3, 8> positions = {};
-        uint32_t inside_count = 0;
-        for (uint32_t i = 0; i < corners.size(); ++i) {
-            const uint32_t x = cube.x + corners[i][0];
-            const uint32_t y = cube.y + corners[i][1];
-            const uint32_t z = cube.z + corners[i][2];
-            inside[i] = contains_voxel_key(occupied_keys, {x, y, z});
-            inside_count += inside[i] ? 1u : 0u;
-            positions[i] = surface_net_sample_position(x, y, z, grid_radius, voxel_size);
-        }
+        const uint32_t inside_mask = surface_net_sparse_corner_mask(occupied_keys, cube);
+        const uint32_t inside_count = std::popcount(inside_mask);
         if (inside_count == 0u || inside_count == 8u) {
             continue;
         }
 
-        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
-            inside,
-            positions,
-            edges,
+        const SurfaceNetPlacement placement = surface_net_mask_placement(
+            inside_mask,
+            surface_net_sample_position(cube.x, cube.y, cube.z, grid_radius, voxel_size),
+            voxel_size,
             config.enable_surface_net_dual_contouring
         );
         if (length(placement.normal) <= 0.000001f) {
@@ -3208,8 +3521,13 @@ SurfaceNetMesh build_sparse_surface_net_mesh_from_occupancy(
         cube_vertices[cube_index] = static_cast<int32_t>(vertex_index);
     }
 
+    report_progress(config, vertex_progress_end, "Connecting surface-net quads");
     surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    const uint64_t edge_total = edge_candidates.size();
+    uint64_t edge_processed = 0;
     for (SurfaceNetEdgeKey edge : edge_candidates) {
+        ++edge_processed;
+        report_index_progress(config, vertex_progress_end, progress_end, edge_processed, edge_total, nullptr);
         if (edge.axis == 0u) {
             if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
                 continue;
@@ -3254,7 +3572,9 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
     uint32_t source_depth,
     float grid_radius,
     const MarchingCubesConfig& config,
-    const std::vector<LocalSurfaceNetPatch>& suppression_patches = {}
+    const std::vector<LocalSurfaceNetPatch>& suppression_patches = {},
+    double progress_begin = 0.72,
+    double progress_end = 0.80
 ) {
     SurfaceNetMesh surface_net;
     if (!config.enable_surface_net_generation || sorted_occupied_keys.empty()) {
@@ -3268,7 +3588,9 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
             source_depth,
             target_depth,
             grid_radius,
-            config
+            config,
+            progress_begin,
+            progress_end
         );
     }
     const uint32_t resolution = 1u << target_depth;
@@ -3299,11 +3621,19 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
         }
     }
 
-    std::vector<VoxelKey> cube_candidates;
-    cube_candidates.reserve(occupied_keys.size() * 8u);
-    std::vector<SurfaceNetEdgeKey> edge_candidates;
-    edge_candidates.reserve(occupied_keys.size() * 6u);
+    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
+    std::vector<uint64_t> cube_candidate_bits((cube_count + 63u) / 64u, 0u);
+    const uint64_t edge_candidate_count = static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * 3ull;
+    std::vector<uint64_t> edge_candidate_bits(static_cast<size_t>((edge_candidate_count + 63ull) / 64ull), 0u);
+    const double candidate_progress_end = progress_begin + (progress_end - progress_begin) * 0.30;
+    const double sort_progress_end = progress_begin + (progress_end - progress_begin) * 0.38;
+    const double vertex_progress_end = progress_begin + (progress_end - progress_begin) * 0.78;
+    const uint64_t occupied_total = occupied_keys.size();
+    uint64_t occupied_processed = 0;
+    report_progress(config, progress_begin, "Collecting surface-net candidates");
     for (VoxelKey key : occupied_keys) {
+        ++occupied_processed;
+        report_index_progress(config, progress_begin, candidate_progress_end, occupied_processed, occupied_total, nullptr);
         if (key.x >= resolution || key.y >= resolution || key.z >= resolution) {
             continue;
         }
@@ -3316,27 +3646,37 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
                     const uint32_t cube_x = key.x - dx;
                     const uint32_t cube_y = key.y - dy;
                     const uint32_t cube_z = key.z - dz;
-                    if (cube_x < cube_resolution && cube_y < cube_resolution && cube_z < cube_resolution) {
-                        cube_candidates.push_back({cube_x, cube_y, cube_z});
-                    }
+                    set_surface_net_cube_candidate(cube_candidate_bits, cube_resolution, cube_x, cube_y, cube_z);
                 }
             }
         }
 
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, true);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, true);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 0u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 0u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 1u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 1u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 2u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 2u, true);
     }
 
-    std::sort(cube_candidates.begin(), cube_candidates.end());
-    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
-    std::sort(edge_candidates.begin(), edge_candidates.end());
-    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+    report_progress(config, candidate_progress_end, "Compacting surface-net candidates");
+    const double cube_compact_progress_end = candidate_progress_end + (sort_progress_end - candidate_progress_end) * 0.40;
+    std::vector<VoxelKey> cube_candidates = compact_surface_net_cube_candidates(
+        cube_candidate_bits,
+        cube_resolution,
+        config,
+        candidate_progress_end,
+        cube_compact_progress_end
+    );
+    std::vector<SurfaceNetEdgeKey> edge_candidates = compact_surface_net_edge_candidates(
+        edge_candidate_bits,
+        resolution,
+        config,
+        cube_compact_progress_end,
+        sort_progress_end
+    );
+    report_progress(config, sort_progress_end, "Placing surface-net vertices");
 
-    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
     std::vector<int32_t> cube_vertices(cube_count, -1);
     surface_net.source_depth = target_depth;
     surface_net.bounds_radius = grid_radius;
@@ -3348,40 +3688,25 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
     surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
     surface_net.normals.reserve(surface_net.vertices.capacity());
 
-    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
-        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
-        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
-    }};
-    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
-        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
-        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
-        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-    }};
-
+    const uint64_t cube_total = cube_candidates.size();
+    uint64_t cube_processed = 0;
     for (VoxelKey cube : cube_candidates) {
+        ++cube_processed;
+        report_index_progress(config, sort_progress_end, vertex_progress_end, cube_processed, cube_total, nullptr);
         if (surface_net.vertices.size() >= max_vertices) {
             break;
         }
 
-        std::array<bool, 8> inside = {};
-        std::array<Vec3, 8> positions = {};
-        uint32_t inside_count = 0;
-        for (uint32_t i = 0; i < corners.size(); ++i) {
-            const uint32_t x = cube.x + corners[i][0];
-            const uint32_t y = cube.y + corners[i][1];
-            const uint32_t z = cube.z + corners[i][2];
-            inside[i] = surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
-            inside_count += inside[i] ? 1u : 0u;
-            positions[i] = surface_net_sample_position(x, y, z, grid_radius, voxel_size);
-        }
+        const uint32_t inside_mask = surface_net_dense_corner_mask(occupancy, resolution, cube.x, cube.y, cube.z);
+        const uint32_t inside_count = std::popcount(inside_mask);
         if (inside_count == 0u || inside_count == 8u) {
             continue;
         }
 
-        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
-            inside,
-            positions,
-            edges,
+        const SurfaceNetPlacement placement = surface_net_mask_placement(
+            inside_mask,
+            surface_net_sample_position(cube.x, cube.y, cube.z, grid_radius, voxel_size),
+            voxel_size,
             config.enable_surface_net_dual_contouring
         );
         if (length(placement.normal) <= 0.000001f) {
@@ -3395,8 +3720,13 @@ SurfaceNetMesh build_surface_net_mesh_from_occupancy(
         cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
     }
 
+    report_progress(config, vertex_progress_end, "Connecting surface-net quads");
     surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    const uint64_t edge_total = edge_candidates.size();
+    uint64_t edge_processed = 0;
     for (SurfaceNetEdgeKey edge : edge_candidates) {
+        ++edge_processed;
+        report_index_progress(config, vertex_progress_end, progress_end, edge_processed, edge_total, nullptr);
         if (edge.axis == 0u) {
             if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
                 continue;
@@ -4255,7 +4585,9 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
     const QuantizedMesh& mesh,
     const LocalSurfaceNetPatch& patch,
     float grid_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end
 ) {
     SurfaceNetMesh surface_net;
     if (!config.enable_surface_net_generation ||
@@ -4378,10 +4710,17 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         return static_cast<size_t>(y) * static_cast<size_t>(u_segments + 1u) + static_cast<size_t>(x);
     };
 
+    const double vertex_progress_end = progress_begin + (progress_end - progress_begin) * 0.70;
+    const double quad_progress_end = progress_begin + (progress_end - progress_begin) * 0.88;
+    const uint64_t vertex_total = static_cast<uint64_t>(u_segments + 1u) * static_cast<uint64_t>(v_segments + 1u);
+    uint64_t vertex_processed = 0;
+    report_progress(config, progress_begin, "Placing local surface vertices");
     for (uint32_t y = 0; y <= v_segments; ++y) {
         const float ty = static_cast<float>(y) / static_cast<float>(v_segments);
         const float v = min_v + (max_v - min_v) * ty;
         for (uint32_t x = 0; x <= u_segments; ++x) {
+            ++vertex_processed;
+            report_index_progress(config, progress_begin, vertex_progress_end, vertex_processed, vertex_total, nullptr);
             if (surface_net.vertices.size() >= max_vertices) {
                 break;
             }
@@ -4400,8 +4739,13 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         }
     }
 
+    report_progress(config, vertex_progress_end, "Connecting local surface quads");
+    const uint64_t quad_total = static_cast<uint64_t>(u_segments) * static_cast<uint64_t>(v_segments);
+    uint64_t quad_processed = 0;
     for (uint32_t y = 0; y < v_segments; ++y) {
         for (uint32_t x = 0; x < u_segments; ++x) {
+            ++quad_processed;
+            report_index_progress(config, vertex_progress_end, quad_progress_end, quad_processed, quad_total, nullptr);
             const int32_t a = grid_vertices[grid_index(x, y)];
             const int32_t b = grid_vertices[grid_index(x + 1u, y)];
             const int32_t c = grid_vertices[grid_index(x + 1u, y + 1u)];
@@ -4433,8 +4777,15 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         append_surface_net_triangle(surface_net, top_a, bottom_b, top_b, preferred_normal, max_vertices, depth);
     };
 
+    report_progress(config, quad_progress_end, "Building local surface walls");
+    const uint64_t wall_total =
+        static_cast<uint64_t>(v_segments + 1u) * static_cast<uint64_t>(u_segments) +
+        static_cast<uint64_t>(u_segments + 1u) * static_cast<uint64_t>(v_segments);
+    uint64_t wall_processed = 0;
     for (uint32_t y = 0; y <= v_segments; ++y) {
         for (uint32_t x = 0; x < u_segments; ++x) {
+            ++wall_processed;
+            report_index_progress(config, quad_progress_end, progress_end, wall_processed, wall_total, nullptr);
             const bool below = y > 0u && cell_has_surface(x, y - 1u);
             const bool above = y < v_segments && cell_has_surface(x, y);
             if (below == above) {
@@ -4445,6 +4796,8 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
     }
     for (uint32_t y = 0; y < v_segments; ++y) {
         for (uint32_t x = 0; x <= u_segments; ++x) {
+            ++wall_processed;
+            report_index_progress(config, quad_progress_end, progress_end, wall_processed, wall_total, nullptr);
             const bool left = x > 0u && cell_has_surface(x - 1u, y);
             const bool right = x < u_segments && cell_has_surface(x, y);
             if (left == right) {
@@ -4463,7 +4816,9 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
     const QuantizedMesh& mesh,
     const LocalSurfaceNetPatch& patch,
     float grid_radius,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    double progress_begin,
+    double progress_end
 ) {
     SurfaceNetMesh surface_net;
     if (!config.enable_surface_net_generation) {
@@ -4471,7 +4826,7 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
     }
 
     if (!config.enable_fractures && !patch.promoted_depth8_keys.empty()) {
-        return build_fast_local_radial_surface_patch_mesh(mesh, patch, grid_radius, config);
+        return build_fast_local_radial_surface_patch_mesh(mesh, patch, grid_radius, config, progress_begin, progress_end);
     }
 
     const LocalSurfaceNetGrid grid = local_surface_net_grid_for_patch(patch, grid_radius);
@@ -4502,8 +4857,7 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
         add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs);
     }
 
-    std::sort(occupied_keys.begin(), occupied_keys.end());
-    occupied_keys.erase(std::unique(occupied_keys.begin(), occupied_keys.end()), occupied_keys.end());
+    sort_and_unique_voxel_keys(occupied_keys);
     if (occupied_keys.empty()) {
         return surface_net;
     }
@@ -4516,12 +4870,19 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
     }
 
     const uint32_t cube_resolution = resolution - 1u;
-
-    std::vector<VoxelKey> cube_candidates;
-    cube_candidates.reserve(occupied_keys.size() * 8u);
-    std::vector<SurfaceNetEdgeKey> edge_candidates;
-    edge_candidates.reserve(occupied_keys.size() * 6u);
+    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
+    std::vector<uint64_t> cube_candidate_bits((cube_count + 63u) / 64u, 0u);
+    const uint64_t edge_candidate_count = static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * 3ull;
+    std::vector<uint64_t> edge_candidate_bits(static_cast<size_t>((edge_candidate_count + 63ull) / 64ull), 0u);
+    const double candidate_progress_end = progress_begin + (progress_end - progress_begin) * 0.30;
+    const double sort_progress_end = progress_begin + (progress_end - progress_begin) * 0.38;
+    const double vertex_progress_end = progress_begin + (progress_end - progress_begin) * 0.78;
+    const uint64_t occupied_total = occupied_keys.size();
+    uint64_t occupied_processed = 0;
+    report_progress(config, progress_begin, "Collecting local surface candidates");
     for (VoxelKey key : occupied_keys) {
+        ++occupied_processed;
+        report_index_progress(config, progress_begin, candidate_progress_end, occupied_processed, occupied_total, nullptr);
         for (uint32_t dz = 0; dz < 2; ++dz) {
             for (uint32_t dy = 0; dy < 2; ++dy) {
                 for (uint32_t dx = 0; dx < 2; ++dx) {
@@ -4531,28 +4892,38 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
                     const uint32_t cube_x = key.x - dx;
                     const uint32_t cube_y = key.y - dy;
                     const uint32_t cube_z = key.z - dz;
-                    if (cube_x < cube_resolution && cube_y < cube_resolution && cube_z < cube_resolution) {
-                        cube_candidates.push_back({cube_x, cube_y, cube_z});
-                    }
+                    set_surface_net_cube_candidate(cube_candidate_bits, cube_resolution, cube_x, cube_y, cube_z);
                 }
             }
         }
 
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 0u, true);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 1u, true);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, false);
-        add_surface_net_edge_candidate(edge_candidates, occupancy, resolution, key.x, key.y, key.z, 2u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 0u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 0u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 1u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 1u, true);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 2u, false);
+        set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, key.x, key.y, key.z, 2u, true);
     }
 
-    std::sort(cube_candidates.begin(), cube_candidates.end());
-    cube_candidates.erase(std::unique(cube_candidates.begin(), cube_candidates.end()), cube_candidates.end());
-    std::sort(edge_candidates.begin(), edge_candidates.end());
-    edge_candidates.erase(std::unique(edge_candidates.begin(), edge_candidates.end()), edge_candidates.end());
+    report_progress(config, candidate_progress_end, "Compacting local surface candidates");
+    const double cube_compact_progress_end = candidate_progress_end + (sort_progress_end - candidate_progress_end) * 0.40;
+    std::vector<VoxelKey> cube_candidates = compact_surface_net_cube_candidates(
+        cube_candidate_bits,
+        cube_resolution,
+        config,
+        candidate_progress_end,
+        cube_compact_progress_end
+    );
+    std::vector<SurfaceNetEdgeKey> edge_candidates = compact_surface_net_edge_candidates(
+        edge_candidate_bits,
+        resolution,
+        config,
+        cube_compact_progress_end,
+        sort_progress_end
+    );
+    report_progress(config, sort_progress_end, "Placing local surface vertices");
 
     const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
-    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
     std::vector<int32_t> cube_vertices(cube_count, -1);
     surface_net.source_depth = depth;
     surface_net.bounds_radius = grid_radius;
@@ -4562,40 +4933,25 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
     surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
     surface_net.normals.reserve(surface_net.vertices.capacity());
 
-    constexpr std::array<std::array<uint32_t, 3>, 8> corners = {{
-        {{0, 0, 0}}, {{1, 0, 0}}, {{0, 1, 0}}, {{1, 1, 0}},
-        {{0, 0, 1}}, {{1, 0, 1}}, {{0, 1, 1}}, {{1, 1, 1}},
-    }};
-    constexpr std::array<std::array<uint32_t, 2>, 12> edges = {{
-        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
-        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
-        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-    }};
-
+    const uint64_t cube_total = cube_candidates.size();
+    uint64_t cube_processed = 0;
     for (VoxelKey cube : cube_candidates) {
+        ++cube_processed;
+        report_index_progress(config, sort_progress_end, vertex_progress_end, cube_processed, cube_total, nullptr);
         if (surface_net.vertices.size() >= max_vertices) {
             break;
         }
 
-        std::array<bool, 8> inside = {};
-        std::array<Vec3, 8> positions = {};
-        uint32_t inside_count = 0;
-        for (uint32_t i = 0; i < corners.size(); ++i) {
-            const uint32_t x = cube.x + corners[i][0];
-            const uint32_t y = cube.y + corners[i][1];
-            const uint32_t z = cube.z + corners[i][2];
-            inside[i] = surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
-            inside_count += inside[i] ? 1u : 0u;
-            positions[i] = local_surface_net_sample_position(x, y, z, origin, voxel_size);
-        }
+        const uint32_t inside_mask = surface_net_dense_corner_mask(occupancy, resolution, cube.x, cube.y, cube.z);
+        const uint32_t inside_count = std::popcount(inside_mask);
         if (inside_count == 0u || inside_count == 8u) {
             continue;
         }
 
-        const SurfaceNetPlacement placement = surface_net_dual_contour_placement(
-            inside,
-            positions,
-            edges,
+        const SurfaceNetPlacement placement = surface_net_mask_placement(
+            inside_mask,
+            local_surface_net_sample_position(cube.x, cube.y, cube.z, origin, voxel_size),
+            voxel_size,
             config.enable_surface_net_dual_contouring
         );
         if (length(placement.normal) <= 0.000001f) {
@@ -4617,8 +4973,13 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
         cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
     }
 
+    report_progress(config, vertex_progress_end, "Connecting local surface quads");
     surface_net.triangle_indices.reserve(edge_candidates.size() * 6u);
+    const uint64_t edge_total = edge_candidates.size();
+    uint64_t edge_processed = 0;
     for (SurfaceNetEdgeKey edge : edge_candidates) {
+        ++edge_processed;
+        report_index_progress(config, vertex_progress_end, progress_end, edge_processed, edge_total, nullptr);
         if (edge.axis == 0u) {
             if (edge.x >= cube_resolution || edge.y == 0u || edge.y >= cube_resolution || edge.z == 0u || edge.z >= cube_resolution) {
                 continue;
@@ -4670,14 +5031,19 @@ void append_local_surface_net_patches(
     }
 
     surface_net.local_patch_depth = patches.front().depth;
+    uint64_t patch_index = 0;
+    const uint64_t patch_total = patches.size();
     for (const LocalSurfaceNetPatch& patch : patches) {
+        const double patch_begin = 0.86 + (0.90 - 0.86) * (static_cast<double>(patch_index) / static_cast<double>(patch_total));
+        const double patch_end = 0.86 + (0.90 - 0.86) * (static_cast<double>(patch_index + 1u) / static_cast<double>(patch_total));
+        ++patch_index;
         std::vector<LocalSurfaceNetPatch> root_patches;
         root_patches.push_back(patch);
 
         for (const LocalSurfaceNetPatch& root_patch : root_patches) {
             const uint32_t vertex_count_before = static_cast<uint32_t>(surface_net.vertices.size());
             const uint32_t triangle_count_before = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
-            SurfaceNetMesh patch_mesh = build_local_surface_net_patch_mesh(mesh, root_patch, grid_radius, config);
+            SurfaceNetMesh patch_mesh = build_local_surface_net_patch_mesh(mesh, root_patch, grid_radius, config, patch_begin, patch_end);
             if (!patch_mesh.vertices.empty() && !patch_mesh.triangle_indices.empty()) {
                 const uint32_t patch_depth = std::clamp(root_patch.depth, 1u, MaxSvoDepth);
                 const float depth_voxel_size = (grid_radius * 2.0f) / static_cast<float>(1u << patch_depth);
@@ -4806,15 +5172,45 @@ std::vector<VoxelKey> build_base_voxel_occupancy(
     const QuantizedMesh& mesh,
     float grid_radius,
     float voxel_size,
-    uint32_t resolution
+    uint32_t resolution,
+    const MarchingCubesConfig& config
 ) {
     std::vector<VoxelKey> keys;
     const uint32_t triangle_count = static_cast<uint32_t>((mesh.triangle_indices.size() + mesh.stitch_triangle_indices.size()) / 3u);
     keys.reserve(static_cast<size_t>(triangle_count) * 16u);
-    add_voxelized_triangles(keys, mesh, mesh.triangle_indices, grid_radius, voxel_size, resolution);
-    add_voxelized_triangles(keys, mesh, mesh.stitch_triangle_indices, grid_radius, voxel_size, resolution);
-    std::sort(keys.begin(), keys.end());
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    const uint64_t total_sample_vertices =
+        voxelized_triangle_sample_count(mesh, mesh.triangle_indices, voxel_size) +
+        voxelized_triangle_sample_count(mesh, mesh.stitch_triangle_indices, voxel_size);
+    uint64_t processed_sample_vertices = 0;
+    report_progress(config, 0.56f, "Voxelizing terrain vertices");
+    add_voxelized_triangles(
+        keys,
+        mesh,
+        mesh.triangle_indices,
+        grid_radius,
+        voxel_size,
+        resolution,
+        config,
+        0.56f,
+        0.64f,
+        processed_sample_vertices,
+        total_sample_vertices
+    );
+    add_voxelized_triangles(
+        keys,
+        mesh,
+        mesh.stitch_triangle_indices,
+        grid_radius,
+        voxel_size,
+        resolution,
+        config,
+        0.56f,
+        0.64f,
+        processed_sample_vertices,
+        total_sample_vertices
+    );
+    report_progress(config, 0.645f, "Sorting voxel occupancy");
+    sort_and_unique_voxel_keys(keys);
     return keys;
 }
 
@@ -4832,9 +5228,11 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     mesh.svo = {};
     mesh.surface_net = {};
     if (!config.enable_svo_generation || mesh.vertices.empty()) {
+        report_progress(config, 0.96f, "Voxel generation disabled");
         return;
     }
 
+    report_progress(config, 0.52f, "Preparing voxel grid");
     const uint32_t depth = std::clamp(config.svo_depth, 1u, MaxSvoDepth);
     const uint32_t resolution = 1u << depth;
     float grid_radius = mesh.voxel_occupancy_cache.depth == depth && mesh.voxel_occupancy_cache.bounds_radius > 0.0f
@@ -4845,13 +5243,15 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     if (mesh.voxel_occupancy_cache.depth != depth ||
         mesh.voxel_occupancy_cache.bounds_radius <= 0.0f ||
         mesh.voxel_occupancy_cache.leaf_keys.empty()) {
-        mesh.voxel_occupancy_cache.leaf_keys = build_base_voxel_occupancy(mesh, grid_radius, voxel_size, resolution);
+        report_progress(config, 0.56f, depth >= MaxSvoDepth ? "Voxelizing depth-16 terrain triangles" : "Voxelizing depth-8 global backbone");
+        mesh.voxel_occupancy_cache.leaf_keys = build_base_voxel_occupancy(mesh, grid_radius, voxel_size, resolution, config);
         mesh.voxel_occupancy_cache.bounds_radius = grid_radius;
         mesh.voxel_occupancy_cache.depth = depth;
     } else {
         grid_radius = mesh.voxel_occupancy_cache.bounds_radius;
     }
 
+    report_progress(config, 0.66f, "Preparing surface-net patches");
     const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = realized_local_surface_net_patches(
         build_local_surface_net_patches(config, grid_radius),
         grid_radius
@@ -4868,16 +5268,22 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
         std::fabs(mesh.surface_net_base_cache.bounds_radius - grid_radius) > 0.000001f ||
         mesh.surface_net_base_cache.material_id != config.surface_net_material_id ||
         mesh.surface_net_base_cache.vertices.empty()) {
+        report_progress(config, 0.72f, "Building base surface net");
         MarchingCubesConfig base_surface_config = config;
         base_surface_config.voxel_edits.digs.clear();
+        const double base_surface_progress_end = has_promoted_depth8_roots ? 0.79 : 0.86;
         mesh.surface_net_base_cache = build_surface_net_mesh_from_occupancy(
             mesh.voxel_occupancy_cache.leaf_keys,
             depth,
             grid_radius,
-            base_surface_config
+            base_surface_config,
+            {},
+            0.72,
+            base_surface_progress_end
         );
     }
     if (has_promoted_depth8_roots) {
+        report_progress(config, 0.80f, "Replacing edited surface roots");
         MarchingCubesConfig promoted_surface_config = config;
         promoted_surface_config.voxel_edits.digs.clear();
         mesh.surface_net = build_surface_net_mesh_from_occupancy(
@@ -4885,7 +5291,9 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
             depth,
             grid_radius,
             promoted_surface_config,
-            local_surface_net_patches
+            local_surface_net_patches,
+            0.80,
+            0.85
         );
     } else {
         mesh.surface_net = mesh.surface_net_base_cache;
@@ -4893,9 +5301,11 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     mesh.surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
     mesh.surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
     if (has_promoted_depth8_roots) {
+        report_progress(config, 0.86f, "Building local depth-16 patches");
         append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
     }
 
+    report_progress(config, 0.91f, "Applying voxel edits");
     std::vector<VoxelKey> keys = mesh.voxel_occupancy_cache.leaf_keys;
     const uint32_t dig_removed_leaf_count = apply_exact_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
 
@@ -4909,10 +5319,12 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     mesh.svo.dig_removed_leaf_count = dig_removed_leaf_count;
     mesh.svo.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
     if (!keys.empty()) {
+        report_progress(config, 0.94f, "Building sparse voxel octree");
         mesh.svo.nodes.resize(1);
         build_svo_node_at(mesh.svo.nodes, 0, keys, 0, static_cast<uint32_t>(keys.size()), 0, 0, 0, 0, resolution, depth);
         count_svo_debug_boxes_recursive(mesh.svo, 0, mesh.svo.debug_draw_depth, mesh.svo.debug_max_boxes, mesh.svo.debug_box_count);
     }
+    report_progress(config, 0.97f, "Voxel data ready");
 }
 
 } // namespace
@@ -4923,6 +5335,7 @@ QuantizedMesh build_quantized_marching_cubes(
     const MarchingCubesConfig& config
 ) {
     QuantizedMesh mesh;
+    report_progress(config, 0.02f, "Building Goldberg cell mesh");
     mesh.cell_count = static_cast<uint32_t>(topology.cells.size());
     BoundaryEdgeMap boundary_edges;
     boundary_edges.reserve(topology.cells.size() * 4096u);
@@ -4954,12 +5367,20 @@ QuantizedMesh build_quantized_marching_cubes(
             fracture_seed_scratch,
             fracture_shard_scratch
         );
+        if ((cell_id % 8u) == 0u || cell_id + 1u == topology.cells.size()) {
+            const float cell_progress = topology.cells.empty()
+                ? 0.42f
+                : static_cast<float>(cell_id + 1u) / static_cast<float>(topology.cells.size());
+            report_progress(config, 0.04f + cell_progress * 0.38f, "Building Goldberg cell mesh");
+        }
     }
 
     if (topology.cells.empty()) {
         mesh.min_cell_subdivisions = 0;
     }
+    report_progress(config, 0.44f, "Sorting boundary edges");
     sort_and_merge_boundary_edges(boundary_edges);
+    report_progress(config, 0.48f, "Stitching LOD boundaries");
     build_transition_stitches(mesh, topology, points, boundary_edges, config, fracture_cache);
     generate_sparse_voxel_octree(mesh, config);
 

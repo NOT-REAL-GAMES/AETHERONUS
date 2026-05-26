@@ -47,6 +47,7 @@ public:
     void update_mesh(const QuantizedMesh& mesh);
     void resize(int width, int height);
     void render(const CameraView& view, const SpaceshipState& ship, const DebugRenderOptions& options, bool show_fps, float fps);
+    void render_progress_overlay(double progress);
     void shutdown();
 
 private:

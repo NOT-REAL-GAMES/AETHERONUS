@@ -9,11 +9,16 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <future>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -182,6 +187,31 @@ struct MeshBuildResult {
     MeshBuildMode mode = MeshBuildMode::Full;
 };
 
+struct BuildProgressState {
+    static constexpr double UnitsPerDone = 1000000000.0;
+    std::atomic<uint64_t> units = 0;
+    mutable std::mutex label_mutex;
+    std::string label = "Queued";
+
+    void set(double progress, const char* next_label) {
+        const double clamped = std::clamp(progress, 0.0, 1.0);
+        units.store(static_cast<uint64_t>(std::round(clamped * UnitsPerDone)), std::memory_order_relaxed);
+        if (next_label != nullptr) {
+            std::lock_guard lock(label_mutex);
+            label = next_label;
+        }
+    }
+
+    double progress() const {
+        return static_cast<double>(units.load(std::memory_order_relaxed)) / UnitsPerDone;
+    }
+
+    std::string label_copy() const {
+        std::lock_guard lock(label_mutex);
+        return label;
+    }
+};
+
 ae::QuantizedMesh make_voxel_rebuild_source(const ae::QuantizedMesh& mesh) {
     ae::QuantizedMesh result;
     result.vertices = mesh.vertices;
@@ -217,30 +247,56 @@ MeshBuildResult build_lod_mesh_async(
     const ae::GoldbergTopology& topology,
     const ae::PointCloud& points,
     ae::MarchingCubesConfig config,
-    uint32_t revision
+    uint32_t revision,
+    std::shared_ptr<BuildProgressState> progress
 ) {
     MeshBuildResult result;
     result.camera_position = config.lod_camera_position;
     result.lod_focus = ae::normalize(config.lod_camera_position);
     result.revision = revision;
     result.mode = MeshBuildMode::Full;
+    if (progress) {
+        progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail build" : "Starting mesh build");
+        config.progress_callback = [progress](double value, const char* label) {
+            progress->set(value, label);
+        };
+    }
     result.mesh = ae::build_quantized_marching_cubes(topology, points, config);
+    if (progress) {
+        progress->set(0.985f, "Validating mesh");
+    }
     result.validation = ae::validate_quantized_mesh(result.mesh);
+    if (progress) {
+        progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Mesh ready" : "Mesh validation failed");
+    }
     return result;
 }
 
 MeshBuildResult build_voxel_mesh_async(
     ae::QuantizedMesh mesh,
     ae::MarchingCubesConfig config,
-    uint32_t revision
+    uint32_t revision,
+    std::shared_ptr<BuildProgressState> progress
 ) {
     MeshBuildResult result;
     result.camera_position = config.lod_camera_position;
     result.lod_focus = ae::normalize(config.lod_camera_position);
     result.revision = revision;
     result.mode = MeshBuildMode::VoxelsOnly;
+    if (progress) {
+        progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail rebuild" : "Starting voxel rebuild");
+        config.progress_callback = [progress](double value, const char* label) {
+            progress->set(value, label);
+        };
+    }
     result.mesh = ae::rebuild_quantized_mesh_voxels(std::move(mesh), config);
+    if (progress) {
+        progress->set(0.985f, "Validating voxel rebuild");
+    }
     result.validation = ae::validate_quantized_mesh(result.mesh);
+    if (progress) {
+        progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Voxel rebuild ready" : "Voxel validation failed");
+    }
     return result;
 }
 
@@ -328,16 +384,21 @@ int main() {
     mesh_config.fracture_chunk_outward_min = 0.08f;
     mesh_config.fracture_chunk_outward_max = 0.72f;
     mesh_config.svo_depth = DefaultSvoDepth;
+    mesh_config.surface_net_depth = DefaultSvoDepth;
+    mesh_config.local_surface_net_depth = HighSvoDepth;
     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
     ae::VoxelEditSet voxel_edits;
     mesh_config.voxel_edits = voxel_edits;
-    const ae::QuantizedMesh mesh = ae::build_quantized_marching_cubes(topology, points, mesh_config);
+    ae::MarchingCubesConfig preview_config = mesh_config;
+    preview_config.enable_svo_generation = false;
+    preview_config.enable_surface_net_generation = false;
+    const ae::QuantizedMesh mesh = ae::build_quantized_marching_cubes(topology, points, preview_config);
     const ae::TopologyValidation validation = ae::validate_topology(topology, static_cast<uint32_t>(points.size()));
     const ae::PointCloudValidation point_validation = ae::validate_point_cloud(topology, points);
     const ae::QuantizedMeshValidation mesh_validation = ae::validate_quantized_mesh(mesh);
     std::cout << validation.message << std::endl;
     std::cout << point_validation.message << std::endl;
-    std::cout << mesh_validation.message << std::endl;
+    std::cout << "Startup preview: " << mesh_validation.message << std::endl;
     if (!validation.ok || !point_validation.ok || !mesh_validation.ok) {
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
@@ -363,6 +424,7 @@ int main() {
     MeshBuildMode requested_mesh_build_mode = MeshBuildMode::Full;
     bool mesh_build_pending = false;
     bool mesh_rebuild_requested = false;
+    auto build_progress = std::make_shared<BuildProgressState>();
     bool show_fps = false;
     ae::DebugRenderOptions render_options;
     ae::SpaceshipState spaceship;
@@ -371,6 +433,7 @@ int main() {
     uint32_t frames_since_fps_update = 0;
     uint64_t fps_update_start = SDL_GetTicksNS();
     uint64_t last_update_time = fps_update_start;
+    bool window_title_shows_progress = false;
     constexpr float LodRebuildDistance = 0.12f;
     constexpr std::chrono::milliseconds NoWait{0};
     auto request_full_mesh_rebuild = [&]() {
@@ -389,6 +452,18 @@ int main() {
         }
         mesh_rebuild_requested = true;
     };
+
+    build_progress->set(0.0f, "Queued startup depth-16 detail build");
+    pending_mesh_build = std::async(
+        std::launch::async,
+        build_lod_mesh_async,
+        std::cref(topology),
+        std::cref(points),
+        mesh_config,
+        mesh_revision,
+        build_progress
+    );
+    mesh_build_pending = true;
 
     bool running = true;
     while (running) {
@@ -426,11 +501,13 @@ int main() {
                     render_options.show_surface_net = !render_options.show_surface_net;
                     std::cout << "Surface nets " << (render_options.show_surface_net ? "shown" : "hidden") << std::endl;
                 } else if (event.key.key == SDLK_F11) {
-                    mesh_config.svo_depth = mesh_config.svo_depth >= HighSvoDepth ? DefaultSvoDepth : HighSvoDepth;
+                    mesh_config.svo_depth = DefaultSvoDepth;
+                    mesh_config.surface_net_depth = DefaultSvoDepth;
+                    mesh_config.local_surface_net_depth = mesh_config.local_surface_net_depth >= HighSvoDepth ? DefaultSvoDepth : HighSvoDepth;
                     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
                     request_voxel_mesh_rebuild();
-                    std::cout << "SVO depth " << mesh_config.svo_depth
-                              << " rebuild requested (debug draw depth " << mesh_config.svo_debug_draw_depth
+                    std::cout << "Local surface detail depth " << mesh_config.local_surface_net_depth
+                              << " rebuild requested (global SVO depth " << mesh_config.svo_depth
                               << ")" << std::endl;
                 } else if (event.key.key == SDLK_F9) {
                     render_options.follow_ship = !render_options.follow_ship;
@@ -560,7 +637,13 @@ int main() {
         if (mesh_build_pending && pending_mesh_build.wait_for(NoWait) == std::future_status::ready) {
             MeshBuildResult result = pending_mesh_build.get();
             mesh_build_pending = false;
-            if (result.validation.ok) {
+            if (result.revision < requested_mesh_revision) {
+                std::cout << "Discarded stale mesh build revision " << result.revision
+                          << " (latest requested " << requested_mesh_revision << ")" << std::endl;
+                if (!mesh_rebuild_requested) {
+                    build_progress->set(0.0f, "Idle");
+                }
+            } else if (result.validation.ok) {
                 current_mesh = result.mesh;
                 renderer.update_mesh(result.mesh);
                 last_mesh_lod_focus = result.lod_focus;
@@ -569,6 +652,7 @@ int main() {
             } else {
                 std::cerr << result.validation.message << std::endl;
                 last_mesh_lod_focus = result.lod_focus;
+                build_progress->set(0.0f, "Build failed");
             }
         }
 
@@ -581,21 +665,25 @@ int main() {
             requested_mesh_build_mode = MeshBuildMode::Full;
             if (async_mode == MeshBuildMode::VoxelsOnly) {
                 ae::QuantizedMesh voxel_base_mesh = make_voxel_rebuild_source(current_mesh);
+                build_progress->set(0.0f, async_config.local_surface_net_depth >= HighSvoDepth ? "Queued depth-16 detail rebuild" : "Queued voxel rebuild");
                 pending_mesh_build = std::async(
                     std::launch::async,
                     build_voxel_mesh_async,
                     std::move(voxel_base_mesh),
                     async_config,
-                    async_revision
+                    async_revision,
+                    build_progress
                 );
             } else {
+                build_progress->set(0.0f, async_config.local_surface_net_depth >= HighSvoDepth ? "Queued depth-16 detail rebuild" : "Queued mesh rebuild");
                 pending_mesh_build = std::async(
                     std::launch::async,
                     build_lod_mesh_async,
                     std::cref(topology),
                     std::cref(points),
                     async_config,
-                    async_revision
+                    async_revision,
+                    build_progress
                 );
             }
             mesh_build_pending = true;
@@ -606,6 +694,9 @@ int main() {
         SDL_GetWindowSizeInPixels(window, &width, &height);
         renderer.resize(width, height);
         renderer.render(camera_view, spaceship, render_options, show_fps, displayed_fps);
+        if (mesh_build_pending) {
+            renderer.render_progress_overlay(build_progress->progress());
+        }
         SDL_GL_SwapWindow(window);
 
         ++frames_since_fps_update;
@@ -615,6 +706,21 @@ int main() {
             displayed_fps = static_cast<float>(frames_since_fps_update) * 1'000'000'000.0f / static_cast<float>(elapsed);
             frames_since_fps_update = 0;
             fps_update_start = now;
+            if (mesh_build_pending) {
+                char percent_buffer[16] = {};
+                std::snprintf(
+                    percent_buffer,
+                    sizeof(percent_buffer),
+                    "%.6f%%",
+                    std::clamp(build_progress->progress(), 0.0, 1.0) * 100.0
+                );
+                const std::string title = "AETHERONUS - " + build_progress->label_copy() + " (" + percent_buffer + ")";
+                SDL_SetWindowTitle(window, title.c_str());
+                window_title_shows_progress = true;
+            } else if (window_title_shows_progress) {
+                SDL_SetWindowTitle(window, "AETHERONUS");
+                window_title_shows_progress = false;
+            }
         }
     }
 

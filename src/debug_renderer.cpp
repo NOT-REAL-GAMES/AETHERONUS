@@ -771,6 +771,47 @@ std::vector<DebugVertex> build_fps_overlay_vertices(float fps) {
     return vertices;
 }
 
+std::vector<DebugVertex> build_progress_overlay_vertices(double progress) {
+    std::vector<DebugVertex> vertices;
+    const Vec3 border_color = {0.20f, 0.34f, 0.42f};
+    const Vec3 fill_color = {0.18f, 0.92f, 1.0f};
+    const Vec3 digit_color = {0.74f, 0.96f, 1.0f};
+    const float left = -0.62f;
+    const float right = 0.46f;
+    const float top = -0.78f;
+    const float bottom = -0.86f;
+    const double clamped = std::clamp(progress, 0.0, 1.0);
+
+    append_line(vertices, left, top, right, top, border_color);
+    append_line(vertices, right, top, right, bottom, border_color);
+    append_line(vertices, right, bottom, left, bottom, border_color);
+    append_line(vertices, left, bottom, left, top, border_color);
+
+    constexpr uint32_t FillSegments = 96;
+    const uint32_t lit_segments = static_cast<uint32_t>(std::round(clamped * static_cast<double>(FillSegments)));
+    for (uint32_t i = 0; i < lit_segments; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(FillSegments);
+        const float x = left + (right - left) * t;
+        append_line(vertices, x, top - 0.012f, x, bottom + 0.012f, fill_color);
+    }
+
+    char buffer[16] = {};
+    std::snprintf(buffer, sizeof(buffer), "%010.6f", clamped * 100.0);
+    float digit_x = 0.39f;
+    for (const char* cursor = buffer; *cursor != '\0'; ++cursor) {
+        if (*cursor == '.') {
+            append_line(vertices, digit_x + 0.008f, bottom + 0.006f, digit_x + 0.012f, bottom + 0.006f, digit_color);
+            append_line(vertices, digit_x + 0.010f, bottom + 0.010f, digit_x + 0.010f, bottom + 0.002f, digit_color);
+            digit_x += 0.018f;
+            continue;
+        }
+        append_seven_segment(vertices, *cursor - '0', digit_x, top + 0.01f, 0.025f, digit_color);
+        digit_x += 0.038f;
+    }
+
+    return vertices;
+}
+
 } // namespace
 
 DebugRenderer::~DebugRenderer() {
@@ -1000,6 +1041,26 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
 
 void DebugRenderer::render_fps_overlay(float fps) {
     const std::vector<DebugVertex> vertices = build_fps_overlay_vertices(fps);
+
+    glUseProgram(shader_);
+    const Mat4 overlay_transform = identity();
+    const int mvp_location = glGetUniformLocation(shader_, "u_mvp");
+    const int point_size_location = glGetUniformLocation(shader_, "u_point_size");
+    glUniformMatrix4fv(mvp_location, 1, GL_FALSE, overlay_transform.m);
+    glUniform1f(point_size_location, 1.0f);
+
+    glDisable(GL_DEPTH_TEST);
+    glBindVertexArray(overlay_vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(DebugVertex)), vertices.data(), GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size()));
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+    glUseProgram(0);
+}
+
+void DebugRenderer::render_progress_overlay(double progress) {
+    const std::vector<DebugVertex> vertices = build_progress_overlay_vertices(progress);
 
     glUseProgram(shader_);
     const Mat4 overlay_transform = identity();
