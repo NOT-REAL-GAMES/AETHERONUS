@@ -5,6 +5,8 @@
 #include <glad/glad.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
@@ -39,6 +41,8 @@ struct VoxelDebugView {
     float range_radius = 100.0f;
     float debug_box_size = 2.0f;
 };
+
+constexpr uint32_t OverlayDefaultVertexCapacity = 512u;
 
 Vec3 planet_to_world(Vec3 position) {
     return position * PlanetRadiusKilometers;
@@ -583,6 +587,8 @@ std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
             ? Vec3{0.045f, 0.095f, 0.045f}
             : vertex.material_id == 4u
             ? Vec3{0.010f, 0.014f, 0.018f}
+            : vertex.material_id == 6u
+            ? Vec3{0.30f, 0.18f, 0.08f}
             : vertex.material_id == 1u
             ? Vec3{0.20f, 0.15f, 0.10f}
             : Vec3{0.07f, 0.15f, 0.18f};
@@ -597,6 +603,17 @@ std::vector<DebugVertex> build_debug_mesh_vertices(const QuantizedMesh& mesh) {
             };
         }
         vertices.push_back({planet_to_world(vertex.position), color});
+    }
+    return vertices;
+}
+
+std::vector<DebugVertex> build_cave_anchor_vertices(const QuantizedMesh& mesh) {
+    std::vector<DebugVertex> vertices;
+    vertices.reserve(mesh.cave_anchor_points.size());
+    constexpr float AnchorSurfaceLift = 1.003f;
+    constexpr Vec3 AnchorColor = {0.34f, 1.0f, 0.48f};
+    for (Vec3 anchor : mesh.cave_anchor_points) {
+        vertices.push_back({planet_to_world(normalize(anchor) * AnchorSurfaceLift), AnchorColor});
     }
     return vertices;
 }
@@ -632,13 +649,13 @@ Vec3 ship_forward(const SpaceshipState& ship) {
     return normalize(ship.forward);
 }
 
-void append_ship_triangle(std::vector<DebugVertex>& vertices, Vec3 a, Vec3 b, Vec3 c, Vec3 color) {
-    vertices.push_back({a, color});
-    vertices.push_back({b, color});
-    vertices.push_back({c, color});
+void append_ship_triangle(DebugVertex* vertices, uint32_t& count, Vec3 a, Vec3 b, Vec3 c, Vec3 color) {
+    vertices[count++] = {a, color};
+    vertices[count++] = {b, color};
+    vertices[count++] = {c, color};
 }
 
-std::vector<DebugVertex> build_spaceship_vertices(const SpaceshipState& ship) {
+uint32_t build_spaceship_vertices(const SpaceshipState& ship, DebugVertex* vertices) {
     const Vec3 forward = ship_forward(ship);
     Vec3 visual_up = ship.up - forward * dot(ship.up, forward);
     if (length(visual_up) <= 0.000001f) {
@@ -655,24 +672,22 @@ std::vector<DebugVertex> build_spaceship_vertices(const SpaceshipState& ship) {
     const Vec3 top = center + forward * 0.008f + visual_up * 0.034f;
     const Vec3 keel = center - forward * 0.020f - visual_up * 0.020f;
 
-    std::vector<DebugVertex> vertices;
-    vertices.reserve(18);
-    append_ship_triangle(vertices, nose, left, top, {0.82f, 0.92f, 1.0f});
-    append_ship_triangle(vertices, right_wing, nose, top, {0.46f, 0.76f, 1.0f});
-    append_ship_triangle(vertices, left, tail, top, {0.28f, 0.42f, 0.72f});
-    append_ship_triangle(vertices, tail, right_wing, top, {0.22f, 0.36f, 0.66f});
-    append_ship_triangle(vertices, nose, keel, left, {0.12f, 0.18f, 0.28f});
-    append_ship_triangle(vertices, right_wing, keel, nose, {0.10f, 0.16f, 0.26f});
-    return vertices;
+    uint32_t count = 0;
+    append_ship_triangle(vertices, count, nose, left, top, {0.82f, 0.92f, 1.0f});
+    append_ship_triangle(vertices, count, right_wing, nose, top, {0.46f, 0.76f, 1.0f});
+    append_ship_triangle(vertices, count, left, tail, top, {0.28f, 0.42f, 0.72f});
+    append_ship_triangle(vertices, count, tail, right_wing, top, {0.22f, 0.36f, 0.66f});
+    append_ship_triangle(vertices, count, nose, keel, left, {0.12f, 0.18f, 0.28f});
+    append_ship_triangle(vertices, count, right_wing, keel, nose, {0.10f, 0.16f, 0.26f});
+    return count;
 }
 
-std::vector<DebugVertex> build_spaceship_trail_vertices(const SpaceshipState& ship) {
-    std::vector<DebugVertex> vertices;
+uint32_t build_spaceship_trail_vertices(const SpaceshipState& ship, DebugVertex* vertices) {
     if (ship.trail_count < 2) {
-        return vertices;
+        return 0;
     }
 
-    vertices.reserve((ship.trail_count - 1u) * 2u);
+    uint32_t count = 0;
     const uint32_t first_index = (ship.trail_head + SpaceshipState::TrailCapacity - ship.trail_count) % SpaceshipState::TrailCapacity;
     auto trail_point = [&](uint32_t index) {
         return ship.trail[(first_index + index) % SpaceshipState::TrailCapacity];
@@ -680,10 +695,10 @@ std::vector<DebugVertex> build_spaceship_trail_vertices(const SpaceshipState& sh
     for (uint32_t i = 1; i < ship.trail_count; ++i) {
         const float t = static_cast<float>(i) / static_cast<float>(ship.trail_count - 1u);
         const Vec3 color = {0.16f + t * 0.42f, 0.38f + t * 0.42f, 0.58f + t * 0.38f};
-        vertices.push_back({trail_point(i - 1u), color});
-        vertices.push_back({trail_point(i), color});
+        vertices[count++] = {trail_point(i - 1u), color};
+        vertices[count++] = {trail_point(i), color};
     }
-    return vertices;
+    return count;
 }
 
 void append_line(std::vector<DebugVertex>& vertices, float x0, float y0, float x1, float y1, Vec3 color) {
@@ -812,6 +827,17 @@ std::vector<DebugVertex> build_progress_overlay_vertices(double progress) {
     return vertices;
 }
 
+void upload_dynamic_overlay_vertices(uint32_t& capacity_bytes, const DebugVertex* vertices, size_t vertex_count) {
+    const uint32_t byte_count = static_cast<uint32_t>(vertex_count * sizeof(DebugVertex));
+    if (byte_count <= capacity_bytes) {
+        glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(byte_count), vertices);
+        return;
+    }
+    capacity_bytes = std::max(byte_count, OverlayDefaultVertexCapacity * static_cast<uint32_t>(sizeof(DebugVertex)));
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(capacity_bytes), nullptr, GL_DYNAMIC_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(byte_count), vertices);
+}
+
 } // namespace
 
 DebugRenderer::~DebugRenderer() {
@@ -829,6 +855,11 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const PointClou
     if (surface_net_shader_ == 0) {
         return false;
     }
+    shader_mvp_location_ = glGetUniformLocation(shader_, "u_mvp");
+    shader_point_size_location_ = glGetUniformLocation(shader_, "u_point_size");
+    surface_mvp_location_ = glGetUniformLocation(surface_net_shader_, "u_mvp");
+    surface_camera_location_ = glGetUniformLocation(surface_net_shader_, "u_camera_position");
+    surface_light_location_ = glGetUniformLocation(surface_net_shader_, "u_light_direction");
 
     std::vector<DebugVertex> line_vertices;
     std::vector<DebugVertex> grid_ribbon_vertices;
@@ -858,12 +889,19 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const PointClou
     glGenBuffers(1, &overlay_vbo_);
     glBindVertexArray(overlay_vao_);
     glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
-    glBufferData(GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW);
+    overlay_buffer_capacity_bytes_ = OverlayDefaultVertexCapacity * static_cast<uint32_t>(sizeof(DebugVertex));
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(overlay_buffer_capacity_bytes_), nullptr, GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(DebugVertex), reinterpret_cast<void*>(0));
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(DebugVertex), reinterpret_cast<void*>(sizeof(Vec3)));
     glBindVertexArray(0);
+
+    if (gpu_query_mesh_ == 0) {
+        glGenQueries(1, &gpu_query_mesh_);
+        glGenQueries(1, &gpu_query_surface_net_);
+        glGenQueries(1, &gpu_query_debug_);
+    }
 
     line_vertex_count_ = static_cast<int>(line_vertices.size());
     point_vertex_count_ = static_cast<int>(point_vertices.size());
@@ -877,10 +915,12 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const PointClou
 }
 
 void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
+    const auto upload_begin = std::chrono::steady_clock::now();
     release_mesh_buffers();
 
     const std::vector<DebugVertex> mesh_vertices = build_debug_mesh_vertices(mesh);
     const std::vector<DebugVertex> voxel_vertices;
+    const std::vector<DebugVertex> cave_anchor_vertices = build_cave_anchor_vertices(mesh);
     const std::vector<SurfaceNetVertex> surface_net_vertices = build_surface_net_vertices(mesh.surface_net);
     current_svo_ = mesh.svo;
     upload_indexed_mesh_buffer(
@@ -897,6 +937,7 @@ void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
         mesh.stitch_line_indices
     );
     upload_vertex_buffer(voxel_vao_, voxel_vbo_, voxel_vertices);
+    upload_vertex_buffer(cave_anchor_vao_, cave_anchor_vbo_, cave_anchor_vertices);
     upload_surface_net_buffer(
         surface_net_vao_,
         surface_net_vbo_,
@@ -910,7 +951,35 @@ void DebugRenderer::update_mesh(const QuantizedMesh& mesh) {
     stitch_triangle_index_count_ = static_cast<int>(mesh.stitch_triangle_indices.size());
     stitch_line_index_count_ = static_cast<int>(mesh.stitch_line_indices.size());
     voxel_line_vertex_count_ = 0;
+    cave_anchor_vertex_count_ = static_cast<int>(cave_anchor_vertices.size());
     surface_net_index_count_ = static_cast<int>(mesh.surface_net.triangle_indices.size());
+
+    uint64_t mesh_upload_bytes = mesh_vertices.size() * sizeof(DebugVertex);
+    mesh_upload_bytes += mesh.triangle_indices.size() * sizeof(uint32_t);
+    mesh_upload_bytes += mesh.line_indices.size() * sizeof(uint32_t);
+    mesh_upload_bytes += mesh.stitch_triangle_indices.size() * sizeof(uint32_t);
+    mesh_upload_bytes += mesh.stitch_line_indices.size() * sizeof(uint32_t);
+
+    uint64_t surface_upload_bytes = surface_net_vertices.size() * sizeof(SurfaceNetVertex);
+    surface_upload_bytes += mesh.surface_net.triangle_indices.size() * sizeof(uint32_t);
+    surface_upload_bytes += cave_anchor_vertices.size() * sizeof(DebugVertex);
+
+    RendererPerfStats next_stats = perf_stats_;
+    next_stats.upload_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - upload_begin
+    ).count();
+    next_stats.mesh_upload_bytes = mesh_upload_bytes;
+    next_stats.surface_net_upload_bytes = surface_upload_bytes;
+    next_stats.voxel_dynamic_upload_bytes = 0;
+    next_stats.mesh_vertices = static_cast<uint32_t>(mesh.vertices.size());
+    next_stats.mesh_triangles = static_cast<uint32_t>(mesh.triangle_indices.size() / 3u);
+    next_stats.stitch_triangles = static_cast<uint32_t>(mesh.stitch_triangle_indices.size() / 3u);
+    next_stats.mesh_lines = static_cast<uint32_t>(mesh.line_indices.size() / 2u);
+    next_stats.stitch_lines = static_cast<uint32_t>(mesh.stitch_line_indices.size() / 2u);
+    next_stats.surface_net_vertices = static_cast<uint32_t>(mesh.surface_net.vertices.size());
+    next_stats.surface_net_triangles = static_cast<uint32_t>(mesh.surface_net.triangle_indices.size() / 3u);
+    next_stats.voxel_debug_lines = 0;
+    perf_stats_ = next_stats;
 }
 
 void DebugRenderer::resize(int width, int height) {
@@ -919,6 +988,15 @@ void DebugRenderer::resize(int width, int height) {
 }
 
 void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, const DebugRenderOptions& options, bool show_fps, float fps) {
+    const auto render_begin = std::chrono::steady_clock::now();
+    const bool sample_gpu_timers = show_fps && ((gpu_timer_frame_++ & 15u) == 0u);
+    if (show_fps) {
+        read_gpu_timer(gpu_query_mesh_, perf_stats_.gpu_mesh_ms);
+        read_gpu_timer(gpu_query_surface_net_, perf_stats_.gpu_surface_net_ms);
+        read_gpu_timer(gpu_query_debug_, perf_stats_.gpu_debug_ms);
+    }
+    perf_stats_.draw_calls = 0;
+
     glViewport(0, 0, width_, height_);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -929,16 +1007,18 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
     const Mat4 mvp = projection * view_matrix;
 
     glUseProgram(shader_);
-    const int mvp_location = glGetUniformLocation(shader_, "u_mvp");
-    const int point_size_location = glGetUniformLocation(shader_, "u_point_size");
-    glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp.m);
+    glUniformMatrix4fv(shader_mvp_location_, 1, GL_FALSE, mvp.m);
 
-    glUniform1f(point_size_location, 1.0f);
+    glUniform1f(shader_point_size_location_, 1.0f);
     glBindVertexArray(mesh_vao_);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh_triangle_ebo_);
+    if (sample_gpu_timers) {
+        begin_gpu_timer(gpu_query_mesh_);
+    }
     glEnable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(1.0f, 1.0f);
     glDrawElements(GL_TRIANGLES, mesh_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
+    ++perf_stats_.draw_calls;
     glDisable(GL_POLYGON_OFFSET_FILL);
 
     if (options.show_mesh_wire) {
@@ -946,55 +1026,80 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
         glDisableVertexAttribArray(1);
         glVertexAttrib3f(1, 0.42f, 0.92f, 1.0f);
         glDrawElements(GL_LINES, mesh_line_index_count_, GL_UNSIGNED_INT, nullptr);
+        ++perf_stats_.draw_calls;
         glEnableVertexAttribArray(1);
     }
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, stitch_triangle_ebo_);
     glDrawElements(GL_TRIANGLES, stitch_triangle_index_count_, GL_UNSIGNED_INT, nullptr);
+    ++perf_stats_.draw_calls;
+    if (sample_gpu_timers) {
+        end_gpu_timer();
+    }
 
     if (options.show_surface_net) {
+        if (sample_gpu_timers) {
+            begin_gpu_timer(gpu_query_surface_net_);
+        }
         glUseProgram(surface_net_shader_);
-        const int surface_mvp_location = glGetUniformLocation(surface_net_shader_, "u_mvp");
-        const int surface_camera_location = glGetUniformLocation(surface_net_shader_, "u_camera_position");
-        const int surface_light_location = glGetUniformLocation(surface_net_shader_, "u_light_direction");
         const Vec3 light_direction = normalize(Vec3{-0.35f, -0.75f, -0.50f});
-        glUniformMatrix4fv(surface_mvp_location, 1, GL_FALSE, mvp.m);
-        glUniform3f(surface_camera_location, view.eye.x, view.eye.y, view.eye.z);
-        glUniform3f(surface_light_location, light_direction.x, light_direction.y, light_direction.z);
+        glUniformMatrix4fv(surface_mvp_location_, 1, GL_FALSE, mvp.m);
+        glUniform3f(surface_camera_location_, view.eye.x, view.eye.y, view.eye.z);
+        glUniform3f(surface_light_location_, light_direction.x, light_direction.y, light_direction.z);
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(-1.0f, -1.0f);
         glBindVertexArray(surface_net_vao_);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, surface_net_ebo_);
         glDrawElements(GL_TRIANGLES, surface_net_index_count_, GL_UNSIGNED_INT, nullptr);
+        ++perf_stats_.draw_calls;
         glDisable(GL_POLYGON_OFFSET_FILL);
         glUseProgram(shader_);
-        glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp.m);
-        glUniform1f(point_size_location, 1.0f);
+        glUniformMatrix4fv(shader_mvp_location_, 1, GL_FALSE, mvp.m);
+        glUniform1f(shader_point_size_location_, 1.0f);
+        if (sample_gpu_timers) {
+            end_gpu_timer();
+        }
     }
 
+    if (sample_gpu_timers) {
+        begin_gpu_timer(gpu_query_debug_);
+    }
     if (options.show_goldberg_grid) {
         glDepthFunc(GL_LEQUAL);
         glBindVertexArray(grid_ribbon_vao_);
         glDrawArrays(GL_TRIANGLES, 0, grid_ribbon_vertex_count_);
+        ++perf_stats_.draw_calls;
 
         glBindVertexArray(grid_ribbon_line_vao_);
         glDrawArrays(GL_LINES, 0, grid_ribbon_line_vertex_count_);
+        ++perf_stats_.draw_calls;
         glDepthFunc(GL_LESS);
 
-        glUniform1f(point_size_location, 1.0f);
+        glUniform1f(shader_point_size_location_, 1.0f);
         glBindVertexArray(line_vao_);
         glDrawArrays(GL_LINES, 0, line_vertex_count_);
+        ++perf_stats_.draw_calls;
     }
 
     if (options.show_points) {
-        glUniform1f(point_size_location, 6.0f);
+        glUniform1f(shader_point_size_location_, 6.0f);
         glBindVertexArray(point_vao_);
         glDrawArrays(GL_POINTS, 0, point_vertex_count_);
+        ++perf_stats_.draw_calls;
+    }
+
+    if (options.show_cave_anchors) {
+        glUniform1f(shader_point_size_location_, 2.0f);
+        glBindVertexArray(cave_anchor_vao_);
+        glDrawArrays(GL_POINTS, 0, cave_anchor_vertex_count_);
+        ++perf_stats_.draw_calls;
     }
 
     if (options.show_voxels) {
         const std::vector<DebugVertex> voxel_vertices = build_visible_voxel_vertices(current_svo_, view, aspect, far_plane);
         voxel_line_vertex_count_ = static_cast<int>(voxel_vertices.size());
+        perf_stats_.voxel_dynamic_upload_bytes = voxel_vertices.size() * sizeof(DebugVertex);
+        perf_stats_.voxel_debug_lines = static_cast<uint32_t>(voxel_vertices.size() / 2u);
         glBindVertexArray(voxel_vao_);
         glBindBuffer(GL_ARRAY_BUFFER, voxel_vbo_);
         glBufferData(
@@ -1004,32 +1109,29 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
             GL_DYNAMIC_DRAW
         );
         glDrawArrays(GL_LINES, 0, voxel_line_vertex_count_);
+        ++perf_stats_.draw_calls;
+    } else {
+        perf_stats_.voxel_dynamic_upload_bytes = 0;
+        perf_stats_.voxel_debug_lines = 0;
     }
 
-    const std::vector<DebugVertex> trail_vertices = build_spaceship_trail_vertices(ship);
-    if (!trail_vertices.empty()) {
-        glUniform1f(point_size_location, 1.0f);
-        glBindVertexArray(overlay_vao_);
-        glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
-        glBufferData(
-            GL_ARRAY_BUFFER,
-            static_cast<GLsizeiptr>(trail_vertices.size() * sizeof(DebugVertex)),
-            trail_vertices.data(),
-            GL_DYNAMIC_DRAW
-        );
-        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(trail_vertices.size()));
-    }
-
-    const std::vector<DebugVertex> ship_vertices = build_spaceship_vertices(ship);
+    std::array<DebugVertex, (SpaceshipState::TrailCapacity - 1u) * 2u + 18u> overlay_vertices = {};
+    const uint32_t trail_vertex_count = build_spaceship_trail_vertices(ship, overlay_vertices.data());
+    const uint32_t ship_vertex_count = build_spaceship_vertices(ship, overlay_vertices.data() + trail_vertex_count);
+    const uint32_t overlay_vertex_count = trail_vertex_count + ship_vertex_count;
+    glUniform1f(shader_point_size_location_, 1.0f);
     glBindVertexArray(overlay_vao_);
     glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(ship_vertices.size() * sizeof(DebugVertex)),
-        ship_vertices.data(),
-        GL_DYNAMIC_DRAW
-    );
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(ship_vertices.size()));
+    upload_dynamic_overlay_vertices(overlay_buffer_capacity_bytes_, overlay_vertices.data(), overlay_vertex_count);
+    if (trail_vertex_count > 0u) {
+        glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(trail_vertex_count));
+        ++perf_stats_.draw_calls;
+    }
+    glDrawArrays(GL_TRIANGLES, static_cast<GLint>(trail_vertex_count), static_cast<GLsizei>(ship_vertex_count));
+    ++perf_stats_.draw_calls;
+    if (sample_gpu_timers) {
+        end_gpu_timer();
+    }
 
     glBindVertexArray(0);
     glUseProgram(0);
@@ -1037,6 +1139,38 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
     if (show_fps) {
         render_fps_overlay(fps);
     }
+    perf_stats_.render_cpu_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - render_begin
+    ).count();
+}
+
+void DebugRenderer::begin_gpu_timer(uint32_t query) {
+    if (query != 0 && GLAD_GL_VERSION_3_3) {
+        glBeginQuery(GL_TIME_ELAPSED, query);
+    }
+}
+
+void DebugRenderer::end_gpu_timer() {
+    if (GLAD_GL_VERSION_3_3) {
+        glEndQuery(GL_TIME_ELAPSED);
+    }
+}
+
+void DebugRenderer::read_gpu_timer(uint32_t query, double& milliseconds) {
+    if (query == 0 || !GLAD_GL_VERSION_3_3) {
+        milliseconds = 0.0;
+        return;
+    }
+
+    GLint available = 0;
+    glGetQueryObjectiv(query, GL_QUERY_RESULT_AVAILABLE, &available);
+    if (available == 0) {
+        return;
+    }
+
+    GLuint64 nanoseconds = 0;
+    glGetQueryObjectui64v(query, GL_QUERY_RESULT, &nanoseconds);
+    milliseconds = static_cast<double>(nanoseconds) / 1000000.0;
 }
 
 void DebugRenderer::render_fps_overlay(float fps) {
@@ -1044,15 +1178,13 @@ void DebugRenderer::render_fps_overlay(float fps) {
 
     glUseProgram(shader_);
     const Mat4 overlay_transform = identity();
-    const int mvp_location = glGetUniformLocation(shader_, "u_mvp");
-    const int point_size_location = glGetUniformLocation(shader_, "u_point_size");
-    glUniformMatrix4fv(mvp_location, 1, GL_FALSE, overlay_transform.m);
-    glUniform1f(point_size_location, 1.0f);
+    glUniformMatrix4fv(shader_mvp_location_, 1, GL_FALSE, overlay_transform.m);
+    glUniform1f(shader_point_size_location_, 1.0f);
 
     glDisable(GL_DEPTH_TEST);
     glBindVertexArray(overlay_vao_);
     glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(DebugVertex)), vertices.data(), GL_DYNAMIC_DRAW);
+    upload_dynamic_overlay_vertices(overlay_buffer_capacity_bytes_, vertices.data(), vertices.size());
     glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size()));
     glBindVertexArray(0);
     glEnable(GL_DEPTH_TEST);
@@ -1064,15 +1196,13 @@ void DebugRenderer::render_progress_overlay(double progress) {
 
     glUseProgram(shader_);
     const Mat4 overlay_transform = identity();
-    const int mvp_location = glGetUniformLocation(shader_, "u_mvp");
-    const int point_size_location = glGetUniformLocation(shader_, "u_point_size");
-    glUniformMatrix4fv(mvp_location, 1, GL_FALSE, overlay_transform.m);
-    glUniform1f(point_size_location, 1.0f);
+    glUniformMatrix4fv(shader_mvp_location_, 1, GL_FALSE, overlay_transform.m);
+    glUniform1f(shader_point_size_location_, 1.0f);
 
     glDisable(GL_DEPTH_TEST);
     glBindVertexArray(overlay_vao_);
     glBindBuffer(GL_ARRAY_BUFFER, overlay_vbo_);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(vertices.size() * sizeof(DebugVertex)), vertices.data(), GL_DYNAMIC_DRAW);
+    upload_dynamic_overlay_vertices(overlay_buffer_capacity_bytes_, vertices.data(), vertices.size());
     glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vertices.size()));
     glBindVertexArray(0);
     glEnable(GL_DEPTH_TEST);
@@ -1112,6 +1242,14 @@ void DebugRenderer::release_mesh_buffers() {
         glDeleteVertexArrays(1, &voxel_vao_);
         voxel_vao_ = 0;
     }
+    if (cave_anchor_vbo_ != 0) {
+        glDeleteBuffers(1, &cave_anchor_vbo_);
+        cave_anchor_vbo_ = 0;
+    }
+    if (cave_anchor_vao_ != 0) {
+        glDeleteVertexArrays(1, &cave_anchor_vao_);
+        cave_anchor_vao_ = 0;
+    }
     if (surface_net_ebo_ != 0) {
         glDeleteBuffers(1, &surface_net_ebo_);
         surface_net_ebo_ = 0;
@@ -1130,6 +1268,7 @@ void DebugRenderer::release_mesh_buffers() {
     stitch_triangle_index_count_ = 0;
     stitch_line_index_count_ = 0;
     voxel_line_vertex_count_ = 0;
+    cave_anchor_vertex_count_ = 0;
     surface_net_index_count_ = 0;
     current_svo_ = {};
 }
@@ -1172,6 +1311,7 @@ void DebugRenderer::shutdown() {
         glDeleteBuffers(1, &overlay_vbo_);
         overlay_vbo_ = 0;
     }
+    overlay_buffer_capacity_bytes_ = 0;
     if (overlay_vao_ != 0) {
         glDeleteVertexArrays(1, &overlay_vao_);
         overlay_vao_ = 0;
@@ -1183,6 +1323,18 @@ void DebugRenderer::shutdown() {
     if (surface_net_shader_ != 0) {
         glDeleteProgram(surface_net_shader_);
         surface_net_shader_ = 0;
+    }
+    if (gpu_query_debug_ != 0) {
+        glDeleteQueries(1, &gpu_query_debug_);
+        gpu_query_debug_ = 0;
+    }
+    if (gpu_query_surface_net_ != 0) {
+        glDeleteQueries(1, &gpu_query_surface_net_);
+        gpu_query_surface_net_ = 0;
+    }
+    if (gpu_query_mesh_ != 0) {
+        glDeleteQueries(1, &gpu_query_mesh_);
+        gpu_query_mesh_ = 0;
     }
     line_vertex_count_ = 0;
     point_vertex_count_ = 0;

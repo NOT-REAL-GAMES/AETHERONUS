@@ -9,6 +9,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -178,6 +179,58 @@ bool ray_surface_net_intersection(
     return true;
 }
 
+bool ray_cave_feature_intersection(
+    const std::vector<ae::LocalVoxelFeature>& features,
+    ae::Vec3 origin_mesh,
+    ae::Vec3 direction,
+    ae::Vec3& hit_mesh
+) {
+    direction = ae::normalize(direction);
+    bool found = false;
+    float closest_t = std::numeric_limits<float>::max();
+    ae::Vec3 closest_hit = {};
+
+    for (const ae::LocalVoxelFeature& feature : features) {
+        if (feature.kind != ae::VoxelFeatureKind::CaveSystem) {
+            continue;
+        }
+
+        const float denominator = ae::dot(direction, feature.normal_mesh);
+        if (std::fabs(denominator) <= 0.000001f) {
+            continue;
+        }
+
+        const float t = ae::dot(feature.center_mesh - origin_mesh, feature.normal_mesh) / denominator;
+        if (t <= 0.0f || t >= closest_t) {
+            continue;
+        }
+
+        const ae::Vec3 plane_hit = origin_mesh + direction * t;
+        const ae::Vec3 offset = plane_hit - feature.center_mesh;
+        const float u = ae::dot(offset, feature.tangent_mesh);
+        const float v = ae::dot(offset, feature.bitangent_mesh);
+        const float entrance_radius = ae::kilometers_to_world_units(feature.entrance_radius_km) * 1.15f;
+        if ((u * u + v * v) > entrance_radius * entrance_radius) {
+            continue;
+        }
+
+        const float seed_depth = std::max(
+            ae::kilometers_to_world_units(2.0f),
+            ae::kilometers_to_world_units(feature.tunnel_radius_km) * 0.45f
+        );
+        closest_hit = plane_hit - feature.normal_mesh * seed_depth;
+        closest_t = t;
+        found = true;
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    hit_mesh = closest_hit;
+    return true;
+}
+
 struct MeshBuildResult {
     ae::QuantizedMesh mesh;
     ae::QuantizedMeshValidation validation;
@@ -185,6 +238,10 @@ struct MeshBuildResult {
     ae::Vec3 lod_focus;
     uint32_t revision = 0;
     MeshBuildMode mode = MeshBuildMode::Full;
+    std::string reason;
+    double queue_wait_ms = 0.0;
+    double async_build_ms = 0.0;
+    double validation_ms = 0.0;
 };
 
 struct BuildProgressState {
@@ -221,6 +278,8 @@ ae::QuantizedMesh make_voxel_rebuild_source(const ae::QuantizedMesh& mesh) {
     result.stitch_line_indices = mesh.stitch_line_indices;
     result.surface_net_base_cache = mesh.surface_net_base_cache;
     result.voxel_occupancy_cache = mesh.voxel_occupancy_cache;
+    result.voxel_features = mesh.voxel_features;
+    result.cave_anchor_points = mesh.cave_anchor_points;
     result.triangle_count = mesh.triangle_count;
     result.rejected_triangle_count = mesh.rejected_triangle_count;
     result.stitch_triangle_count = mesh.stitch_triangle_count;
@@ -248,13 +307,18 @@ MeshBuildResult build_lod_mesh_async(
     const ae::PointCloud& points,
     ae::MarchingCubesConfig config,
     uint32_t revision,
+    std::string reason,
+    std::chrono::steady_clock::time_point queued_at,
     std::shared_ptr<BuildProgressState> progress
 ) {
+    const auto build_begin = std::chrono::steady_clock::now();
     MeshBuildResult result;
     result.camera_position = config.lod_camera_position;
     result.lod_focus = ae::normalize(config.lod_camera_position);
     result.revision = revision;
     result.mode = MeshBuildMode::Full;
+    result.reason = std::move(reason);
+    result.queue_wait_ms = std::chrono::duration<double, std::milli>(build_begin - queued_at).count();
     if (progress) {
         progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail build" : "Starting mesh build");
         config.progress_callback = [progress](double value, const char* label) {
@@ -262,10 +326,17 @@ MeshBuildResult build_lod_mesh_async(
         };
     }
     result.mesh = ae::build_quantized_marching_cubes(topology, points, config);
+    const auto validation_begin = std::chrono::steady_clock::now();
     if (progress) {
         progress->set(0.985f, "Validating mesh");
     }
     result.validation = ae::validate_quantized_mesh(result.mesh);
+    result.validation_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - validation_begin
+    ).count();
+    result.async_build_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - build_begin
+    ).count();
     if (progress) {
         progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Mesh ready" : "Mesh validation failed");
     }
@@ -276,13 +347,18 @@ MeshBuildResult build_voxel_mesh_async(
     ae::QuantizedMesh mesh,
     ae::MarchingCubesConfig config,
     uint32_t revision,
+    std::string reason,
+    std::chrono::steady_clock::time_point queued_at,
     std::shared_ptr<BuildProgressState> progress
 ) {
+    const auto build_begin = std::chrono::steady_clock::now();
     MeshBuildResult result;
     result.camera_position = config.lod_camera_position;
     result.lod_focus = ae::normalize(config.lod_camera_position);
     result.revision = revision;
     result.mode = MeshBuildMode::VoxelsOnly;
+    result.reason = std::move(reason);
+    result.queue_wait_ms = std::chrono::duration<double, std::milli>(build_begin - queued_at).count();
     if (progress) {
         progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail rebuild" : "Starting voxel rebuild");
         config.progress_callback = [progress](double value, const char* label) {
@@ -290,10 +366,17 @@ MeshBuildResult build_voxel_mesh_async(
         };
     }
     result.mesh = ae::rebuild_quantized_mesh_voxels(std::move(mesh), config);
+    const auto validation_begin = std::chrono::steady_clock::now();
     if (progress) {
         progress->set(0.985f, "Validating voxel rebuild");
     }
     result.validation = ae::validate_quantized_mesh(result.mesh);
+    result.validation_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - validation_begin
+    ).count();
+    result.async_build_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - build_begin
+    ).count();
     if (progress) {
         progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Voxel rebuild ready" : "Voxel validation failed");
     }
@@ -309,7 +392,7 @@ int main() {
     }
 
     SDL_GL_ResetAttributes();
-    if (!set_gl_attribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3, "major version") ||
+    if (!set_gl_attribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4, "major version") ||
         !set_gl_attribute(SDL_GL_CONTEXT_MINOR_VERSION, 3, "minor version") ||
         !set_gl_attribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE, "core profile") ||
         !set_gl_attribute(SDL_GL_DOUBLEBUFFER, 1, "double buffer") ||
@@ -349,8 +432,8 @@ int main() {
         return 1;
     }
 
-    if (!GLAD_GL_VERSION_3_3) {
-        std::cerr << "OpenGL 3.3 is required." << std::endl;
+    if (!GLAD_GL_VERSION_4_3) {
+        std::cerr << "OpenGL 4.3 is required." << std::endl;
         SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
@@ -386,6 +469,7 @@ int main() {
     mesh_config.svo_depth = DefaultSvoDepth;
     mesh_config.surface_net_depth = DefaultSvoDepth;
     mesh_config.local_surface_net_depth = HighSvoDepth;
+    mesh_config.voxel_features.cave_depth = HighSvoDepth;
     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
     ae::VoxelEditSet voxel_edits;
     mesh_config.voxel_edits = voxel_edits;
@@ -422,33 +506,44 @@ int main() {
     uint32_t requested_mesh_revision = mesh_revision;
     std::future<MeshBuildResult> pending_mesh_build;
     MeshBuildMode requested_mesh_build_mode = MeshBuildMode::Full;
+    std::string requested_mesh_build_reason = "startup";
+    std::chrono::steady_clock::time_point requested_mesh_queued_at = std::chrono::steady_clock::now();
     bool mesh_build_pending = false;
     bool mesh_rebuild_requested = false;
     auto build_progress = std::make_shared<BuildProgressState>();
     bool show_fps = false;
+    bool benchmark_mode = false;
+    double benchmark_time = 0.0;
     ae::DebugRenderOptions render_options;
     ae::SpaceshipState spaceship;
     bool relative_mouse_enabled = false;
     float displayed_fps = 0.0f;
     uint32_t frames_since_fps_update = 0;
+    std::array<double, 128> frame_times_ms = {};
+    uint32_t frame_time_cursor = 0;
+    double recent_worst_frame_ms = 0.0;
     uint64_t fps_update_start = SDL_GetTicksNS();
     uint64_t last_update_time = fps_update_start;
     bool window_title_shows_progress = false;
     constexpr float LodRebuildDistance = 0.12f;
     constexpr std::chrono::milliseconds NoWait{0};
-    auto request_full_mesh_rebuild = [&]() {
+    auto request_full_mesh_rebuild = [&](const char* reason) {
         requested_mesh_revision = ++mesh_revision;
         requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
         requested_mesh_camera_position = mesh_config.lod_camera_position;
         requested_mesh_build_mode = MeshBuildMode::Full;
+        requested_mesh_build_reason = reason != nullptr ? reason : "full rebuild";
+        requested_mesh_queued_at = std::chrono::steady_clock::now();
         mesh_rebuild_requested = true;
     };
-    auto request_voxel_mesh_rebuild = [&]() {
+    auto request_voxel_mesh_rebuild = [&](const char* reason) {
         requested_mesh_revision = ++mesh_revision;
         requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
         requested_mesh_camera_position = mesh_config.lod_camera_position;
         if (!mesh_rebuild_requested || requested_mesh_build_mode != MeshBuildMode::Full) {
             requested_mesh_build_mode = MeshBuildMode::VoxelsOnly;
+            requested_mesh_build_reason = reason != nullptr ? reason : "voxel rebuild";
+            requested_mesh_queued_at = std::chrono::steady_clock::now();
         }
         mesh_rebuild_requested = true;
     };
@@ -461,12 +556,15 @@ int main() {
         std::cref(points),
         mesh_config,
         mesh_revision,
+        std::string("startup"),
+        requested_mesh_queued_at,
         build_progress
     );
     mesh_build_pending = true;
 
     bool running = true;
     while (running) {
+        const auto frame_begin = std::chrono::steady_clock::now();
         float ship_mouse_yaw = 0.0f;
         float ship_mouse_pitch = 0.0f;
         SDL_Event event;
@@ -481,10 +579,19 @@ int main() {
                     mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        request_full_mesh_rebuild();
+                        request_full_mesh_rebuild("camera reset");
                     }
                 } else if (event.key.key == SDLK_F3) {
                     show_fps = !show_fps;
+                } else if (event.key.key == SDLK_F2) {
+                    benchmark_mode = !benchmark_mode;
+                    benchmark_time = 0.0;
+                    show_fps = benchmark_mode ? true : show_fps;
+                    std::cout << "Benchmark camera path " << (benchmark_mode ? "enabled" : "disabled") << std::endl;
+                } else if (event.key.key == SDLK_F1) {
+                    render_options.show_cave_anchors = !render_options.show_cave_anchors;
+                    std::cout << "Cave anchor cloud " << (render_options.show_cave_anchors ? "shown" : "hidden")
+                              << " (" << current_mesh.cave_anchor_points.size() << " anchors)" << std::endl;
                 } else if (event.key.key == SDLK_F6) {
                     render_options.show_goldberg_grid = !render_options.show_goldberg_grid;
                     std::cout << "Goldberg grid " << (render_options.show_goldberg_grid ? "shown" : "hidden") << std::endl;
@@ -504,10 +611,11 @@ int main() {
                     mesh_config.svo_depth = DefaultSvoDepth;
                     mesh_config.surface_net_depth = DefaultSvoDepth;
                     mesh_config.local_surface_net_depth = mesh_config.local_surface_net_depth >= HighSvoDepth ? DefaultSvoDepth : HighSvoDepth;
+                    mesh_config.voxel_features.cave_depth = mesh_config.local_surface_net_depth;
                     mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
-                    request_voxel_mesh_rebuild();
-                    std::cout << "Local surface detail depth " << mesh_config.local_surface_net_depth
-                              << " rebuild requested (global SVO depth " << mesh_config.svo_depth
+                    request_voxel_mesh_rebuild("cave depth toggle");
+                    std::cout << "Cave SVO detail depth " << mesh_config.voxel_features.cave_depth
+                              << " rebuild requested (global exterior replacement disabled; SVO depth " << mesh_config.svo_depth
                               << ")" << std::endl;
                 } else if (event.key.key == SDLK_F9) {
                     render_options.follow_ship = !render_options.follow_ship;
@@ -527,17 +635,17 @@ int main() {
                     std::cout << "Ship follow camera " << (render_options.follow_ship ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F4) {
                     mesh_config.enable_fractures = !mesh_config.enable_fractures;
-                    request_full_mesh_rebuild();
+                    request_full_mesh_rebuild("fracture toggle");
                     std::cout << "Fractures " << (mesh_config.enable_fractures ? "enabled" : "disabled") << std::endl;
                 } else if (event.key.key == SDLK_F5) {
                     ++mesh_config.fracture_seed;
                     mesh_config.enable_fractures = true;
-                    request_full_mesh_rebuild();
+                    request_full_mesh_rebuild("fracture seed");
                     std::cout << "Fracture seed " << mesh_config.fracture_seed << std::endl;
                 } else if (event.key.key == SDLK_F13) {
                     voxel_edits.digs.clear();
                     mesh_config.voxel_edits = voxel_edits;
-                    request_voxel_mesh_rebuild();
+                    request_voxel_mesh_rebuild("clear cave edits");
                     std::cout << "Cleared dig edits; rebuild requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
@@ -550,13 +658,13 @@ int main() {
                     dig_direction,
                     hit_mesh
                 );
-                ae::Vec3 hit_km = {};
-                const bool hit_planet = hit_surface_net ||
-                    ray_sphere_intersection(dig_view.eye, dig_direction, ae::PlanetRadiusKilometers, hit_km);
-                if (hit_planet) {
-                    if (!hit_surface_net) {
-                        hit_mesh = hit_km / ae::PlanetRadiusKilometers;
-                    }
+                const bool hit_cave_feature = hit_surface_net || ray_cave_feature_intersection(
+                    current_mesh.voxel_features,
+                    dig_view.eye / ae::PlanetRadiusKilometers,
+                    dig_direction,
+                    hit_mesh
+                );
+                if (hit_cave_feature) {
                     voxel_edits.digs.push_back({
                         hit_mesh,
                         8.0f,
@@ -564,10 +672,10 @@ int main() {
                     });
                     mesh_config.voxel_edits = voxel_edits;
                     mesh_config.lod_camera_position = dig_view.eye;
-                    request_voxel_mesh_rebuild();
+                    request_voxel_mesh_rebuild("cave dig");
                     std::cout << "Dig edit " << voxel_edits.digs.size()
                               << ": radius 8 km, local depth " << voxel_edits.local_depth
-                              << " voxel rebuild requested" << std::endl;
+                              << " cave voxel rebuild requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_MOTION && render_options.follow_ship) {
                 ship_mouse_yaw += static_cast<float>(event.motion.xrel);
@@ -578,7 +686,7 @@ int main() {
                 mesh_config.lod_camera_position = free_camera_eye(camera);
                 const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                 if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                    request_full_mesh_rebuild();
+                    request_full_mesh_rebuild("orbit camera");
                 }
             } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
                 camera.distance = std::clamp(
@@ -621,17 +729,24 @@ int main() {
                     mesh_config.lod_camera_position = free_camera_eye(camera);
                     const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
                     if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        request_full_mesh_rebuild();
+                        request_full_mesh_rebuild("free camera move");
                     }
                 }
             }
         }
         ae::update_spaceship(spaceship, ship_input, dt);
+        if (benchmark_mode && !render_options.follow_ship) {
+            benchmark_time += static_cast<double>(dt);
+            camera.target = {};
+            camera.yaw = static_cast<float>(benchmark_time * 0.18);
+            camera.pitch = -0.30f + std::sin(static_cast<float>(benchmark_time) * 0.37f) * 0.20f;
+            camera.distance = ae::PlanetRadiusKilometers * (1.08f + 0.16f * (0.5f + 0.5f * std::sin(static_cast<float>(benchmark_time) * 0.21f)));
+        }
         const ae::CameraView camera_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
         mesh_config.lod_camera_position = camera_view.eye;
         const ae::Vec3 frame_lod_focus = ae::normalize(mesh_config.lod_camera_position);
         if (ae::length(frame_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-            request_full_mesh_rebuild();
+            request_full_mesh_rebuild(render_options.follow_ship ? "ship camera LOD" : "camera LOD");
         }
 
         if (mesh_build_pending && pending_mesh_build.wait_for(NoWait) == std::future_status::ready) {
@@ -649,6 +764,32 @@ int main() {
                 last_mesh_lod_focus = result.lod_focus;
                 std::cout << (result.mode == MeshBuildMode::VoxelsOnly ? "Voxel rebuild OK: " : "Mesh rebuild OK: ")
                           << result.validation.message << std::endl;
+                const ae::RendererPerfStats& renderer_stats = renderer.perf_stats();
+                std::cout << "Perf [" << result.reason << "]: queue " << result.queue_wait_ms
+                          << " ms, async " << result.async_build_ms
+                          << " ms, validation " << result.validation_ms
+                          << " ms, upload " << renderer_stats.upload_ms
+                          << " ms, mesh upload " << (renderer_stats.mesh_upload_bytes / (1024.0 * 1024.0))
+                          << " MiB, surface-net upload " << (renderer_stats.surface_net_upload_bytes / (1024.0 * 1024.0))
+                          << " MiB, cave anchors " << result.mesh.cave_anchor_points.size() << std::endl;
+                if (!result.mesh.perf.cave_features.empty()) {
+                    for (const ae::CaveFeatureBuildStats& cave_stats : result.mesh.perf.cave_features) {
+                        std::cout << "  Cave " << cave_stats.feature_id
+                                  << " cell " << cave_stats.owner_cell_id
+                                  << ": depth " << cave_stats.depth
+                                  << ", " << cave_stats.vertices << " vertices, "
+                                  << cave_stats.triangles << " triangles, "
+                                  << cave_stats.occupied_voxels << " occupied voxels, "
+                                  << cave_stats.candidate_cubes << " candidate cubes, "
+                                  << cave_stats.surface_net_ms << " ms"
+                                  << " [occ " << cave_stats.occupancy_ms
+                                  << ", candidates " << cave_stats.candidate_ms
+                                  << ", compact " << cave_stats.compact_ms
+                                  << ", verts " << cave_stats.vertex_ms
+                                  << ", quads " << cave_stats.quad_ms
+                                  << "]" << std::endl;
+                    }
+                }
             } else {
                 std::cerr << result.validation.message << std::endl;
                 last_mesh_lod_focus = result.lod_focus;
@@ -661,6 +802,8 @@ int main() {
             async_config.lod_camera_position = requested_mesh_camera_position;
             const uint32_t async_revision = requested_mesh_revision;
             const MeshBuildMode async_mode = requested_mesh_build_mode;
+            const std::string async_reason = requested_mesh_build_reason;
+            const auto async_queued_at = requested_mesh_queued_at;
             mesh_rebuild_requested = false;
             requested_mesh_build_mode = MeshBuildMode::Full;
             if (async_mode == MeshBuildMode::VoxelsOnly) {
@@ -672,6 +815,8 @@ int main() {
                     std::move(voxel_base_mesh),
                     async_config,
                     async_revision,
+                    async_reason,
+                    async_queued_at,
                     build_progress
                 );
             } else {
@@ -683,6 +828,8 @@ int main() {
                     std::cref(points),
                     async_config,
                     async_revision,
+                    async_reason,
+                    async_queued_at,
                     build_progress
                 );
             }
@@ -698,6 +845,11 @@ int main() {
             renderer.render_progress_overlay(build_progress->progress());
         }
         SDL_GL_SwapWindow(window);
+        const double frame_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - frame_begin
+        ).count();
+        frame_times_ms[frame_time_cursor % frame_times_ms.size()] = frame_ms;
+        ++frame_time_cursor;
 
         ++frames_since_fps_update;
         const uint64_t now = SDL_GetTicksNS();
@@ -706,6 +858,11 @@ int main() {
             displayed_fps = static_cast<float>(frames_since_fps_update) * 1'000'000'000.0f / static_cast<float>(elapsed);
             frames_since_fps_update = 0;
             fps_update_start = now;
+            recent_worst_frame_ms = 0.0;
+            const uint32_t frame_sample_count = std::min<uint32_t>(frame_time_cursor, static_cast<uint32_t>(frame_times_ms.size()));
+            for (uint32_t i = 0; i < frame_sample_count; ++i) {
+                recent_worst_frame_ms = std::max(recent_worst_frame_ms, frame_times_ms[i]);
+            }
             if (mesh_build_pending) {
                 char percent_buffer[16] = {};
                 std::snprintf(
@@ -716,6 +873,24 @@ int main() {
                 );
                 const std::string title = "AETHERONUS - " + build_progress->label_copy() + " (" + percent_buffer + ")";
                 SDL_SetWindowTitle(window, title.c_str());
+                window_title_shows_progress = true;
+            } else if (show_fps) {
+                const ae::RendererPerfStats& renderer_stats = renderer.perf_stats();
+                char title_buffer[256] = {};
+                std::snprintf(
+                    title_buffer,
+                    sizeof(title_buffer),
+                    "AETHERONUS - FPS %.0f | frame %.2f ms worst %.2f | render %.2f ms | GPU mesh %.2f surf %.2f dbg %.2f | draws %u",
+                    displayed_fps,
+                    1000.0f / std::max(displayed_fps, 0.001f),
+                    recent_worst_frame_ms,
+                    renderer_stats.render_cpu_ms,
+                    renderer_stats.gpu_mesh_ms,
+                    renderer_stats.gpu_surface_net_ms,
+                    renderer_stats.gpu_debug_ms,
+                    renderer_stats.draw_calls
+                );
+                SDL_SetWindowTitle(window, title_buffer);
                 window_title_shows_progress = true;
             } else if (window_title_shows_progress) {
                 SDL_SetWindowTitle(window, "AETHERONUS");

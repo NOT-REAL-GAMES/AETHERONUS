@@ -23,6 +23,38 @@ struct VoxelEditSet {
     uint32_t local_depth = 16;
 };
 
+enum class VoxelFeatureKind : uint8_t {
+    CaveSystem = 0,
+};
+
+struct LocalVoxelFeature {
+    VoxelFeatureKind kind = VoxelFeatureKind::CaveSystem;
+    uint32_t feature_id = 0;
+    uint32_t owner_cell_id = 0;
+    Vec3 center_mesh;
+    Vec3 normal_mesh;
+    Vec3 tangent_mesh;
+    Vec3 bitangent_mesh;
+    float entrance_radius_km = 28.0f;
+    float tunnel_radius_km = 18.0f;
+    float chamber_radius_km = 48.0f;
+    float depth_km = 110.0f;
+    uint32_t svo_depth = 16;
+    uint32_t seed = 1;
+};
+
+struct VoxelFeatureSet {
+    bool enabled = true;
+    uint32_t seed = 1;
+    uint32_t cave_count = 6;
+    uint32_t cave_anchor_count = 1000000;
+    uint32_t cave_depth = 16;
+    float entrance_radius_km = 28.0f;
+    float tunnel_radius_km = 18.0f;
+    float chamber_radius_km = 48.0f;
+    float cave_depth_km = 110.0f;
+};
+
 struct VoxelKey {
     uint32_t x = 0;
     uint32_t y = 0;
@@ -84,12 +116,14 @@ struct MarchingCubesConfig {
     uint32_t surface_net_depth = 8;
     uint32_t surface_net_max_vertices = 2000000;
     uint32_t surface_net_material_id = 5;
+    bool enable_exterior_surface_net_replacement = false;
     bool enable_local_surface_net_detail = true;
     uint32_t local_surface_net_depth = 16;
     float local_surface_net_patch_radius_km = 160.0f;
     float local_surface_net_patch_overlap_km = 24.0f;
     uint32_t local_surface_net_max_patches = 8;
     VoxelEditSet voxel_edits;
+    VoxelFeatureSet voxel_features;
     std::function<void(double, const char*)> progress_callback;
 };
 
@@ -144,6 +178,40 @@ struct SurfaceNetMesh {
     uint32_t local_triangle_count = 0;
 };
 
+struct CaveFeatureBuildStats {
+    uint32_t feature_id = 0;
+    uint32_t owner_cell_id = 0;
+    uint32_t depth = 0;
+    uint32_t vertices = 0;
+    uint32_t triangles = 0;
+    uint32_t occupied_voxels = 0;
+    uint32_t candidate_cubes = 0;
+    double surface_net_ms = 0.0;
+    double occupancy_ms = 0.0;
+    double candidate_ms = 0.0;
+    double compact_ms = 0.0;
+    double vertex_ms = 0.0;
+    double quad_ms = 0.0;
+};
+
+struct QuantizedMeshBuildStats {
+    double total_ms = 0.0;
+    double goldberg_mesh_ms = 0.0;
+    double fracture_mesh_ms = 0.0;
+    double boundary_sort_ms = 0.0;
+    double stitch_ms = 0.0;
+    double voxel_total_ms = 0.0;
+    double cave_surface_net_ms = 0.0;
+    double cave_svo_ms = 0.0;
+    double exterior_voxelize_ms = 0.0;
+    double exterior_surface_net_ms = 0.0;
+    uint32_t cave_feature_count = 0;
+    uint32_t cave_surface_vertices = 0;
+    uint32_t cave_surface_triangles = 0;
+    uint32_t material_triangle_counts[8] = {};
+    std::vector<CaveFeatureBuildStats> cave_features;
+};
+
 struct VoxelOccupancyCache {
     std::vector<VoxelKey> leaf_keys;
     float bounds_radius = 0.0f;
@@ -167,6 +235,8 @@ struct QuantizedMesh {
     SurfaceNetMesh surface_net;
     SurfaceNetMesh surface_net_base_cache;
     VoxelOccupancyCache voxel_occupancy_cache;
+    std::vector<LocalVoxelFeature> voxel_features;
+    std::vector<Vec3> cave_anchor_points;
     uint32_t triangle_count = 0;
     uint32_t rejected_triangle_count = 0;
     uint32_t stitch_triangle_count = 0;
@@ -186,6 +256,7 @@ struct QuantizedMesh {
     uint32_t min_cell_subdivisions = 0;
     uint32_t max_cell_subdivisions = 0;
     uint32_t lod_level_count = 0;
+    QuantizedMeshBuildStats perf;
 };
 
 struct QuantizedMeshValidation {
