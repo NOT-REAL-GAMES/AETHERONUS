@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <map>
 #include <vector>
 #include <sstream>
@@ -166,6 +167,10 @@ struct PreparedVoxelDig {
     float radius_with_leaf_mesh = 0.0f;
 };
 
+bool dig_target_matches(const VoxelDigEdit& dig, VoxelDigTarget target) {
+    return dig.target == target;
+}
+
 struct LocalSurfaceNetPatch {
     Vec3 center_mesh;
     Vec3 dig_center_mesh;
@@ -194,7 +199,14 @@ struct SurfaceNetPlacement {
 
 struct CaveCellCandidate {
     uint32_t cell_id = 0;
-    uint32_t score = 0;
+    Vec3 center = {};
+    float inradius_mesh = 0.0f;
+};
+
+struct CaveFeatureAnchor {
+    uint32_t cell_id = 0;
+    Vec3 direction = {};
+    float inradius_mesh = 0.0f;
 };
 
 struct CaveSurfaceCubeCandidate {
@@ -931,9 +943,165 @@ float cell_polygon_inradius(const std::vector<Vec2>& polygon) {
     return distance_to_polygon_boundary(polygon_centroid(polygon), polygon);
 }
 
+Vec3 seeded_unit_direction(uint32_t seed, uint32_t index) {
+    const uint32_t base = seed ^ (index * 0x9e3779b9u) ^ 0x4cf5ad43u;
+    const float z = hash_unit(base) * 2.0f - 1.0f;
+    const float theta = hash_unit(base ^ 0x85ebca6bu) * (Pi * 2.0f);
+    const float radius = std::sqrt(std::max(0.0f, 1.0f - z * z));
+    return {
+        std::cos(theta) * radius,
+        std::sin(theta) * radius,
+        z,
+    };
+}
+
+std::vector<Vec3> optimize_cave_directions_frank_wolfe(uint32_t seed, uint32_t cave_count) {
+    std::vector<Vec3> targets;
+    targets.reserve(cave_count);
+    std::vector<Vec3> directions;
+    directions.reserve(cave_count);
+    for (uint32_t i = 0; i < cave_count; ++i) {
+        const Vec3 target = seeded_unit_direction(seed, i);
+        targets.push_back(target);
+        directions.push_back(target);
+    }
+
+    constexpr uint32_t Iterations = 48u;
+    constexpr float RepulsionWeight = 1.0f;
+    constexpr float SeedAttractionWeight = 0.12f;
+    constexpr float RepulsionEpsilon = 0.035f;
+    for (uint32_t iteration = 0; iteration < Iterations; ++iteration) {
+        std::vector<Vec3> gradients(cave_count);
+        for (uint32_t i = 0; i < cave_count; ++i) {
+            gradients[i] = targets[i] * -SeedAttractionWeight;
+        }
+
+        for (uint32_t i = 0; i < cave_count; ++i) {
+            for (uint32_t j = i + 1u; j < cave_count; ++j) {
+                const float similarity = std::clamp(dot(directions[i], directions[j]), -0.999f, 0.999f);
+                const float denominator = std::max(RepulsionEpsilon, 1.0f - similarity + RepulsionEpsilon);
+                const float scale = RepulsionWeight / (denominator * denominator);
+                gradients[i] = gradients[i] + directions[j] * scale;
+                gradients[j] = gradients[j] + directions[i] * scale;
+            }
+        }
+
+        const float gamma = 2.0f / static_cast<float>(iteration + 2u);
+        for (uint32_t i = 0; i < cave_count; ++i) {
+            const Vec3 descent = length(gradients[i]) > 0.000001f
+                ? normalize(gradients[i]) * -1.0f
+                : targets[i];
+            directions[i] = directions[i] * (1.0f - gamma) + descent * gamma;
+        }
+    }
+
+    for (Vec3& direction : directions) {
+        direction = normalize(direction);
+    }
+    return directions;
+}
+
+std::vector<uint32_t> select_frank_wolfe_cave_cells(
+    const std::vector<CaveCellCandidate>& candidates,
+    uint32_t seed,
+    uint32_t cave_count
+) {
+    std::vector<uint32_t> selected_cells;
+    if (candidates.empty() || cave_count == 0u) {
+        return selected_cells;
+    }
+
+    const uint32_t selected_count = std::min(cave_count, static_cast<uint32_t>(candidates.size()));
+    selected_cells.reserve(selected_count);
+    const std::vector<Vec3> directions = optimize_cave_directions_frank_wolfe(seed, selected_count);
+    std::vector<uint8_t> used(candidates.size(), 0u);
+
+    constexpr float TieBreakerWeight = 0.000001f;
+    for (uint32_t feature_index = 0; feature_index < selected_count; ++feature_index) {
+        const Vec3 direction = directions[feature_index];
+        size_t best_index = candidates.size();
+        float best_score = -1000000.0f;
+        for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+            if (used[candidate_index] != 0u) {
+                continue;
+            }
+            const CaveCellCandidate& candidate = candidates[candidate_index];
+            const float tie_breaker = hash_unit(
+                seed ^
+                (candidate.cell_id * 0x7feb352du) ^
+                (feature_index * 0x846ca68bu) ^
+                0x51ed270bu
+            ) * TieBreakerWeight;
+            const float score = dot(candidate.center, direction) + tie_breaker;
+            if (score > best_score || (std::fabs(score - best_score) <= 0.0000001f && candidate.cell_id < candidates[best_index].cell_id)) {
+                best_score = score;
+                best_index = candidate_index;
+            }
+        }
+
+        if (best_index == candidates.size()) {
+            break;
+        }
+        used[best_index] = 1u;
+        selected_cells.push_back(candidates[best_index].cell_id);
+    }
+
+    return selected_cells;
+}
+
+size_t nearest_cave_cell_candidate(const std::vector<CaveCellCandidate>& candidates, Vec3 direction) {
+    size_t nearest_index = candidates.size();
+    float best_score = -2.0f;
+    const Vec3 normalized_direction = normalize(direction);
+    for (size_t candidate_index = 0; candidate_index < candidates.size(); ++candidate_index) {
+        const float score = dot(normalized_direction, candidates[candidate_index].center);
+        if (score > best_score) {
+            best_score = score;
+            nearest_index = candidate_index;
+        }
+    }
+    return nearest_index;
+}
+
+std::vector<CaveFeatureAnchor> select_anchor_cave_features(
+    const std::vector<CaveCellCandidate>& candidates,
+    const std::vector<Vec3>& cave_anchor_points,
+    uint32_t seed,
+    uint32_t cave_count
+) {
+    std::vector<CaveFeatureAnchor> selected;
+    if (candidates.empty() || cave_anchor_points.empty() || cave_count == 0u) {
+        return selected;
+    }
+
+    const uint32_t anchor_count = static_cast<uint32_t>(cave_anchor_points.size());
+    const uint32_t selected_count = std::min(cave_count, anchor_count);
+    selected.reserve(selected_count);
+    const uint32_t offset = anchor_count == 0u
+        ? 0u
+        : hash_u32(seed ^ 0x6d2b79f5u) % anchor_count;
+    const uint32_t stride = std::max(1u, anchor_count / std::max(1u, selected_count));
+
+    for (uint32_t feature_slot = 0; feature_slot < selected_count; ++feature_slot) {
+        const uint32_t anchor_index = (offset + feature_slot * stride) % anchor_count;
+        const Vec3 direction = normalize(cave_anchor_points[anchor_index]);
+        const size_t candidate_index = nearest_cave_cell_candidate(candidates, direction);
+        if (candidate_index < candidates.size()) {
+            selected.push_back({
+                candidates[candidate_index].cell_id,
+                direction,
+                candidates[candidate_index].inradius_mesh,
+            });
+        }
+    }
+
+    return selected;
+}
+
 std::vector<LocalVoxelFeature> build_local_voxel_features(
     const GoldbergTopology& topology,
-    const MarchingCubesConfig& config
+    const MarchingCubesConfig& config,
+    const std::vector<Vec3>& cave_anchor_points
 ) {
     std::vector<LocalVoxelFeature> features;
     if (!config.voxel_features.enabled || config.voxel_features.cave_count == 0u) {
@@ -947,27 +1115,52 @@ std::vector<LocalVoxelFeature> build_local_voxel_features(
         if (cell.kind != GoldbergCellKind::Hexagon || cell.corner_indices.size() < 3) {
             continue;
         }
-        candidates.push_back({
-            cell_id,
-            hash_u32(config.voxel_features.seed ^ (cell_id * 0x9e3779b9u) ^ 0x51ed270bu),
-        });
-    }
-
-    std::sort(candidates.begin(), candidates.end(), [](const CaveCellCandidate& lhs, const CaveCellCandidate& rhs) {
-        if (lhs.score != rhs.score) {
-            return lhs.score < rhs.score;
-        }
-        return lhs.cell_id < rhs.cell_id;
-    });
-
-    const uint32_t cave_count = std::min(config.voxel_features.cave_count, static_cast<uint32_t>(candidates.size()));
-    features.reserve(cave_count);
-    for (uint32_t feature_index = 0; feature_index < cave_count; ++feature_index) {
-        const uint32_t cell_id = candidates[feature_index].cell_id;
-        const GoldbergCell& cell = topology.cells[cell_id];
         const Frame frame = build_frame(cell.normal);
         const std::vector<Vec2> polygon = cell_clip_polygon(topology, cell, cell.center, frame);
         const float inradius_mesh = cell_polygon_inradius(polygon);
+        if (inradius_mesh <= 0.000001f) {
+            continue;
+        }
+        candidates.push_back({
+            cell_id,
+            normalize(cell.center),
+            inradius_mesh,
+        });
+    }
+
+    std::vector<CaveFeatureAnchor> selected_anchors = select_anchor_cave_features(
+        candidates,
+        cave_anchor_points,
+        config.voxel_features.seed,
+        config.voxel_features.cave_count
+    );
+    if (selected_anchors.empty()) {
+        const std::vector<uint32_t> selected_cells = select_frank_wolfe_cave_cells(
+            candidates,
+            config.voxel_features.seed,
+            config.voxel_features.cave_count
+        );
+        selected_anchors.reserve(selected_cells.size());
+        for (uint32_t cell_id : selected_cells) {
+            const size_t candidate_index = nearest_cave_cell_candidate(candidates, topology.cells[cell_id].center);
+            if (candidate_index < candidates.size()) {
+                selected_anchors.push_back({
+                    cell_id,
+                    candidates[candidate_index].center,
+                    candidates[candidate_index].inradius_mesh,
+                });
+            }
+        }
+    }
+
+    const uint32_t cave_count = static_cast<uint32_t>(selected_anchors.size());
+    features.reserve(cave_count);
+    for (uint32_t feature_index = 0; feature_index < cave_count; ++feature_index) {
+        const CaveFeatureAnchor& selected_anchor = selected_anchors[feature_index];
+        const uint32_t cell_id = selected_anchor.cell_id;
+        const Vec3 anchor_direction = normalize(selected_anchor.direction);
+        const Frame frame = build_frame(anchor_direction);
+        const float inradius_mesh = selected_anchor.inradius_mesh;
         const float requested_entrance_radius = kilometers_to_world_units(config.voxel_features.entrance_radius_km);
         const float entrance_radius_mesh = std::max(
             kilometers_to_world_units(6.0f),
@@ -981,8 +1174,8 @@ std::vector<LocalVoxelFeature> build_local_voxel_features(
         feature.kind = VoxelFeatureKind::CaveSystem;
         feature.feature_id = feature_index + 1u;
         feature.owner_cell_id = cell_id;
-        feature.center_mesh = normalize(cell.center);
-        feature.normal_mesh = normalize(cell.normal);
+        feature.center_mesh = anchor_direction;
+        feature.normal_mesh = anchor_direction;
         feature.tangent_mesh = frame.tangent;
         feature.bitangent_mesh = frame.bitangent;
         feature.entrance_radius_km = world_units_to_kilometers(entrance_radius_mesh);
@@ -995,74 +1188,6 @@ std::vector<LocalVoxelFeature> build_local_voxel_features(
     }
 
     return features;
-}
-
-std::vector<Vec3> build_cave_anchor_points(
-    const GoldbergTopology& topology,
-    const MarchingCubesConfig& config
-) {
-    std::vector<Vec3> anchors;
-    if (!config.voxel_features.enabled || config.voxel_features.cave_anchor_count == 0u || topology.cells.empty()) {
-        return anchors;
-    }
-
-    std::vector<uint32_t> cave_cells;
-    cave_cells.reserve(topology.cells.size());
-    for (uint32_t cell_id = 0; cell_id < topology.cells.size(); ++cell_id) {
-        const GoldbergCell& cell = topology.cells[cell_id];
-        if (cell.kind == GoldbergCellKind::Hexagon && cell.corner_indices.size() >= 3) {
-            cave_cells.push_back(cell_id);
-        }
-    }
-    if (cave_cells.empty()) {
-        return anchors;
-    }
-
-    struct AnchorCellFrame {
-        uint32_t cell_id = 0;
-        Vec3 center = {};
-        Vec3 tangent = {};
-        Vec3 bitangent = {};
-        Vec2 local_center = {};
-        float sample_radius = 0.0f;
-    };
-
-    std::vector<AnchorCellFrame> frames;
-    frames.reserve(cave_cells.size());
-    for (uint32_t cell_id : cave_cells) {
-        const GoldbergCell& cell = topology.cells[cell_id];
-        const Frame frame = build_frame(cell.normal);
-        const std::vector<Vec2> polygon = cell_clip_polygon(topology, cell, cell.center, frame);
-        const float inradius = cell_polygon_inradius(polygon);
-        if (inradius <= 0.000001f) {
-            continue;
-        }
-        frames.push_back({
-            cell_id,
-            normalize(cell.center),
-            frame.tangent,
-            frame.bitangent,
-            polygon_centroid(polygon),
-            inradius * 0.82f,
-        });
-    }
-    if (frames.empty()) {
-        return anchors;
-    }
-
-    anchors.reserve(config.voxel_features.cave_anchor_count);
-    const uint32_t seed = config.voxel_features.seed ^ 0x9d06e9c5u;
-    for (uint32_t anchor_index = 0; anchor_index < config.voxel_features.cave_anchor_count; ++anchor_index) {
-        const uint32_t cell_hash = hash_u32(seed ^ (anchor_index * 0x85ebca6bu));
-        const AnchorCellFrame& frame = frames[cell_hash % frames.size()];
-        const float angle = hash_unit(seed ^ (anchor_index * 0xc2b2ae35u) ^ (frame.cell_id * 0x27d4eb2du)) * (Pi * 2.0f);
-        const float radial = std::sqrt(hash_unit(seed ^ (anchor_index * 0x165667b1u) ^ 0x68bc21ebu)) * frame.sample_radius;
-        const Vec2 local = frame.local_center + Vec2{std::cos(angle) * radial, std::sin(angle) * radial};
-        const Vec3 world = normalize(frame.center + frame.tangent * local.x + frame.bitangent * local.y);
-        anchors.push_back(world);
-    }
-
-    return anchors;
 }
 
 std::vector<Vec2> clip_polygon_to_voronoi_half_plane(const std::vector<Vec2>& polygon, Vec2 seed, Vec2 other_seed) {
@@ -1209,6 +1334,83 @@ uint32_t nearest_global_fracture_chunk_id(Vec3 direction, const MarchingCubesCon
         }
     }
     return nearest_seed + 1u;
+}
+
+Vec3 plate_guided_cave_anchor_direction(
+    uint32_t anchor_index,
+    uint32_t anchor_count,
+    const MarchingCubesConfig& config,
+    const std::vector<Vec3>& plate_centers
+) {
+    const uint32_t seed = config.voxel_features.seed ^ 0x9d06e9c5u;
+    constexpr float GoldenAngle = 2.39996323f;
+    const float count = static_cast<float>(std::max(1u, anchor_count));
+    const float row_jitter = (hash_unit(seed ^ (anchor_index * 0x7feb352du)) - 0.5f) * 0.72f;
+    const float row = std::clamp(static_cast<float>(anchor_index) + 0.5f + row_jitter, 0.5f, count - 0.5f);
+    const float z = 1.0f - 2.0f * (row / count);
+    const float radius = std::sqrt(std::max(0.0f, 1.0f - z * z));
+    const float phase = hash_unit(seed ^ 0x68bc21ebu) * (Pi * 2.0f);
+    const float theta_jitter = (hash_unit(seed ^ (anchor_index * 0x846ca68bu) ^ 0xa511e9b3u) - 0.5f) * 0.35f;
+    Vec3 direction = normalize({
+        std::cos(static_cast<float>(anchor_index) * GoldenAngle + phase + theta_jitter) * radius,
+        z,
+        std::sin(static_cast<float>(anchor_index) * GoldenAngle + phase + theta_jitter) * radius,
+    });
+
+    const uint32_t plate_count = static_cast<uint32_t>(plate_centers.size());
+    uint32_t nearest_plate = 0u;
+    float best_score = -2.0f;
+    float second_score = -2.0f;
+    for (uint32_t plate_id = 0; plate_id < plate_count; ++plate_id) {
+        const float score = dot(direction, plate_centers[plate_id]);
+        if (score > best_score) {
+            second_score = best_score;
+            best_score = score;
+            nearest_plate = plate_id;
+        } else if (score > second_score) {
+            second_score = score;
+        }
+    }
+
+    const Vec3 plate_center = plate_centers[nearest_plate];
+    const Frame plate_frame = build_frame(plate_center);
+    const uint32_t plate_seed = seed ^
+        (config.fracture_seed * 0x27d4eb2du) ^
+        (nearest_plate * 0x85ebca6bu) ^
+        (anchor_index * 0xc2b2ae35u);
+    const float plate_margin = std::clamp((best_score - second_score) * static_cast<float>(plate_count) * 0.35f, 0.0f, 1.0f);
+    const float cave_grain = 0.0016f + hash_unit(plate_seed ^ 0x51ed270bu) * 0.0014f;
+    const float grain_angle = hash_unit(plate_seed ^ 0x165667b1u) * (Pi * 2.0f);
+    const float grain_radius = cave_grain * (0.35f + plate_margin * 0.65f);
+    const Vec3 tangent_grain =
+        plate_frame.tangent * (std::cos(grain_angle) * grain_radius) +
+        plate_frame.bitangent * (std::sin(grain_angle) * grain_radius);
+    return normalize(direction + tangent_grain);
+}
+
+std::vector<Vec3> build_cave_anchor_points(const MarchingCubesConfig& config) {
+    std::vector<Vec3> anchors;
+    if (!config.voxel_features.enabled || config.voxel_features.cave_anchor_count == 0u) {
+        return anchors;
+    }
+
+    anchors.reserve(config.voxel_features.cave_anchor_count);
+    const uint32_t plate_count = global_fracture_seed_count(config);
+    std::vector<Vec3> plate_centers;
+    plate_centers.reserve(plate_count);
+    for (uint32_t plate_id = 0; plate_id < plate_count; ++plate_id) {
+        plate_centers.push_back(global_fracture_seed_position(plate_id, plate_count, config));
+    }
+
+    for (uint32_t anchor_index = 0; anchor_index < config.voxel_features.cave_anchor_count; ++anchor_index) {
+        anchors.push_back(plate_guided_cave_anchor_direction(
+            anchor_index,
+            config.voxel_features.cave_anchor_count,
+            config,
+            plate_centers
+        ));
+    }
+    return anchors;
 }
 
 void build_global_fracture_seeds(
@@ -1561,18 +1763,6 @@ void emit_fracture_shard_walls(
     }
 }
 
-const LocalVoxelFeature* cave_feature_for_cell(
-    const std::vector<LocalVoxelFeature>& features,
-    uint32_t cell_id
-) {
-    for (const LocalVoxelFeature& feature : features) {
-        if (feature.kind == VoxelFeatureKind::CaveSystem && feature.owner_cell_id == cell_id) {
-            return &feature;
-        }
-    }
-    return nullptr;
-}
-
 bool point_inside_cave_entrance(Vec3 position, const LocalVoxelFeature& feature, float scale = 1.0f) {
     const Vec3 offset = position - feature.center_mesh;
     const float tangent_distance = std::sqrt(
@@ -1591,6 +1781,20 @@ bool local_triangle_inside_cave_entrance(
     const Vec2 centroid = (triangle[0] + triangle[1] + triangle[2]) * (1.0f / 3.0f);
     const Vec3 position = normalize(local_to_world(cell_center, frame, {centroid.x, centroid.y, 0.0f}));
     return point_inside_cave_entrance(position, feature, 0.98f);
+}
+
+bool local_triangle_inside_any_cave_entrance(
+    const std::array<Vec2, 3>& triangle,
+    Vec3 cell_center,
+    const Frame& frame,
+    const std::vector<const LocalVoxelFeature*>& cave_features
+) {
+    for (const LocalVoxelFeature* feature : cave_features) {
+        if (feature != nullptr && local_triangle_inside_cave_entrance(triangle, cell_center, frame, *feature)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void append_cave_rim_quad(
@@ -1759,8 +1963,13 @@ void emit_subdivided_goldberg_cell_plane(
             emit_fracture_shard_walls(mesh, cell_id, shard, cell.center, frame, cell_polygon, surface_radius, config, cache);
         }
     }
-    const LocalVoxelFeature* cave_feature = cave_feature_for_cell(voxel_features, cell_id);
-    if (cave_feature != nullptr) {
+    std::vector<const LocalVoxelFeature*> cell_cave_features;
+    for (const LocalVoxelFeature& feature : voxel_features) {
+        if (feature.kind == VoxelFeatureKind::CaveSystem && feature.owner_cell_id == cell_id) {
+            cell_cave_features.push_back(&feature);
+        }
+    }
+    for (const LocalVoxelFeature* cave_feature : cell_cave_features) {
         emit_cave_entrance_rim(mesh, cell_id, *cave_feature, surface_radius);
     }
 
@@ -1780,7 +1989,7 @@ void emit_subdivided_goldberg_cell_plane(
                         subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step + 1, b_step, subdivisions),
                         subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                     }};
-                    if (cave_feature == nullptr || !local_triangle_inside_cave_entrance(tri0, cell.center, frame, *cave_feature)) {
+                    if (!local_triangle_inside_any_cave_entrance(tri0, cell.center, frame, cell_cave_features)) {
                         for (const FractureShard& shard : shards) {
                             emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri0, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, cache, material_id);
                         }
@@ -1791,7 +2000,7 @@ void emit_subdivided_goldberg_cell_plane(
                         subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step + 1, b_step, subdivisions),
                         subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                     }};
-                    if (cave_feature != nullptr && local_triangle_inside_cave_entrance(tri0, cell.center, frame, *cave_feature)) {
+                    if (local_triangle_inside_any_cave_entrance(tri0, cell.center, frame, cell_cave_features)) {
                         continue;
                     }
                     const Vec3 p0 = subdivided_cell_vertex(center, edge_a, edge_b, a_step, b_step, subdivisions, surface_radius);
@@ -1807,7 +2016,7 @@ void emit_subdivided_goldberg_cell_plane(
                             subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step + 1, b_step + 1, subdivisions),
                             subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                         }};
-                        if (cave_feature == nullptr || !local_triangle_inside_cave_entrance(tri1, cell.center, frame, *cave_feature)) {
+                        if (!local_triangle_inside_any_cave_entrance(tri1, cell.center, frame, cell_cave_features)) {
                             for (const FractureShard& shard : shards) {
                                 emit_fractured_local_triangle(mesh, boundary_edges, cell_id, tri1, shard, cell.center, cell.normal, frame, cell_polygon, surface_radius, config, cache, material_id);
                             }
@@ -1818,7 +2027,7 @@ void emit_subdivided_goldberg_cell_plane(
                             subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step + 1, b_step + 1, subdivisions),
                             subdivided_cell_local_vertex(local_edge_a, local_edge_b, a_step, b_step + 1, subdivisions),
                         }};
-                        if (cave_feature != nullptr && local_triangle_inside_cave_entrance(tri1, cell.center, frame, *cave_feature)) {
+                        if (local_triangle_inside_any_cave_entrance(tri1, cell.center, frame, cell_cave_features)) {
                             continue;
                         }
                         const Vec3 p1 = subdivided_cell_vertex(center, edge_a, edge_b, a_step + 1, b_step, subdivisions, surface_radius);
@@ -2845,7 +3054,7 @@ std::vector<PreparedVoxelDig> prepare_voxel_digs(const VoxelEditSet& edits, floa
     prepared.reserve(edits.digs.size());
     const float leaf_radius = std::sqrt(3.0f) * voxel_size * 0.5f;
     for (const VoxelDigEdit& dig : edits.digs) {
-        if (dig.radius_km <= 0.0f) {
+        if (dig.radius_km <= 0.0f || !dig_target_matches(dig, VoxelDigTarget::Terrain)) {
             continue;
         }
         const float radius_mesh = kilometers_to_world_units(dig.radius_km);
@@ -2862,7 +3071,7 @@ std::vector<PreparedVoxelDig> prepare_exact_voxel_digs(const VoxelEditSet& edits
     std::vector<PreparedVoxelDig> prepared;
     prepared.reserve(edits.digs.size());
     for (const VoxelDigEdit& dig : edits.digs) {
-        if (dig.radius_km <= 0.0f) {
+        if (dig.radius_km <= 0.0f || !dig_target_matches(dig, VoxelDigTarget::Terrain)) {
             continue;
         }
         const float radius_mesh = kilometers_to_world_units(dig.radius_km);
@@ -2873,6 +3082,97 @@ std::vector<PreparedVoxelDig> prepare_exact_voxel_digs(const VoxelEditSet& edits
         });
     }
     return prepared;
+}
+
+bool terrain_height_mask_project(const TerrainHeightMask& mask, Vec3 position, float& px, float& py) {
+    if (mask.resolution == 0u ||
+        mask.radius_km <= 0.0f ||
+        mask.heights.size() != static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution) ||
+        length(mask.center_mesh) <= 0.000001f ||
+        length(position) <= 0.000001f) {
+        return false;
+    }
+
+    const float radius_mesh = kilometers_to_world_units(mask.radius_km);
+    const Vec3 relative = normalize(position) - normalize(mask.center_mesh);
+    const float u = dot(relative, mask.tangent_mesh) / (radius_mesh * 2.0f) + 0.5f;
+    const float v = dot(relative, mask.bitangent_mesh) / (radius_mesh * 2.0f) + 0.5f;
+    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
+        return false;
+    }
+
+    px = u * static_cast<float>(mask.resolution - 1u);
+    py = v * static_cast<float>(mask.resolution - 1u);
+    return true;
+}
+
+bool terrain_height_mask_carves(const TerrainHeightMask& mask, Vec3 position) {
+    float px = 0.0f;
+    float py = 0.0f;
+    if (!terrain_height_mask_project(mask, position, px, py)) {
+        return false;
+    }
+
+    const uint32_t x = std::clamp(static_cast<uint32_t>(std::lround(px)), 0u, mask.resolution - 1u);
+    const uint32_t y = std::clamp(static_cast<uint32_t>(std::lround(py)), 0u, mask.resolution - 1u);
+    return mask.heights[static_cast<size_t>(y) * mask.resolution + x] == 0u;
+}
+
+bool terrain_height_masks_carve(Vec3 position, const std::vector<TerrainHeightMask>& masks) {
+    for (const TerrainHeightMask& mask : masks) {
+        if (terrain_height_mask_carves(mask, position)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool terrain_height_mask_hole_footprint(const TerrainHeightMask& mask, Vec3& center, float& radius) {
+    center = {};
+    radius = 0.0f;
+    if (mask.resolution == 0u ||
+        mask.radius_km <= 0.0f ||
+        mask.heights.size() != static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution) ||
+        length(mask.center_mesh) <= 0.000001f) {
+        return false;
+    }
+
+    uint32_t min_x = mask.resolution;
+    uint32_t min_y = mask.resolution;
+    uint32_t max_x = 0u;
+    uint32_t max_y = 0u;
+    bool any_hole = false;
+    for (uint32_t y = 0; y < mask.resolution; ++y) {
+        for (uint32_t x = 0; x < mask.resolution; ++x) {
+            if (mask.heights[static_cast<size_t>(y) * mask.resolution + x] != 0u) {
+                continue;
+            }
+            min_x = std::min(min_x, x);
+            min_y = std::min(min_y, y);
+            max_x = std::max(max_x, x);
+            max_y = std::max(max_y, y);
+            any_hole = true;
+        }
+    }
+    if (!any_hole) {
+        return false;
+    }
+
+    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
+    auto local_coord = [&](uint32_t value) {
+        return ((static_cast<float>(value) / resolution_minus_one) - 0.5f) * kilometers_to_world_units(mask.radius_km) * 2.0f;
+    };
+    const float min_local_x = local_coord(min_x);
+    const float max_local_x = local_coord(max_x);
+    const float min_local_y = local_coord(min_y);
+    const float max_local_y = local_coord(max_y);
+    const Vec3 local_center =
+        mask.tangent_mesh * ((min_local_x + max_local_x) * 0.5f) +
+        mask.bitangent_mesh * ((min_local_y + max_local_y) * 0.5f);
+    center = normalize(normalize(mask.center_mesh) + local_center);
+    radius = length(mask.tangent_mesh * ((max_local_x - min_local_x) * 0.5f) +
+                    mask.bitangent_mesh * ((max_local_y - min_local_y) * 0.5f));
+    return radius > 0.0f;
 }
 
 uint32_t apply_voxel_dig_edits(
@@ -2918,12 +3218,12 @@ uint32_t apply_exact_voxel_dig_edits(
     float voxel_size,
     const VoxelEditSet& edits
 ) {
-    if (keys.empty() || edits.digs.empty()) {
+    if (keys.empty()) {
         return 0;
     }
 
     const std::vector<PreparedVoxelDig> digs = prepare_exact_voxel_digs(edits);
-    if (digs.empty()) {
+    if (digs.empty() && edits.terrain_masks.empty()) {
         return 0;
     }
 
@@ -2938,6 +3238,9 @@ uint32_t apply_exact_voxel_dig_edits(
                     if (length(center - dig.center_mesh) <= dig.radius_mesh) {
                         return true;
                     }
+                }
+                if (terrain_height_masks_carve(center, edits.terrain_masks)) {
+                    return true;
                 }
                 return false;
             }
@@ -3479,6 +3782,135 @@ bool depth8_key_in_promoted_patches(VoxelKey key, const std::vector<LocalSurface
     return false;
 }
 
+VoxelEditSet promoted_terrain_dig_edits(const MarchingCubesConfig& config) {
+    VoxelEditSet promoted;
+    promoted.local_depth = config.voxel_edits.local_depth;
+    const float promotion_radius_mesh = kilometers_to_world_units(std::max(0.0f, config.terrain_svo_promotion_radius_km));
+    if (promotion_radius_mesh <= 0.0f) {
+        return promoted;
+    }
+
+    struct TerrainDigRef {
+        Vec3 center;
+        float radius = 0.0f;
+        uint32_t depth = MaxSvoDepth;
+        size_t mask_index = std::numeric_limits<size_t>::max();
+    };
+
+    std::vector<TerrainDigRef> terrain_digs;
+    terrain_digs.reserve(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size());
+    for (const VoxelDigEdit& dig : config.voxel_edits.digs) {
+        if (!dig_target_matches(dig, VoxelDigTarget::Terrain) || dig.radius_km <= 0.0f || length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        terrain_digs.push_back({
+            dig.center_mesh,
+            kilometers_to_world_units(dig.radius_km),
+            std::clamp(dig.depth > 0u ? dig.depth : config.voxel_edits.local_depth, 1u, MaxSvoDepth),
+            std::numeric_limits<size_t>::max(),
+        });
+    }
+    for (size_t mask_index = 0; mask_index < config.voxel_edits.terrain_masks.size(); ++mask_index) {
+        Vec3 center{};
+        float radius = 0.0f;
+        if (!terrain_height_mask_hole_footprint(config.voxel_edits.terrain_masks[mask_index], center, radius)) {
+            continue;
+        }
+        terrain_digs.push_back({
+            center,
+            radius,
+            std::clamp(config.voxel_edits.local_depth, 1u, MaxSvoDepth),
+            mask_index,
+        });
+    }
+    if (terrain_digs.empty()) {
+        return promoted;
+    }
+
+    std::vector<uint8_t> visited(terrain_digs.size(), 0u);
+    std::vector<size_t> stack;
+    std::vector<size_t> cluster;
+    for (size_t start = 0; start < terrain_digs.size(); ++start) {
+        if (visited[start] != 0u) {
+            continue;
+        }
+
+        stack.clear();
+        cluster.clear();
+        visited[start] = 1u;
+        stack.push_back(start);
+        while (!stack.empty()) {
+            const size_t current = stack.back();
+            stack.pop_back();
+            cluster.push_back(current);
+            for (size_t candidate = 0; candidate < terrain_digs.size(); ++candidate) {
+                if (visited[candidate] != 0u) {
+                    continue;
+                }
+                const float distance = length(terrain_digs[current].center - terrain_digs[candidate].center);
+                if (distance <= terrain_digs[current].radius + terrain_digs[candidate].radius) {
+                    visited[candidate] = 1u;
+                    stack.push_back(candidate);
+                }
+            }
+        }
+
+        Vec3 center_sum{};
+        float weight_sum = 0.0f;
+        uint32_t depth = 1u;
+        bool cluster_has_circular_dig = false;
+        for (size_t index : cluster) {
+            const float weight = std::max(terrain_digs[index].radius, 0.000001f);
+            center_sum = center_sum + terrain_digs[index].center * weight;
+            weight_sum += weight;
+            depth = std::max(depth, terrain_digs[index].depth);
+            cluster_has_circular_dig = cluster_has_circular_dig ||
+                terrain_digs[index].mask_index == std::numeric_limits<size_t>::max();
+        }
+        if (weight_sum <= 0.0f || length(center_sum) <= 0.000001f) {
+            continue;
+        }
+
+        const Vec3 cluster_center = center_sum * (1.0f / weight_sum);
+        float cluster_radius = 0.0f;
+        for (size_t index : cluster) {
+            cluster_radius = std::max(cluster_radius, length(terrain_digs[index].center - cluster_center) + terrain_digs[index].radius);
+        }
+        if (cluster_radius < promotion_radius_mesh) {
+            continue;
+        }
+
+        if (cluster_has_circular_dig) {
+            promoted.digs.push_back({
+                cluster_center,
+                world_units_to_kilometers(cluster_radius),
+                depth,
+                VoxelDigTarget::Terrain,
+            });
+        }
+        for (size_t index : cluster) {
+            const size_t mask_index = terrain_digs[index].mask_index;
+            if (mask_index == std::numeric_limits<size_t>::max()) {
+                continue;
+            }
+            const TerrainHeightMask& mask = config.voxel_edits.terrain_masks[mask_index];
+            const bool already_added = std::any_of(
+                promoted.terrain_masks.begin(),
+                promoted.terrain_masks.end(),
+                [&](const TerrainHeightMask& existing) {
+                    return existing.revision == mask.revision &&
+                           length(existing.center_mesh - mask.center_mesh) <= 0.000001f;
+                }
+            );
+            if (!already_added) {
+                promoted.terrain_masks.push_back(mask);
+            }
+        }
+    }
+
+    return promoted;
+}
+
 std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const MarchingCubesConfig& config, float grid_radius) {
     std::vector<LocalSurfaceNetPatch> patches;
     if (!config.enable_local_surface_net_detail || config.local_surface_net_max_patches == 0u) {
@@ -3561,16 +3993,16 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
     const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
         ? normalize(config.lod_camera_position)
         : Vec3{0.0f, 0.0f, 1.0f};
-    if (config.voxel_edits.digs.empty() && fallback_depth >= MaxSvoDepth) {
+    if (config.voxel_edits.digs.empty() && config.voxel_edits.terrain_masks.empty() && fallback_depth >= MaxSvoDepth) {
         const float startup_radius = kilometers_to_world_units(config.local_surface_net_patch_radius_km);
         add_patch(camera_center, startup_radius, fallback_depth, true);
     }
 
     std::vector<DigCandidate> dig_candidates;
-    dig_candidates.reserve(config.voxel_edits.digs.size());
+    dig_candidates.reserve(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size());
     for (uint32_t i = 0; i < config.voxel_edits.digs.size(); ++i) {
         const VoxelDigEdit& dig = config.voxel_edits.digs[i];
-        if (length(dig.center_mesh) <= 0.000001f) {
+        if (!dig_target_matches(dig, VoxelDigTarget::Terrain) || length(dig.center_mesh) <= 0.000001f) {
             continue;
         }
         const float radius_mesh = kilometers_to_world_units(dig.radius_km);
@@ -3583,6 +4015,20 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
             length(normalize(dig.center_mesh) - camera_center),
             static_cast<uint32_t>(config.voxel_edits.digs.size() - i),
             std::clamp(dig.depth > 0u ? dig.depth : fallback_depth, 1u, MaxSvoDepth),
+        });
+    }
+    for (uint32_t i = 0; i < config.voxel_edits.terrain_masks.size(); ++i) {
+        Vec3 center{};
+        float radius_mesh = 0.0f;
+        if (!terrain_height_mask_hole_footprint(config.voxel_edits.terrain_masks[i], center, radius_mesh)) {
+            continue;
+        }
+        dig_candidates.push_back({
+            center,
+            radius_mesh,
+            length(normalize(center) - camera_center),
+            static_cast<uint32_t>(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size() - i),
+            fallback_depth,
         });
     }
     std::sort(
@@ -4303,6 +4749,9 @@ float cave_air_sdf(const LocalVoxelFeature& feature, Vec3 local, const VoxelEdit
     sdf = std::min(sdf, length(local - lobe_center) - chamber_radius * 0.48f);
 
     for (const VoxelDigEdit& dig : edits.digs) {
+        if (!dig_target_matches(dig, VoxelDigTarget::CaveInterior)) {
+            continue;
+        }
         const Vec3 edit_local = cave_world_to_local(feature, dig.center_mesh);
         const float edit_radius = kilometers_to_world_units(dig.radius_km);
         if (std::fabs(edit_local.z - local.z) > edit_radius + chamber_radius) {
@@ -4365,6 +4814,9 @@ CaveAirField build_cave_air_field(const LocalVoxelFeature& feature, const VoxelE
 
     field.edits.reserve(edits.digs.size());
     for (const VoxelDigEdit& dig : edits.digs) {
+        if (!dig_target_matches(dig, VoxelDigTarget::CaveInterior)) {
+            continue;
+        }
         field.edits.push_back({
             cave_world_to_local(feature, dig.center_mesh),
             kilometers_to_world_units(dig.radius_km),
@@ -4522,6 +4974,12 @@ uint32_t cave_surface_net_resolution(uint32_t depth) {
     if (depth >= 13u) {
         return 88u;
     }
+    if (depth <= 4u) {
+        return 24u;
+    }
+    if (depth <= 8u) {
+        return 36u;
+    }
     return 56u;
 }
 
@@ -4561,7 +5019,8 @@ SurfaceNetMesh build_cave_surface_net_feature(
         (local_min.y + local_max.y - padded_size.y) * 0.5f,
         (local_min.z + local_max.z - padded_size.z) * 0.5f,
     };
-    const CaveAirField air_field = build_cave_air_field(feature, config.voxel_edits);
+    CaveAirField air_field = build_cave_air_field(feature, config.voxel_edits);
+    air_field.tunnel_z0 = origin.z - step * 2.0f;
 
     const uint32_t grid_count = resolution * resolution * resolution;
     std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
@@ -5087,6 +5546,98 @@ void append_surface_net_triangle(
     surface_net.triangle_indices.push_back(base + 2u);
 }
 
+Vec3 terrain_mask_surface_point(const TerrainHeightMask& mask, float px, float py, float surface_radius) {
+    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
+    const float clamped_x = std::clamp(px, 0.0f, resolution_minus_one);
+    const float clamped_y = std::clamp(py, 0.0f, resolution_minus_one);
+    const float radius_mesh = kilometers_to_world_units(mask.radius_km);
+    const float local_x = (clamped_x / resolution_minus_one - 0.5f) * radius_mesh * 2.0f;
+    const float local_y = (clamped_y / resolution_minus_one - 0.5f) * radius_mesh * 2.0f;
+    return normalize(normalize(mask.center_mesh) + mask.tangent_mesh * local_x + mask.bitangent_mesh * local_y) * surface_radius;
+}
+
+bool terrain_mask_pixel_is_hole(const TerrainHeightMask& mask, int32_t x, int32_t y) {
+    if (x < 0 || y < 0 || x >= static_cast<int32_t>(mask.resolution) || y >= static_cast<int32_t>(mask.resolution)) {
+        return false;
+    }
+    return mask.heights[static_cast<size_t>(y) * mask.resolution + static_cast<uint32_t>(x)] == 0u;
+}
+
+void append_terrain_mask_svo_fill(
+    SurfaceNetMesh& surface_net,
+    const LocalSurfaceNetPatch& patch,
+    const MarchingCubesConfig& config,
+    float surface_radius,
+    float wall_depth,
+    uint32_t depth_tag
+) {
+    if (!patch.replace_surface || config.voxel_edits.terrain_masks.empty() || wall_depth <= 0.0f) {
+        return;
+    }
+
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    const float fill_depth = std::min(wall_depth, kilometers_to_world_units(6.0f));
+    const float top_radius = surface_radius + kilometers_to_world_units(0.05f);
+    const float bottom_radius = std::max(0.0f, surface_radius - fill_depth);
+
+    auto append_quad = [&](Vec3 a, Vec3 b, Vec3 c, Vec3 d, Vec3 preferred_normal) {
+        append_surface_net_triangle(surface_net, a, b, c, preferred_normal, max_vertices, depth_tag);
+        append_surface_net_triangle(surface_net, a, c, d, preferred_normal, max_vertices, depth_tag);
+    };
+
+    for (const TerrainHeightMask& mask : config.voxel_edits.terrain_masks) {
+        Vec3 footprint_center{};
+        float footprint_radius = 0.0f;
+        if (!terrain_height_mask_hole_footprint(mask, footprint_center, footprint_radius)) {
+            continue;
+        }
+        if (length(footprint_center - patch.center_mesh) > patch.extraction_radius_mesh + footprint_radius) {
+            continue;
+        }
+
+        const int32_t resolution = static_cast<int32_t>(mask.resolution);
+        for (int32_t y = 0; y < resolution; ++y) {
+            for (int32_t x = 0; x < resolution; ++x) {
+                if (!terrain_mask_pixel_is_hole(mask, x, y)) {
+                    continue;
+                }
+
+                const float x0 = static_cast<float>(x) - 0.5f;
+                const float x1 = static_cast<float>(x) + 0.5f;
+                const float y0 = static_cast<float>(y) - 0.5f;
+                const float y1 = static_cast<float>(y) + 0.5f;
+
+                struct Edge {
+                    int32_t nx;
+                    int32_t ny;
+                    float ax;
+                    float ay;
+                    float bx;
+                    float by;
+                };
+                constexpr std::array<Edge, 4> Edges = {{
+                    {-1, 0, -0.5f, -0.5f, -0.5f,  0.5f},
+                    { 1, 0,  0.5f,  0.5f,  0.5f, -0.5f},
+                    {0, -1,  0.5f, -0.5f, -0.5f, -0.5f},
+                    {0,  1, -0.5f,  0.5f,  0.5f,  0.5f},
+                }};
+
+                for (const Edge& edge : Edges) {
+                    if (terrain_mask_pixel_is_hole(mask, x + edge.nx, y + edge.ny)) {
+                        continue;
+                    }
+                    const Vec3 top_a = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.ax, static_cast<float>(y) + edge.ay, top_radius);
+                    const Vec3 top_b = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.bx, static_cast<float>(y) + edge.by, top_radius);
+                    const Vec3 bottom_a = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.ax, static_cast<float>(y) + edge.ay, bottom_radius);
+                    const Vec3 bottom_b = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.bx, static_cast<float>(y) + edge.by, bottom_radius);
+                    const Vec3 wall_normal = normalize(cross(top_b - top_a, bottom_a - top_a));
+                    append_quad(top_a, top_b, bottom_b, bottom_a, wall_normal);
+                }
+            }
+        }
+    }
+}
+
 void append_local_surface_net_transition_fill(
     SurfaceNetMesh& surface_net,
     const LocalSurfaceNetPatch& patch,
@@ -5480,7 +6031,14 @@ Vec3 local_surface_net_sample_position(uint32_t x, uint32_t y, uint32_t z, Vec3 
     };
 }
 
-bool local_surface_net_sample_carved(Vec3 position, const std::vector<PreparedVoxelDig>& digs) {
+bool local_surface_net_sample_carved(
+    Vec3 position,
+    const std::vector<PreparedVoxelDig>& digs,
+    const std::vector<TerrainHeightMask>& masks
+) {
+    if (terrain_height_masks_carve(position, masks)) {
+        return true;
+    }
     for (const PreparedVoxelDig& dig : digs) {
         if (length(dig.center_mesh) <= 0.000001f) {
             continue;
@@ -5520,9 +6078,10 @@ void push_local_voxel_key(
     Vec3 origin,
     float voxel_size,
     uint32_t resolution,
-    const std::vector<PreparedVoxelDig>& digs
+    const std::vector<PreparedVoxelDig>& digs,
+    const std::vector<TerrainHeightMask>& masks
 ) {
-    if (length(position - patch.center_mesh) > patch.extraction_radius_mesh || local_surface_net_sample_carved(position, digs)) {
+    if (length(position - patch.center_mesh) > patch.extraction_radius_mesh || local_surface_net_sample_carved(position, digs, masks)) {
         return;
     }
 
@@ -5540,7 +6099,8 @@ void add_local_voxelized_triangles(
     Vec3 origin,
     float voxel_size,
     uint32_t resolution,
-    const std::vector<PreparedVoxelDig>& digs
+    const std::vector<PreparedVoxelDig>& digs,
+    const std::vector<TerrainHeightMask>& masks
 ) {
     const Vec3 patch_min = origin;
     const Vec3 patch_max = origin + Vec3{
@@ -5577,13 +6137,13 @@ void add_local_voxelized_triangles(
                 const float u = static_cast<float>(u_step) / static_cast<float>(steps);
                 const float v = static_cast<float>(v_step) / static_cast<float>(steps);
                 const float w = 1.0f - u - v;
-                push_local_voxel_key(keys, a * u + b * v + c * w, patch, origin, voxel_size, resolution, digs);
+                push_local_voxel_key(keys, a * u + b * v + c * w, patch, origin, voxel_size, resolution, digs, masks);
             }
         }
-        push_local_voxel_key(keys, (a + b + c) / 3.0f, patch, origin, voxel_size, resolution, digs);
-        push_local_voxel_key(keys, (a + b) * 0.5f, patch, origin, voxel_size, resolution, digs);
-        push_local_voxel_key(keys, (b + c) * 0.5f, patch, origin, voxel_size, resolution, digs);
-        push_local_voxel_key(keys, (c + a) * 0.5f, patch, origin, voxel_size, resolution, digs);
+        push_local_voxel_key(keys, (a + b + c) / 3.0f, patch, origin, voxel_size, resolution, digs, masks);
+        push_local_voxel_key(keys, (a + b) * 0.5f, patch, origin, voxel_size, resolution, digs, masks);
+        push_local_voxel_key(keys, (b + c) * 0.5f, patch, origin, voxel_size, resolution, digs, masks);
+        push_local_voxel_key(keys, (c + a) * 0.5f, patch, origin, voxel_size, resolution, digs, masks);
     }
 }
 
@@ -5595,7 +6155,8 @@ void fill_local_radial_occupancy(
     float voxel_size,
     uint32_t resolution,
     float surface_radius,
-    const std::vector<PreparedVoxelDig>& digs
+    const std::vector<PreparedVoxelDig>& digs,
+    const std::vector<TerrainHeightMask>& masks
 ) {
     const float shell_radius = patch.extraction_radius_mesh + std::sqrt(3.0f) * voxel_size;
     const bool use_replacement_bounds = !patch.promoted_depth8_keys.empty();
@@ -5606,7 +6167,7 @@ void fill_local_radial_occupancy(
                 const Vec3 position = local_surface_net_sample_position(x, y, z, origin, voxel_size);
                 if ((!use_replacement_bounds && length(position - patch.center_mesh) > shell_radius) ||
                     length(position) > surface_radius ||
-                    local_surface_net_sample_carved(position, digs)) {
+                    local_surface_net_sample_carved(position, digs, masks)) {
                     continue;
                 }
                 set_surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
@@ -5778,6 +6339,14 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
     surface_net.source_depth = depth;
     surface_net.bounds_radius = grid_radius;
     surface_net.material_id = config.surface_net_material_id;
+    if (!config.voxel_edits.terrain_masks.empty()) {
+        const float mask_fill_depth = std::max(voxel_size * 4.0f, kilometers_to_world_units(4.0f));
+        append_terrain_mask_svo_fill(surface_net, patch, config, replaced_surface_radius, mask_fill_depth, depth);
+        surface_net.occupied_voxel_count = static_cast<uint32_t>(surface_net.vertices.size());
+        surface_net.candidate_cube_count = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
+        return surface_net;
+    }
+
     surface_net.vertices.reserve(std::min<uint32_t>((u_segments + 1u) * (v_segments + 1u), max_vertices));
     surface_net.normals.reserve(surface_net.vertices.capacity());
     surface_net.vertex_depths.reserve(surface_net.vertices.capacity());
@@ -5787,6 +6356,9 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         return normalize(plane_origin + tangent * u + bitangent * v) * replaced_surface_radius;
     };
     auto sample_carved = [&](Vec3 position) {
+        if (terrain_height_masks_carve(position, config.voxel_edits.terrain_masks)) {
+            return true;
+        }
         for (const PreparedVoxelDig& dig : digs) {
             if (length(dig.center_mesh) <= 0.000001f) {
                 continue;
@@ -5913,6 +6485,8 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         }
     }
 
+    append_terrain_mask_svo_fill(surface_net, patch, config, replaced_surface_radius, wall_depth, depth);
+
     surface_net.occupied_voxel_count = static_cast<uint32_t>(surface_net.vertices.size());
     surface_net.candidate_cube_count = static_cast<uint32_t>(u_segments * v_segments);
     return surface_net;
@@ -5956,11 +6530,12 @@ SurfaceNetMesh build_local_surface_net_patch_mesh(
             voxel_size,
             resolution,
             1.0f,
-            digs
+            digs,
+            config.voxel_edits.terrain_masks
         );
     } else {
-        add_local_voxelized_triangles(occupied_keys, mesh, mesh.triangle_indices, patch, origin, voxel_size, resolution, digs);
-        add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs);
+        add_local_voxelized_triangles(occupied_keys, mesh, mesh.triangle_indices, patch, origin, voxel_size, resolution, digs, config.voxel_edits.terrain_masks);
+        add_local_voxelized_triangles(occupied_keys, mesh, mesh.stitch_triangle_indices, patch, origin, voxel_size, resolution, digs, config.voxel_edits.terrain_masks);
     }
 
     sort_and_unique_voxel_keys(occupied_keys);
@@ -6340,20 +6915,39 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
         return;
     }
 
-    if (config.voxel_features.enabled) {
-        generate_cave_feature_voxels(mesh, config);
+    const VoxelEditSet promoted_terrain_edits = promoted_terrain_dig_edits(config);
+    const bool should_build_exterior_replacement =
+        config.enable_exterior_surface_net_replacement ||
+        !promoted_terrain_edits.digs.empty() ||
+        !promoted_terrain_edits.terrain_masks.empty();
+    const bool promoted_terrain_only =
+        !config.enable_exterior_surface_net_replacement &&
+        (!promoted_terrain_edits.digs.empty() || !promoted_terrain_edits.terrain_masks.empty());
+
+    if (config.voxel_features.enabled && !should_build_exterior_replacement) {
+        report_progress(config, 0.97f, "Cave interiors queued for streaming");
+        mesh.perf.cave_feature_count = static_cast<uint32_t>(mesh.voxel_features.size());
+        mesh.surface_net = {};
+        mesh.svo = {};
         mesh.perf.voxel_total_ms = elapsed_ms(voxel_begin);
         return;
     }
 
-    if (!config.enable_exterior_surface_net_replacement) {
+    if (!should_build_exterior_replacement) {
         report_progress(config, 0.97f, "Exterior SVO replacement disabled");
+        mesh.surface_net = {};
+        mesh.svo = {};
         mesh.perf.voxel_total_ms = elapsed_ms(voxel_begin);
         return;
+    }
+
+    MarchingCubesConfig exterior_config = config;
+    if (!config.enable_exterior_surface_net_replacement) {
+        exterior_config.voxel_edits = promoted_terrain_edits;
     }
 
     report_progress(config, 0.52f, "Preparing voxel grid");
-    const uint32_t depth = std::clamp(config.svo_depth, 1u, MaxSvoDepth);
+    const uint32_t depth = std::clamp(exterior_config.svo_depth, 1u, MaxSvoDepth);
     const uint32_t resolution = 1u << depth;
     float grid_radius = mesh.voxel_occupancy_cache.depth == depth && mesh.voxel_occupancy_cache.bounds_radius > 0.0f
         ? mesh.voxel_occupancy_cache.bounds_radius
@@ -6365,7 +6959,7 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
         mesh.voxel_occupancy_cache.leaf_keys.empty()) {
         report_progress(config, 0.56f, depth >= MaxSvoDepth ? "Voxelizing depth-16 terrain triangles" : "Voxelizing depth-8 global backbone");
         const auto voxelize_begin = PerfClock::now();
-        mesh.voxel_occupancy_cache.leaf_keys = build_base_voxel_occupancy(mesh, grid_radius, voxel_size, resolution, config);
+        mesh.voxel_occupancy_cache.leaf_keys = build_base_voxel_occupancy(mesh, grid_radius, voxel_size, resolution, exterior_config);
         mesh.perf.exterior_voxelize_ms = elapsed_ms(voxelize_begin);
         mesh.voxel_occupancy_cache.bounds_radius = grid_radius;
         mesh.voxel_occupancy_cache.depth = depth;
@@ -6375,7 +6969,7 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
 
     report_progress(config, 0.66f, "Preparing surface-net patches");
     const std::vector<LocalSurfaceNetPatch> local_surface_net_patches = realized_local_surface_net_patches(
-        build_local_surface_net_patches(config, grid_radius),
+        build_local_surface_net_patches(exterior_config, grid_radius),
         grid_radius
     );
     const bool has_promoted_depth8_roots = std::any_of(
@@ -6385,14 +6979,14 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
             return patch.replace_surface && !patch.promoted_depth8_keys.empty();
         }
     );
-    const uint32_t surface_net_depth = std::clamp(std::min(config.surface_net_depth, depth), 1u, MaxSvoDepth);
+    const uint32_t surface_net_depth = std::clamp(std::min(exterior_config.surface_net_depth, depth), 1u, MaxSvoDepth);
     if (mesh.surface_net_base_cache.source_depth != surface_net_depth ||
         std::fabs(mesh.surface_net_base_cache.bounds_radius - grid_radius) > 0.000001f ||
-        mesh.surface_net_base_cache.material_id != config.surface_net_material_id ||
+        mesh.surface_net_base_cache.material_id != exterior_config.surface_net_material_id ||
         mesh.surface_net_base_cache.vertices.empty()) {
         report_progress(config, 0.72f, "Building base surface net");
         const auto surface_begin = PerfClock::now();
-        MarchingCubesConfig base_surface_config = config;
+        MarchingCubesConfig base_surface_config = exterior_config;
         base_surface_config.voxel_edits.digs.clear();
         const double base_surface_progress_end = has_promoted_depth8_roots ? 0.79 : 0.86;
         mesh.surface_net_base_cache = build_surface_net_mesh_from_occupancy(
@@ -6409,31 +7003,38 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     if (has_promoted_depth8_roots) {
         report_progress(config, 0.80f, "Replacing edited surface roots");
         const auto replacement_surface_begin = PerfClock::now();
-        MarchingCubesConfig promoted_surface_config = config;
-        promoted_surface_config.voxel_edits.digs.clear();
-        mesh.surface_net = build_surface_net_mesh_from_occupancy(
-            mesh.voxel_occupancy_cache.leaf_keys,
-            depth,
-            grid_radius,
-            promoted_surface_config,
-            local_surface_net_patches,
-            0.80,
-            0.85
-        );
+        if (promoted_terrain_only) {
+            mesh.surface_net = {};
+            mesh.surface_net.source_depth = surface_net_depth;
+            mesh.surface_net.bounds_radius = grid_radius;
+            mesh.surface_net.material_id = exterior_config.surface_net_material_id;
+        } else {
+            MarchingCubesConfig promoted_surface_config = exterior_config;
+            promoted_surface_config.voxel_edits.digs.clear();
+            mesh.surface_net = build_surface_net_mesh_from_occupancy(
+                mesh.voxel_occupancy_cache.leaf_keys,
+                depth,
+                grid_radius,
+                promoted_surface_config,
+                local_surface_net_patches,
+                0.80,
+                0.85
+            );
+        }
         mesh.perf.exterior_surface_net_ms += elapsed_ms(replacement_surface_begin);
     } else {
         mesh.surface_net = mesh.surface_net_base_cache;
     }
     mesh.surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
-    mesh.surface_net.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    mesh.surface_net.local_edit_depth = (config.voxel_edits.digs.empty() && config.voxel_edits.terrain_masks.empty()) ? 0u : config.voxel_edits.local_depth;
     if (has_promoted_depth8_roots) {
         report_progress(config, 0.86f, "Building local depth-16 patches");
-        append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, config);
+        append_local_surface_net_patches(mesh.surface_net, mesh, local_surface_net_patches, grid_radius, exterior_config);
     }
 
     report_progress(config, 0.91f, "Applying voxel edits");
     std::vector<VoxelKey> keys = mesh.voxel_occupancy_cache.leaf_keys;
-    const uint32_t dig_removed_leaf_count = apply_exact_voxel_dig_edits(keys, grid_radius, voxel_size, config.voxel_edits);
+    const uint32_t dig_removed_leaf_count = apply_exact_voxel_dig_edits(keys, grid_radius, voxel_size, exterior_config.voxel_edits);
 
     mesh.svo.bounds_radius = grid_radius;
     mesh.svo.depth = depth;
@@ -6443,7 +7044,7 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
     mesh.svo.occupied_leaf_count = static_cast<uint32_t>(keys.size());
     mesh.svo.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
     mesh.svo.dig_removed_leaf_count = dig_removed_leaf_count;
-    mesh.svo.local_edit_depth = config.voxel_edits.digs.empty() ? 0u : config.voxel_edits.local_depth;
+    mesh.svo.local_edit_depth = (config.voxel_edits.digs.empty() && config.voxel_edits.terrain_masks.empty()) ? 0u : config.voxel_edits.local_depth;
     if (!keys.empty()) {
         report_progress(config, 0.94f, "Building sparse voxel octree");
         const uint32_t debug_tree_depth = std::min(depth, mesh.svo.debug_draw_depth);
@@ -6456,6 +7057,26 @@ void generate_sparse_voxel_octree(QuantizedMesh& mesh, const MarchingCubesConfig
 }
 
 } // namespace
+
+SurfaceNetMesh build_cave_surface_net_for_feature(
+    const LocalVoxelFeature& feature,
+    MarchingCubesConfig config,
+    float grid_radius,
+    CaveFeatureBuildStats* stats
+) {
+    LocalVoxelFeature stream_feature = feature;
+    stream_feature.svo_depth = std::clamp(config.voxel_features.cave_depth, 1u, MaxSvoDepth);
+    config.progress_callback = {};
+    std::vector<VoxelKey> sign_changing_keys;
+    sign_changing_keys.reserve(24576u);
+    return build_cave_surface_net_feature(
+        stream_feature,
+        config,
+        grid_radius,
+        sign_changing_keys,
+        stats
+    );
+}
 
 QuantizedMesh build_quantized_marching_cubes(
     const GoldbergTopology& topology,
@@ -6475,8 +7096,9 @@ QuantizedMesh build_quantized_marching_cubes(
     mesh.lod_level_count = (config.enable_lod_subdivision_test || config.enable_camera_proximity_lod) ? std::max(1u, config.lod_levels) : 1u;
     std::vector<FractureSeed> fracture_seed_scratch;
     std::vector<FractureShard> fracture_shard_scratch;
-    mesh.voxel_features = build_local_voxel_features(topology, config);
-    mesh.cave_anchor_points = build_cave_anchor_points(topology, config);
+    mesh.cave_anchor_points = build_cave_anchor_points(config);
+    mesh.voxel_features = build_local_voxel_features(topology, config, mesh.cave_anchor_points);
+    const std::vector<LocalVoxelFeature> baked_cave_features;
 
     const auto goldberg_begin = PerfClock::now();
     for (uint32_t cell_id = 0; cell_id < topology.cells.size(); ++cell_id) {
@@ -6499,7 +7121,7 @@ QuantizedMesh build_quantized_marching_cubes(
             fracture_cache,
             fracture_seed_scratch,
             fracture_shard_scratch,
-            mesh.voxel_features
+            baked_cave_features
         );
         if (config.enable_fractures) {
             mesh.perf.fracture_mesh_ms += elapsed_ms(cell_emit_begin);

@@ -12,14 +12,31 @@
 
 namespace ae {
 
+enum class VoxelDigTarget : uint8_t {
+    CaveInterior = 0,
+    Terrain = 1,
+};
+
 struct VoxelDigEdit {
     Vec3 center_mesh;
     float radius_km = 8.0f;
     uint32_t depth = 16;
+    VoxelDigTarget target = VoxelDigTarget::CaveInterior;
+};
+
+struct TerrainHeightMask {
+    Vec3 center_mesh;
+    Vec3 tangent_mesh;
+    Vec3 bitangent_mesh;
+    float radius_km = 64.0f;
+    uint32_t resolution = 128;
+    std::vector<uint16_t> heights;
+    uint32_t revision = 0;
 };
 
 struct VoxelEditSet {
     std::vector<VoxelDigEdit> digs;
+    std::vector<TerrainHeightMask> terrain_masks;
     uint32_t local_depth = 16;
 };
 
@@ -46,9 +63,9 @@ struct LocalVoxelFeature {
 struct VoxelFeatureSet {
     bool enabled = true;
     uint32_t seed = 1;
-    uint32_t cave_count = 6;
-    uint32_t cave_anchor_count = 1000000;
-    uint32_t cave_depth = 16;
+    uint32_t cave_count = 10000;
+    uint32_t cave_anchor_count = 10000;
+    uint32_t cave_depth = 4;
     float entrance_radius_km = 28.0f;
     float tunnel_radius_km = 18.0f;
     float chamber_radius_km = 48.0f;
@@ -121,6 +138,8 @@ struct MarchingCubesConfig {
     uint32_t local_surface_net_depth = 16;
     float local_surface_net_patch_radius_km = 160.0f;
     float local_surface_net_patch_overlap_km = 24.0f;
+    float terrain_svo_promotion_radius_km = 16.0f;
+    float terrain_height_stratosphere_km = 128.0f;
     uint32_t local_surface_net_max_patches = 8;
     VoxelEditSet voxel_edits;
     VoxelFeatureSet voxel_features;
@@ -273,6 +292,13 @@ QuantizedMesh build_quantized_marching_cubes(
 QuantizedMesh rebuild_quantized_mesh_voxels(
     QuantizedMesh mesh,
     const MarchingCubesConfig& config = {}
+);
+
+SurfaceNetMesh build_cave_surface_net_for_feature(
+    const LocalVoxelFeature& feature,
+    MarchingCubesConfig config,
+    float grid_radius,
+    CaveFeatureBuildStats* stats = nullptr
 );
 
 QuantizedMeshValidation validate_quantized_mesh(const QuantizedMesh& mesh);
