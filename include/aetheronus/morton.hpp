@@ -2,7 +2,17 @@
 
 #include <cstdint>
 
-#if defined(__BMI2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+#if defined(__AVX2__) || defined(__BMI2__)
+#define AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE 1
+#else
+#define AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE 0
+#endif
+#else
+#define AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE 0
+#endif
+
+#if defined(__BMI2__) || (defined(_MSC_VER) && AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE)
 #include <immintrin.h>
 #endif
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
@@ -66,7 +76,7 @@ AE_FORCE_INLINE uint64_t morton_encode(uint32_t x, uint32_t y, uint32_t z) {
     return _pdep_u64(x, 0x1249249249249249ull) |
            _pdep_u64(y, 0x2492492492492492ull) |
            _pdep_u64(z, 0x4924924924924924ull);
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+#elif defined(_MSC_VER) && AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE
     static const bool has_bmi2 = morton_cpu_has_bmi2();
     if (has_bmi2) {
         return _pdep_u64(x, 0x1249249249249249ull) |
@@ -84,7 +94,7 @@ AE_FORCE_INLINE void morton_decode(uint64_t code, uint32_t& x, uint32_t& y, uint
     x = static_cast<uint32_t>(_pext_u64(code, 0x1249249249249249ull));
     y = static_cast<uint32_t>(_pext_u64(code, 0x2492492492492492ull));
     z = static_cast<uint32_t>(_pext_u64(code, 0x4924924924924924ull));
-#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64))
+#elif defined(_MSC_VER) && AE_MORTON_MSVC_BMI2_FEATURE_AVAILABLE
     static const bool has_bmi2 = morton_cpu_has_bmi2();
     if (has_bmi2) {
         x = static_cast<uint32_t>(_pext_u64(code, 0x1249249249249249ull));
