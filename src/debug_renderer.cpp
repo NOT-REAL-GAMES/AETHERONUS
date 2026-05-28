@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -67,7 +68,8 @@ constexpr uint32_t VoxelComputeWorkgroupSize = 128u;
 constexpr uint32_t VoxelComputeMaxBoxes = 131072u;
 constexpr uint32_t CaveAnchorComputeWorkgroupSize = 128u;
 constexpr uint32_t CaveAnchorComputeMaxVisible = 10000u;
-constexpr uint32_t MaxTerrainHoles = 64u;
+constexpr uint32_t MaxTerrainHoles = 24u;
+constexpr uint32_t MaxCaveDigTransitions = 32u;
 constexpr uint32_t MaxTerrainHeightMasks = 16u;
 
 enum VoxelComputeFallbackCode : uint32_t {
@@ -102,6 +104,28 @@ float debug_hash_unit(uint32_t value) {
     return static_cast<float>(debug_hash_u32(value) & 0x00ffffffu) / static_cast<float>(0x01000000u);
 }
 
+float cave_transition_visual_radius_km(const LocalVoxelFeature& hole) {
+    return std::clamp(hole.entrance_radius_km * 1.05f, 3.0f, 72.0f);
+}
+
+float cave_transition_owner_radius_km(const LocalVoxelFeature& hole) {
+    const float owner_radius = std::max({
+        hole.entrance_radius_km * 1.08f,
+        hole.tunnel_radius_km * 1.45f,
+        cave_transition_visual_radius_km(hole),
+    });
+    return std::clamp(owner_radius, cave_transition_visual_radius_km(hole), 128.0f);
+}
+
+float cave_transition_feather_radius_km(const LocalVoxelFeature& hole, float owner_radius_km) {
+    const float feather = std::max({
+        hole.entrance_radius_km * 0.18f,
+        owner_radius_km * 0.08f,
+        1.5f,
+    });
+    return std::clamp(feather, 1.25f, 36.0f);
+}
+
 const char* VertexShaderSource = R"glsl(
 #version 330 core
 layout (location = 0) in vec3 a_position;
@@ -129,12 +153,54 @@ in vec3 v_position;
 uniform int u_point_style;
 uniform int u_terrain_hole_count;
 uniform vec4 u_terrain_holes[64];
+uniform vec4 u_terrain_transition_tangent[64];
+uniform vec4 u_terrain_transition_bitangent_seed[64];
+uniform vec4 u_terrain_transition_shape[64];
+uniform int u_cave_dig_count;
+uniform vec4 u_cave_dig_spheres[96];
+uniform vec4 u_cave_dig_planes[96];
 uniform int u_terrain_mask_count;
 uniform usampler2DArray u_terrain_height_masks;
 uniform vec4 u_terrain_mask_center_radius[16];
 uniform vec4 u_terrain_mask_tangent[16];
 uniform vec4 u_terrain_mask_bitangent[16];
 out vec4 frag_color;
+
+float transition_hash(vec2 p, float seed) {
+    return fract(sin(dot(p + vec2(seed, seed * 0.37), vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+float cave_tunnel_sdf(vec3 local, float entrance_radius, float tunnel_radius, float depth) {
+    float z0 = 0.0;
+    float z1 = depth;
+    float t = clamp((local.z - z0) / max(0.000001, z1 - z0), 0.0, 1.0);
+    float radius = mix(entrance_radius, tunnel_radius, t);
+    float radial = length(local.xy) - radius;
+    float lower_cap = z0 - local.z;
+    float upper_cap = local.z - z1;
+    return max(radial, max(lower_cap, upper_cap));
+}
+
+float cave_volume_sdf(vec3 local, vec4 shape, float seed) {
+    float entrance_radius = max(shape.x, 0.001);
+    float tunnel_radius = max(shape.y, 0.001);
+    float chamber_radius = max(shape.z, 0.001);
+    float depth = max(shape.w, 0.001);
+
+    float sdf = cave_tunnel_sdf(local, entrance_radius, tunnel_radius, depth);
+    float side_angle = transition_hash(vec2(seed, seed * 1.71), 13.0) * 6.28318530718;
+    vec3 chamber_center = vec3(cos(side_angle) * chamber_radius * 0.42,
+                               sin(side_angle) * chamber_radius * 0.42,
+                               depth * 0.86);
+    sdf = min(sdf, length(local - chamber_center) - chamber_radius);
+
+    float lobe_angle = transition_hash(vec2(seed * 0.37, seed * 2.11), 29.0) * 6.28318530718;
+    vec3 lobe_center = vec3(cos(lobe_angle) * chamber_radius * 0.72,
+                            sin(lobe_angle) * chamber_radius * 0.72,
+                            depth * 0.58);
+    sdf = min(sdf, length(local - lobe_center) - chamber_radius * 0.48);
+    return sdf;
+}
 
 void main() {
     vec3 color = v_color;
@@ -165,24 +231,120 @@ void main() {
     }
     if (u_point_style == 0 && u_terrain_hole_count > 0) {
         vec3 surface_dir = normalize(v_position);
+        float best_coverage = 0.0;
         float best_edge = 100000.0;
+        float best_seed = 0.0;
+        bool hard_discard = false;
         for (int i = 0; i < u_terrain_hole_count; ++i) {
-            vec3 hole_dir = normalize(u_terrain_holes[i].xyz);
-            float chord_radius = u_terrain_holes[i].w;
-            vec3 delta = surface_dir - hole_dir;
-            float dist = length(delta);
-            if (dot(surface_dir, hole_dir) > 0.0) {
-                best_edge = min(best_edge, dist / max(chord_radius, 0.000001));
+            vec3 hole_center = u_terrain_holes[i].xyz;
+            vec3 hole_dir = normalize(hole_center);
+            vec3 tangent = normalize(u_terrain_transition_tangent[i].xyz);
+            vec3 bitangent = normalize(u_terrain_transition_bitangent_seed[i].xyz);
+            float inner_radius = max(u_terrain_holes[i].w, 0.000001);
+            float feather_radius = max(u_terrain_transition_tangent[i].w, 0.000001);
+            float seed = u_terrain_transition_bitangent_seed[i].w;
+            float fragment_radius = length(v_position);
+            vec3 rel_from_opening = v_position - hole_center;
+            float local_depth = -dot(rel_from_opening, hole_dir);
+            vec3 cave_local = vec3(dot(rel_from_opening, tangent),
+                                   dot(rel_from_opening, bitangent),
+                                   local_depth);
+            float mouth_radius = u_terrain_transition_shape[i].x * 1.10;
+            float mouth_feather = max(u_terrain_transition_shape[i].x * 0.04, 0.75);
+            float mouth_depth = max(u_terrain_transition_shape[i].x * 0.36, 8.0);
+            float mouth_coverage =
+                (1.0 - smoothstep(mouth_radius, mouth_radius + mouth_feather, length(cave_local.xy))) *
+                smoothstep(-mouth_feather * 1.5, 0.0, local_depth) *
+                (1.0 - smoothstep(mouth_depth, mouth_depth + mouth_feather * 2.0, local_depth));
+            if (mouth_coverage > best_coverage) {
+                best_coverage = mouth_coverage;
+                best_edge = length(cave_local.xy) / max(mouth_radius, 0.001);
+                best_seed = seed;
+            }
+
+            float shape_sdf = cave_volume_sdf(cave_local, u_terrain_transition_shape[i], seed);
+            float shape_feather = max(u_terrain_transition_shape[i].x * 0.075, 1.0);
+            if (shape_sdf <= -shape_feather) {
+                hard_discard = true;
+            } else if (shape_sdf < 0.0 && local_depth <= mouth_depth + mouth_feather * 2.0) {
+                float shape_coverage = 1.0 - smoothstep(-shape_feather, 0.0, shape_sdf);
+                if (shape_coverage > best_coverage) {
+                    best_coverage = shape_coverage;
+                    best_edge = max((shape_sdf + shape_feather) / shape_feather, 0.0);
+                    best_seed = seed;
+                }
+            }
+
+            vec3 owner_center = hole_dir * fragment_radius;
+            vec3 rel_world = v_position - owner_center;
+            vec2 local_world = vec2(dot(rel_world, tangent), dot(rel_world, bitangent));
+            float dist_world = length(local_world);
+            float inner_world = inner_radius * fragment_radius;
+            float feather_world = feather_radius * fragment_radius;
+            float near_surface_depth = max(inner_world * 0.42, 5.0);
+            float depth_coverage = 1.0 - smoothstep(near_surface_depth, near_surface_depth + feather_world * 1.25, local_depth);
+            depth_coverage *= smoothstep(-feather_world * 0.45, feather_world * 0.25, local_depth);
+            if (dot(surface_dir, hole_dir) > 0.0 && dist_world <= inner_world + feather_world) {
+                float coverage = (1.0 - smoothstep(inner_world, inner_world + feather_world, dist_world)) * depth_coverage;
+                if (coverage > best_coverage) {
+                    best_coverage = coverage;
+                    best_edge = dist_world / inner_world;
+                    best_seed = seed;
+                }
+            }
+
+            vec3 rel = surface_dir - hole_dir;
+            vec2 local = vec2(dot(rel, tangent), dot(rel, bitangent));
+            float dist = length(local);
+            if (dot(surface_dir, hole_dir) > 0.0 && dist <= inner_radius + feather_radius) {
+                float coverage = 1.0 - smoothstep(inner_radius, inner_radius + feather_radius, dist);
+                if (coverage > best_coverage) {
+                    best_coverage = coverage;
+                    best_edge = dist / inner_radius;
+                    best_seed = seed;
+                }
             }
         }
-        if (best_edge <= 0.94) {
+        for (int i = 0; i < u_cave_dig_count; ++i) {
+            vec3 dig_center = u_cave_dig_spheres[i].xyz;
+            float dig_radius = max(u_cave_dig_spheres[i].w, 0.001);
+            vec3 dig_normal = normalize(u_cave_dig_planes[i].xyz);
+            float inward_side = u_cave_dig_planes[i].w - dot(v_position, dig_normal);
+            if (inward_side < -1.0) {
+                continue;
+            }
+            float dist = length(v_position - dig_center);
+            if (dist <= dig_radius) {
+                float coverage = smoothstep(-1.0, 1.0, inward_side);
+                if (coverage > best_coverage) {
+                    best_coverage = coverage;
+                    best_edge = 0.0;
+                    best_seed = float(i + 137);
+                }
+            } else if (dist <= dig_radius * 1.08) {
+                float coverage = (1.0 - smoothstep(dig_radius, dig_radius * 1.08, dist)) *
+                    smoothstep(-1.0, 1.0, inward_side);
+                if (coverage > best_coverage) {
+                    best_coverage = coverage;
+                    best_edge = dist / dig_radius;
+                    best_seed = float(i + 137);
+                }
+            }
+        }
+        if (hard_discard) {
             discard;
         }
-        if (best_edge <= 1.08) {
-            float blend = smoothstep(0.94, 1.08, best_edge);
-            vec3 cave_shadow = vec3(0.020, 0.012, 0.007);
-            vec3 weathered_rim = vec3(0.16, 0.095, 0.045);
-            color = mix(mix(cave_shadow, weathered_rim, blend), color, blend * 0.86);
+        if (best_coverage >= 0.995) {
+            discard;
+        }
+        if (best_coverage > 0.0) {
+            float dither = transition_hash(floor(gl_FragCoord.xy), best_seed + best_edge * 17.0);
+            if (dither < best_coverage) {
+                discard;
+            }
+            vec3 cave_shadow = vec3(0.018, 0.011, 0.007);
+            vec3 weathered_rim = vec3(0.17, 0.095, 0.040);
+            color = mix(color, mix(weathered_rim, cave_shadow, best_coverage), best_coverage * 0.34);
         }
     }
 
@@ -1108,7 +1270,7 @@ std::vector<DebugVertex> build_cave_transition_vertices(const std::vector<LocalV
         const Vec3 fallback_axis = std::fabs(normal.y) < 0.92f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f};
         const Vec3 tangent = length(hole.tangent_mesh) > 0.000001f ? normalize(hole.tangent_mesh) : normalize(cross(fallback_axis, normal));
         const Vec3 bitangent = length(hole.bitangent_mesh) > 0.000001f ? normalize(hole.bitangent_mesh) : normalize(cross(normal, tangent));
-        const float radius = kilometers_to_world_units(hole.entrance_radius_km);
+        const float radius = kilometers_to_world_units(cave_transition_visual_radius_km(hole));
         const std::array<float, 3> radii = {radius * 0.91f, radius * 1.005f, radius * 1.12f};
         const std::array<float, 3> lifts = {1.00008f, 1.00018f, 1.00030f};
         const std::array<Vec3, 3> colors = {InnerColor, MidColor, OuterColor};
@@ -1874,6 +2036,12 @@ bool DebugRenderer::initialize(const GoldbergTopology& topology, const PointClou
     shader_point_style_location_ = glGetUniformLocation(shader_, "u_point_style");
     shader_terrain_hole_count_location_ = glGetUniformLocation(shader_, "u_terrain_hole_count");
     shader_terrain_holes_location_ = glGetUniformLocation(shader_, "u_terrain_holes[0]");
+    shader_terrain_transition_tangent_location_ = glGetUniformLocation(shader_, "u_terrain_transition_tangent[0]");
+    shader_terrain_transition_bitangent_seed_location_ = glGetUniformLocation(shader_, "u_terrain_transition_bitangent_seed[0]");
+    shader_terrain_transition_shape_location_ = glGetUniformLocation(shader_, "u_terrain_transition_shape[0]");
+    shader_cave_dig_count_location_ = glGetUniformLocation(shader_, "u_cave_dig_count");
+    shader_cave_dig_spheres_location_ = glGetUniformLocation(shader_, "u_cave_dig_spheres[0]");
+    shader_cave_dig_planes_location_ = glGetUniformLocation(shader_, "u_cave_dig_planes[0]");
     shader_terrain_mask_count_location_ = glGetUniformLocation(shader_, "u_terrain_mask_count");
     shader_terrain_mask_sampler_location_ = glGetUniformLocation(shader_, "u_terrain_height_masks");
     shader_terrain_mask_center_radius_location_ = glGetUniformLocation(shader_, "u_terrain_mask_center_radius[0]");
@@ -2079,10 +2247,54 @@ void DebugRenderer::update_terrain_holes(const std::vector<LocalVoxelFeature>& h
     rebuild_terrain_transition_buffer();
 }
 
+void DebugRenderer::update_cave_dig_transitions(const std::vector<LocalVoxelFeature>& active_holes, const VoxelEditSet& edits) {
+    cave_dig_transitions_.clear();
+    cave_dig_transitions_.reserve(std::min<size_t>(edits.digs.size(), MaxCaveDigTransitions));
+    for (auto it = edits.digs.rbegin(); it != edits.digs.rend(); ++it) {
+        const VoxelDigEdit& dig = *it;
+        if (dig.target != VoxelDigTarget::CaveInterior ||
+            dig.radius_km <= 0.0f ||
+            length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        const LocalVoxelFeature* owner = nullptr;
+        if (dig.feature_id != 0u) {
+            auto owner_it = std::find_if(active_holes.begin(), active_holes.end(), [&](const LocalVoxelFeature& hole) {
+                return hole.feature_id == dig.feature_id;
+            });
+            if (owner_it != active_holes.end()) {
+                owner = &*owner_it;
+            }
+        } else {
+            float best_score = std::numeric_limits<float>::max();
+            for (const LocalVoxelFeature& hole : active_holes) {
+                const float score = length(dig.center_mesh - hole.center_mesh);
+                if (score < best_score) {
+                    best_score = score;
+                    owner = &hole;
+                }
+            }
+        }
+        if (owner == nullptr || length(owner->normal_mesh) <= 0.000001f) {
+            continue;
+        }
+        const Vec3 normal = normalize(owner->normal_mesh);
+        const float min_z_km = 0.0f;
+        const float boundary_dot_km = dot(planet_to_world(owner->center_mesh), normal) - min_z_km;
+        cave_dig_transitions_.push_back({
+            dig.center_mesh,
+            dig.radius_km,
+            normal,
+            boundary_dot_km,
+        });
+        if (cave_dig_transitions_.size() >= MaxCaveDigTransitions) {
+            break;
+        }
+    }
+}
+
 void DebugRenderer::rebuild_terrain_transition_buffer() {
-    std::vector<DebugVertex> transition_vertices = build_cave_transition_vertices(terrain_holes_);
-    const std::vector<DebugVertex> mask_vertices = build_terrain_mask_transition_vertices(terrain_masks_);
-    transition_vertices.insert(transition_vertices.end(), mask_vertices.begin(), mask_vertices.end());
+    std::vector<DebugVertex> transition_vertices;
     if (cave_transition_vao_ == 0) {
         glGenVertexArrays(1, &cave_transition_vao_);
     }
@@ -2248,16 +2460,75 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
         glUniform1i(shader_terrain_hole_count_location_, hole_count);
         if (hole_count > 0 && shader_terrain_holes_location_ >= 0) {
             std::array<float, MaxTerrainHoles * 4u> hole_data = {};
+            std::array<float, MaxTerrainHoles * 4u> tangent_data = {};
+            std::array<float, MaxTerrainHoles * 4u> bitangent_seed_data = {};
+            std::array<float, MaxTerrainHoles * 4u> shape_data = {};
             for (int i = 0; i < hole_count; ++i) {
                 const LocalVoxelFeature& hole = terrain_holes_[static_cast<size_t>(i)];
                 const Vec3 direction = normalize(hole.center_mesh);
-                const float chord_radius = hole.entrance_radius_km / PlanetRadiusKilometers;
-                hole_data[static_cast<size_t>(i) * 4u + 0u] = direction.x;
-                hole_data[static_cast<size_t>(i) * 4u + 1u] = direction.y;
-                hole_data[static_cast<size_t>(i) * 4u + 2u] = direction.z;
-                hole_data[static_cast<size_t>(i) * 4u + 3u] = chord_radius;
+                const Vec3 tangent = length(hole.tangent_mesh) > 0.000001f
+                    ? normalize(hole.tangent_mesh)
+                    : normalize(cross(std::fabs(direction.y) < 0.92f ? Vec3{0.0f, 1.0f, 0.0f} : Vec3{1.0f, 0.0f, 0.0f}, direction));
+                const Vec3 bitangent = length(hole.bitangent_mesh) > 0.000001f
+                    ? normalize(hole.bitangent_mesh)
+                    : normalize(cross(direction, tangent));
+                const float owner_km = cave_transition_owner_radius_km(hole);
+                const float feather_km = cave_transition_feather_radius_km(hole, owner_km);
+                const float inner_radius = owner_km / PlanetRadiusKilometers;
+                const float feather_radius = feather_km / PlanetRadiusKilometers;
+                const Vec3 center_world = planet_to_world(hole.center_mesh);
+                hole_data[static_cast<size_t>(i) * 4u + 0u] = center_world.x;
+                hole_data[static_cast<size_t>(i) * 4u + 1u] = center_world.y;
+                hole_data[static_cast<size_t>(i) * 4u + 2u] = center_world.z;
+                hole_data[static_cast<size_t>(i) * 4u + 3u] = inner_radius;
+                tangent_data[static_cast<size_t>(i) * 4u + 0u] = tangent.x;
+                tangent_data[static_cast<size_t>(i) * 4u + 1u] = tangent.y;
+                tangent_data[static_cast<size_t>(i) * 4u + 2u] = tangent.z;
+                tangent_data[static_cast<size_t>(i) * 4u + 3u] = feather_radius;
+                bitangent_seed_data[static_cast<size_t>(i) * 4u + 0u] = bitangent.x;
+                bitangent_seed_data[static_cast<size_t>(i) * 4u + 1u] = bitangent.y;
+                bitangent_seed_data[static_cast<size_t>(i) * 4u + 2u] = bitangent.z;
+                bitangent_seed_data[static_cast<size_t>(i) * 4u + 3u] = static_cast<float>((hole.seed & 0xffffu) + 1u);
+                shape_data[static_cast<size_t>(i) * 4u + 0u] = hole.entrance_radius_km;
+                shape_data[static_cast<size_t>(i) * 4u + 1u] = hole.tunnel_radius_km;
+                shape_data[static_cast<size_t>(i) * 4u + 2u] = hole.chamber_radius_km;
+                shape_data[static_cast<size_t>(i) * 4u + 3u] = hole.depth_km;
             }
             glUniform4fv(shader_terrain_holes_location_, hole_count, hole_data.data());
+            if (shader_terrain_transition_tangent_location_ >= 0) {
+                glUniform4fv(shader_terrain_transition_tangent_location_, hole_count, tangent_data.data());
+            }
+            if (shader_terrain_transition_bitangent_seed_location_ >= 0) {
+                glUniform4fv(shader_terrain_transition_bitangent_seed_location_, hole_count, bitangent_seed_data.data());
+            }
+            if (shader_terrain_transition_shape_location_ >= 0) {
+                glUniform4fv(shader_terrain_transition_shape_location_, hole_count, shape_data.data());
+            }
+        }
+    }
+    if (shader_cave_dig_count_location_ >= 0) {
+        const int dig_count = static_cast<int>(std::min<size_t>(cave_dig_transitions_.size(), MaxCaveDigTransitions));
+        glUniform1i(shader_cave_dig_count_location_, dig_count);
+        if (dig_count > 0 && shader_cave_dig_spheres_location_ >= 0) {
+            std::array<float, MaxCaveDigTransitions * 4u> dig_data = {};
+            std::array<float, MaxCaveDigTransitions * 4u> plane_data = {};
+            for (int i = 0; i < dig_count; ++i) {
+                const CaveDigTransition& dig = cave_dig_transitions_[static_cast<size_t>(i)];
+                const Vec3 center_world = planet_to_world(dig.center_mesh);
+                dig_data[static_cast<size_t>(i) * 4u + 0u] = center_world.x;
+                dig_data[static_cast<size_t>(i) * 4u + 1u] = center_world.y;
+                dig_data[static_cast<size_t>(i) * 4u + 2u] = center_world.z;
+                dig_data[static_cast<size_t>(i) * 4u + 3u] = dig.radius_km;
+                const Vec3 normal = normalize(dig.normal_mesh);
+                plane_data[static_cast<size_t>(i) * 4u + 0u] = normal.x;
+                plane_data[static_cast<size_t>(i) * 4u + 1u] = normal.y;
+                plane_data[static_cast<size_t>(i) * 4u + 2u] = normal.z;
+                plane_data[static_cast<size_t>(i) * 4u + 3u] = dig.boundary_dot_km;
+            }
+            glUniform4fv(shader_cave_dig_spheres_location_, dig_count, dig_data.data());
+            if (shader_cave_dig_planes_location_ >= 0) {
+                glUniform4fv(shader_cave_dig_planes_location_, dig_count, plane_data.data());
+            }
         }
     }
     glBindVertexArray(mesh_vao_);
@@ -2291,6 +2562,9 @@ void DebugRenderer::render(const CameraView& view, const SpaceshipState& ship, c
     }
     if (shader_terrain_mask_count_location_ >= 0) {
         glUniform1i(shader_terrain_mask_count_location_, 0);
+    }
+    if (shader_cave_dig_count_location_ >= 0) {
+        glUniform1i(shader_cave_dig_count_location_, 0);
     }
     if (cave_transition_vertex_count_ > 0) {
         glEnable(GL_POLYGON_OFFSET_FILL);

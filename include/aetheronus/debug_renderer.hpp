@@ -74,6 +74,7 @@ public:
     void update_mesh(const QuantizedMesh& mesh);
     void update_cave_interiors(const SurfaceNetMesh& cave_interiors);
     void update_terrain_holes(const std::vector<LocalVoxelFeature>& holes);
+    void update_cave_dig_transitions(const std::vector<LocalVoxelFeature>& active_holes, const VoxelEditSet& edits);
     void update_terrain_height_masks(const std::vector<TerrainHeightMask>& masks);
     void resize(int width, int height);
     void render(const CameraView& view, const SpaceshipState& ship, const DebugRenderOptions& options, bool show_fps, float fps);
@@ -142,6 +143,12 @@ private:
     int shader_point_style_location_ = -1;
     int shader_terrain_hole_count_location_ = -1;
     int shader_terrain_holes_location_ = -1;
+    int shader_terrain_transition_tangent_location_ = -1;
+    int shader_terrain_transition_bitangent_seed_location_ = -1;
+    int shader_terrain_transition_shape_location_ = -1;
+    int shader_cave_dig_count_location_ = -1;
+    int shader_cave_dig_spheres_location_ = -1;
+    int shader_cave_dig_planes_location_ = -1;
     int shader_terrain_mask_count_location_ = -1;
     int shader_terrain_mask_sampler_location_ = -1;
     int shader_terrain_mask_center_radius_location_ = -1;
@@ -207,8 +214,15 @@ private:
     int cave_anchor_compute_far_plane_location_ = -1;
     int cave_anchor_compute_occlusion_radius_location_ = -1;
     int cave_anchor_compute_max_distance_location_ = -1;
+    struct CaveDigTransition {
+        Vec3 center_mesh;
+        float radius_km = 0.0f;
+        Vec3 normal_mesh;
+        float boundary_dot_km = 0.0f;
+    };
     SparseVoxelOctree current_svo_;
     std::vector<LocalVoxelFeature> terrain_holes_;
+    std::vector<CaveDigTransition> cave_dig_transitions_;
     std::vector<TerrainHeightMask> terrain_masks_;
     uint32_t terrain_mask_resolution_ = 0;
     uint32_t terrain_mask_layer_count_ = 0;

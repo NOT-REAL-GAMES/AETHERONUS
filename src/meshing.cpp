@@ -171,6 +171,10 @@ bool dig_target_matches(const VoxelDigEdit& dig, VoxelDigTarget target) {
     return dig.target == target;
 }
 
+bool is_terrain_hole_feature_id(uint32_t feature_id) {
+    return (feature_id & 0x80000000u) != 0u;
+}
+
 struct LocalSurfaceNetPatch {
     Vec3 center_mesh;
     Vec3 dig_center_mesh;
@@ -190,6 +194,26 @@ struct LocalSurfaceNetGrid {
     float voxel_size = 0.0f;
     float radius = 0.0f;
     Vec3 origin;
+};
+
+struct TerrainMaskHoleBounds {
+    uint32_t min_x = 0;
+    uint32_t max_x = 0;
+    uint32_t min_y = 0;
+    uint32_t max_y = 0;
+    bool any = false;
+};
+
+struct TerrainSvoPatchDescriptor {
+    const TerrainHeightMask* mask = nullptr;
+    Vec3 center_mesh;
+    Vec3 normal_mesh;
+    Vec3 tangent_mesh;
+    Vec3 bitangent_mesh;
+    TerrainMaskHoleBounds bounds;
+    float surface_radius = 1.0f;
+    float cap_depth_mesh = 0.0f;
+    uint32_t depth = MaxSvoDepth;
 };
 
 struct SurfaceNetPlacement {
@@ -3127,34 +3151,37 @@ bool terrain_height_masks_carve(Vec3 position, const std::vector<TerrainHeightMa
     return false;
 }
 
-bool terrain_height_mask_hole_footprint(const TerrainHeightMask& mask, Vec3& center, float& radius) {
-    center = {};
-    radius = 0.0f;
+TerrainMaskHoleBounds terrain_height_mask_hole_bounds(const TerrainHeightMask& mask) {
+    TerrainMaskHoleBounds bounds;
     if (mask.resolution == 0u ||
         mask.radius_km <= 0.0f ||
         mask.heights.size() != static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution) ||
         length(mask.center_mesh) <= 0.000001f) {
-        return false;
+        return bounds;
     }
 
-    uint32_t min_x = mask.resolution;
-    uint32_t min_y = mask.resolution;
-    uint32_t max_x = 0u;
-    uint32_t max_y = 0u;
-    bool any_hole = false;
+    bounds.min_x = mask.resolution;
+    bounds.min_y = mask.resolution;
     for (uint32_t y = 0; y < mask.resolution; ++y) {
         for (uint32_t x = 0; x < mask.resolution; ++x) {
             if (mask.heights[static_cast<size_t>(y) * mask.resolution + x] != 0u) {
                 continue;
             }
-            min_x = std::min(min_x, x);
-            min_y = std::min(min_y, y);
-            max_x = std::max(max_x, x);
-            max_y = std::max(max_y, y);
-            any_hole = true;
+            bounds.min_x = std::min(bounds.min_x, x);
+            bounds.min_y = std::min(bounds.min_y, y);
+            bounds.max_x = std::max(bounds.max_x, x);
+            bounds.max_y = std::max(bounds.max_y, y);
+            bounds.any = true;
         }
     }
-    if (!any_hole) {
+    return bounds;
+}
+
+bool terrain_height_mask_hole_footprint(const TerrainHeightMask& mask, Vec3& center, float& radius) {
+    center = {};
+    radius = 0.0f;
+    const TerrainMaskHoleBounds bounds = terrain_height_mask_hole_bounds(mask);
+    if (!bounds.any) {
         return false;
     }
 
@@ -3162,10 +3189,10 @@ bool terrain_height_mask_hole_footprint(const TerrainHeightMask& mask, Vec3& cen
     auto local_coord = [&](uint32_t value) {
         return ((static_cast<float>(value) / resolution_minus_one) - 0.5f) * kilometers_to_world_units(mask.radius_km) * 2.0f;
     };
-    const float min_local_x = local_coord(min_x);
-    const float max_local_x = local_coord(max_x);
-    const float min_local_y = local_coord(min_y);
-    const float max_local_y = local_coord(max_y);
+    const float min_local_x = local_coord(bounds.min_x);
+    const float max_local_x = local_coord(bounds.max_x);
+    const float min_local_y = local_coord(bounds.min_y);
+    const float max_local_y = local_coord(bounds.max_y);
     const Vec3 local_center =
         mask.tangent_mesh * ((min_local_x + max_local_x) * 0.5f) +
         mask.bitangent_mesh * ((min_local_y + max_local_y) * 0.5f);
@@ -3785,129 +3812,6 @@ bool depth8_key_in_promoted_patches(VoxelKey key, const std::vector<LocalSurface
 VoxelEditSet promoted_terrain_dig_edits(const MarchingCubesConfig& config) {
     VoxelEditSet promoted;
     promoted.local_depth = config.voxel_edits.local_depth;
-    const float promotion_radius_mesh = kilometers_to_world_units(std::max(0.0f, config.terrain_svo_promotion_radius_km));
-    if (promotion_radius_mesh <= 0.0f) {
-        return promoted;
-    }
-
-    struct TerrainDigRef {
-        Vec3 center;
-        float radius = 0.0f;
-        uint32_t depth = MaxSvoDepth;
-        size_t mask_index = std::numeric_limits<size_t>::max();
-    };
-
-    std::vector<TerrainDigRef> terrain_digs;
-    terrain_digs.reserve(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size());
-    for (const VoxelDigEdit& dig : config.voxel_edits.digs) {
-        if (!dig_target_matches(dig, VoxelDigTarget::Terrain) || dig.radius_km <= 0.0f || length(dig.center_mesh) <= 0.000001f) {
-            continue;
-        }
-        terrain_digs.push_back({
-            dig.center_mesh,
-            kilometers_to_world_units(dig.radius_km),
-            std::clamp(dig.depth > 0u ? dig.depth : config.voxel_edits.local_depth, 1u, MaxSvoDepth),
-            std::numeric_limits<size_t>::max(),
-        });
-    }
-    for (size_t mask_index = 0; mask_index < config.voxel_edits.terrain_masks.size(); ++mask_index) {
-        Vec3 center{};
-        float radius = 0.0f;
-        if (!terrain_height_mask_hole_footprint(config.voxel_edits.terrain_masks[mask_index], center, radius)) {
-            continue;
-        }
-        terrain_digs.push_back({
-            center,
-            radius,
-            std::clamp(config.voxel_edits.local_depth, 1u, MaxSvoDepth),
-            mask_index,
-        });
-    }
-    if (terrain_digs.empty()) {
-        return promoted;
-    }
-
-    std::vector<uint8_t> visited(terrain_digs.size(), 0u);
-    std::vector<size_t> stack;
-    std::vector<size_t> cluster;
-    for (size_t start = 0; start < terrain_digs.size(); ++start) {
-        if (visited[start] != 0u) {
-            continue;
-        }
-
-        stack.clear();
-        cluster.clear();
-        visited[start] = 1u;
-        stack.push_back(start);
-        while (!stack.empty()) {
-            const size_t current = stack.back();
-            stack.pop_back();
-            cluster.push_back(current);
-            for (size_t candidate = 0; candidate < terrain_digs.size(); ++candidate) {
-                if (visited[candidate] != 0u) {
-                    continue;
-                }
-                const float distance = length(terrain_digs[current].center - terrain_digs[candidate].center);
-                if (distance <= terrain_digs[current].radius + terrain_digs[candidate].radius) {
-                    visited[candidate] = 1u;
-                    stack.push_back(candidate);
-                }
-            }
-        }
-
-        Vec3 center_sum{};
-        float weight_sum = 0.0f;
-        uint32_t depth = 1u;
-        bool cluster_has_circular_dig = false;
-        for (size_t index : cluster) {
-            const float weight = std::max(terrain_digs[index].radius, 0.000001f);
-            center_sum = center_sum + terrain_digs[index].center * weight;
-            weight_sum += weight;
-            depth = std::max(depth, terrain_digs[index].depth);
-            cluster_has_circular_dig = cluster_has_circular_dig ||
-                terrain_digs[index].mask_index == std::numeric_limits<size_t>::max();
-        }
-        if (weight_sum <= 0.0f || length(center_sum) <= 0.000001f) {
-            continue;
-        }
-
-        const Vec3 cluster_center = center_sum * (1.0f / weight_sum);
-        float cluster_radius = 0.0f;
-        for (size_t index : cluster) {
-            cluster_radius = std::max(cluster_radius, length(terrain_digs[index].center - cluster_center) + terrain_digs[index].radius);
-        }
-        if (cluster_radius < promotion_radius_mesh) {
-            continue;
-        }
-
-        if (cluster_has_circular_dig) {
-            promoted.digs.push_back({
-                cluster_center,
-                world_units_to_kilometers(cluster_radius),
-                depth,
-                VoxelDigTarget::Terrain,
-            });
-        }
-        for (size_t index : cluster) {
-            const size_t mask_index = terrain_digs[index].mask_index;
-            if (mask_index == std::numeric_limits<size_t>::max()) {
-                continue;
-            }
-            const TerrainHeightMask& mask = config.voxel_edits.terrain_masks[mask_index];
-            const bool already_added = std::any_of(
-                promoted.terrain_masks.begin(),
-                promoted.terrain_masks.end(),
-                [&](const TerrainHeightMask& existing) {
-                    return existing.revision == mask.revision &&
-                           length(existing.center_mesh - mask.center_mesh) <= 0.000001f;
-                }
-            );
-            if (!already_added) {
-                promoted.terrain_masks.push_back(mask);
-            }
-        }
-    }
-
     return promoted;
 }
 
@@ -3993,13 +3897,13 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
     const Vec3 camera_center = length(config.lod_camera_position) > 0.000001f
         ? normalize(config.lod_camera_position)
         : Vec3{0.0f, 0.0f, 1.0f};
-    if (config.voxel_edits.digs.empty() && config.voxel_edits.terrain_masks.empty() && fallback_depth >= MaxSvoDepth) {
+    if (config.voxel_edits.digs.empty() && fallback_depth >= MaxSvoDepth) {
         const float startup_radius = kilometers_to_world_units(config.local_surface_net_patch_radius_km);
         add_patch(camera_center, startup_radius, fallback_depth, true);
     }
 
     std::vector<DigCandidate> dig_candidates;
-    dig_candidates.reserve(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size());
+    dig_candidates.reserve(config.voxel_edits.digs.size());
     for (uint32_t i = 0; i < config.voxel_edits.digs.size(); ++i) {
         const VoxelDigEdit& dig = config.voxel_edits.digs[i];
         if (!dig_target_matches(dig, VoxelDigTarget::Terrain) || length(dig.center_mesh) <= 0.000001f) {
@@ -4015,20 +3919,6 @@ std::vector<LocalSurfaceNetPatch> build_local_surface_net_patches(const Marching
             length(normalize(dig.center_mesh) - camera_center),
             static_cast<uint32_t>(config.voxel_edits.digs.size() - i),
             std::clamp(dig.depth > 0u ? dig.depth : fallback_depth, 1u, MaxSvoDepth),
-        });
-    }
-    for (uint32_t i = 0; i < config.voxel_edits.terrain_masks.size(); ++i) {
-        Vec3 center{};
-        float radius_mesh = 0.0f;
-        if (!terrain_height_mask_hole_footprint(config.voxel_edits.terrain_masks[i], center, radius_mesh)) {
-            continue;
-        }
-        dig_candidates.push_back({
-            center,
-            radius_mesh,
-            length(normalize(center) - camera_center),
-            static_cast<uint32_t>(config.voxel_edits.digs.size() + config.voxel_edits.terrain_masks.size() - i),
-            fallback_depth,
         });
     }
     std::sort(
@@ -4711,7 +4601,7 @@ Vec3 cave_world_to_local(const LocalVoxelFeature& feature, Vec3 world) {
 }
 
 float cave_tunnel_sdf(Vec3 local, float entrance_radius, float tunnel_radius, float depth) {
-    const float z0 = -entrance_radius * 0.45f;
+    const float z0 = 0.0f;
     const float z1 = depth;
     const float t = std::clamp((local.z - z0) / std::max(0.000001f, z1 - z0), 0.0f, 1.0f);
     const float radius = entrance_radius * (1.0f - t) + tunnel_radius * t;
@@ -4726,6 +4616,7 @@ float cave_air_sdf(const LocalVoxelFeature& feature, Vec3 local, const VoxelEdit
     const float tunnel_radius = kilometers_to_world_units(feature.tunnel_radius_km);
     const float chamber_radius = kilometers_to_world_units(feature.chamber_radius_km);
     const float depth = kilometers_to_world_units(feature.depth_km);
+    const float edit_min_z = 0.0f;
 
     float sdf = cave_tunnel_sdf(local, entrance_radius, tunnel_radius, depth);
 
@@ -4752,6 +4643,12 @@ float cave_air_sdf(const LocalVoxelFeature& feature, Vec3 local, const VoxelEdit
         if (!dig_target_matches(dig, VoxelDigTarget::CaveInterior)) {
             continue;
         }
+        if (dig.feature_id != 0u && dig.feature_id != feature.feature_id) {
+            continue;
+        }
+        if (local.z < edit_min_z) {
+            continue;
+        }
         const Vec3 edit_local = cave_world_to_local(feature, dig.center_mesh);
         const float edit_radius = kilometers_to_world_units(dig.radius_km);
         if (std::fabs(edit_local.z - local.z) > edit_radius + chamber_radius) {
@@ -4766,6 +4663,7 @@ float cave_air_sdf(const LocalVoxelFeature& feature, Vec3 local, const VoxelEdit
 struct CaveAirSphere {
     Vec3 center;
     float radius = 0.0f;
+    float min_z = 0.0f;
 };
 
 struct CaveAirField {
@@ -4786,7 +4684,7 @@ CaveAirField build_cave_air_field(const LocalVoxelFeature& feature, const VoxelE
     field.tunnel_radius = kilometers_to_world_units(feature.tunnel_radius_km);
     field.chamber_radius = kilometers_to_world_units(feature.chamber_radius_km);
     field.depth = kilometers_to_world_units(feature.depth_km);
-    field.tunnel_z0 = -field.entrance_radius * 0.45f;
+    field.tunnel_z0 = 0.0f;
     field.tunnel_z1 = field.depth;
 
     const uint32_t side_hash = hash_u32(feature.seed ^ 0x9e3779b9u);
@@ -4817,9 +4715,13 @@ CaveAirField build_cave_air_field(const LocalVoxelFeature& feature, const VoxelE
         if (!dig_target_matches(dig, VoxelDigTarget::CaveInterior)) {
             continue;
         }
+        if (dig.feature_id != 0u && dig.feature_id != feature.feature_id) {
+            continue;
+        }
         field.edits.push_back({
             cave_world_to_local(feature, dig.center_mesh),
             kilometers_to_world_units(dig.radius_km),
+            field.tunnel_z0,
         });
     }
     return field;
@@ -4831,6 +4733,9 @@ float cave_air_sdf(const CaveAirField& field, Vec3 local) {
     sdf = std::min(sdf, length(local - field.lobe.center) - field.lobe.radius);
 
     for (const CaveAirSphere& edit : field.edits) {
+        if (local.z < edit.min_z) {
+            continue;
+        }
         if (std::fabs(edit.center.z - local.z) > edit.radius + field.chamber_radius) {
             continue;
         }
@@ -4864,6 +4769,9 @@ bool cave_air_contains(const CaveAirField& field, float x, float y, float z) {
         return true;
     }
     for (const CaveAirSphere& edit : field.edits) {
+        if (z < edit.min_z) {
+            continue;
+        }
         if (inside_sphere(edit)) {
             return true;
         }
@@ -5003,7 +4911,7 @@ SurfaceNetMesh build_cave_surface_net_feature(
     const float chamber_radius = kilometers_to_world_units(feature.chamber_radius_km);
     const float cave_depth = kilometers_to_world_units(feature.depth_km);
     const float lateral_extent = std::max({entrance_radius * 1.75f, chamber_radius * 1.55f, tunnel_radius * 2.2f});
-    const float z_min = -entrance_radius * 0.62f;
+    const float z_min = 0.0f;
     const float z_max = cave_depth + chamber_radius * 1.45f;
     const Vec3 local_min{-lateral_extent, -lateral_extent, z_min};
     const Vec3 local_max{lateral_extent, lateral_extent, z_max};
@@ -5020,7 +4928,6 @@ SurfaceNetMesh build_cave_surface_net_feature(
         (local_min.z + local_max.z - padded_size.z) * 0.5f,
     };
     CaveAirField air_field = build_cave_air_field(feature, config.voxel_edits);
-    air_field.tunnel_z0 = origin.z - step * 2.0f;
 
     const uint32_t grid_count = resolution * resolution * resolution;
     std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
@@ -5546,16 +5453,6 @@ void append_surface_net_triangle(
     surface_net.triangle_indices.push_back(base + 2u);
 }
 
-Vec3 terrain_mask_surface_point(const TerrainHeightMask& mask, float px, float py, float surface_radius) {
-    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
-    const float clamped_x = std::clamp(px, 0.0f, resolution_minus_one);
-    const float clamped_y = std::clamp(py, 0.0f, resolution_minus_one);
-    const float radius_mesh = kilometers_to_world_units(mask.radius_km);
-    const float local_x = (clamped_x / resolution_minus_one - 0.5f) * radius_mesh * 2.0f;
-    const float local_y = (clamped_y / resolution_minus_one - 0.5f) * radius_mesh * 2.0f;
-    return normalize(normalize(mask.center_mesh) + mask.tangent_mesh * local_x + mask.bitangent_mesh * local_y) * surface_radius;
-}
-
 bool terrain_mask_pixel_is_hole(const TerrainHeightMask& mask, int32_t x, int32_t y) {
     if (x < 0 || y < 0 || x >= static_cast<int32_t>(mask.resolution) || y >= static_cast<int32_t>(mask.resolution)) {
         return false;
@@ -5563,79 +5460,367 @@ bool terrain_mask_pixel_is_hole(const TerrainHeightMask& mask, int32_t x, int32_
     return mask.heights[static_cast<size_t>(y) * mask.resolution + static_cast<uint32_t>(x)] == 0u;
 }
 
-void append_terrain_mask_svo_fill(
-    SurfaceNetMesh& surface_net,
-    const LocalSurfaceNetPatch& patch,
-    const MarchingCubesConfig& config,
-    float surface_radius,
-    float wall_depth,
-    uint32_t depth_tag
-) {
-    if (!patch.replace_surface || config.voxel_edits.terrain_masks.empty() || wall_depth <= 0.0f) {
-        return;
+float terrain_mask_local_coord(const TerrainHeightMask& mask, float pixel) {
+    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
+    return (pixel / resolution_minus_one - 0.5f) * kilometers_to_world_units(mask.radius_km) * 2.0f;
+}
+
+float terrain_mask_pixel_coord(const TerrainHeightMask& mask, float local_coord) {
+    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
+    const float radius_mesh = kilometers_to_world_units(mask.radius_km);
+    return (local_coord / (radius_mesh * 2.0f) + 0.5f) * resolution_minus_one;
+}
+
+Vec3 terrain_svo_patch_local_to_world(const TerrainSvoPatchDescriptor& patch, Vec3 local) {
+    const Vec3 surface_point = normalize(
+        patch.normal_mesh * patch.surface_radius +
+        patch.tangent_mesh * local.x +
+        patch.bitangent_mesh * local.y
+    );
+    return surface_point * std::max(0.0f, patch.surface_radius - local.z);
+}
+
+bool terrain_svo_patch_pixel_solid(const TerrainSvoPatchDescriptor& patch, Vec3 local) {
+    if (patch.mask == nullptr) {
+        return false;
     }
+    const TerrainHeightMask& mask = *patch.mask;
+    const float px = terrain_mask_pixel_coord(mask, local.x);
+    const float py = terrain_mask_pixel_coord(mask, local.y);
+    if (px < -0.5f ||
+        py < -0.5f ||
+        px > static_cast<float>(mask.resolution) - 0.5f ||
+        py > static_cast<float>(mask.resolution) - 0.5f) {
+        return false;
+    }
+    const int32_t ix = static_cast<int32_t>(std::lround(px));
+    const int32_t iy = static_cast<int32_t>(std::lround(py));
+    return terrain_mask_pixel_is_hole(mask, ix, iy);
+}
 
-    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
-    const float fill_depth = std::min(wall_depth, kilometers_to_world_units(6.0f));
-    const float top_radius = surface_radius + kilometers_to_world_units(0.05f);
-    const float bottom_radius = std::max(0.0f, surface_radius - fill_depth);
+bool terrain_svo_patch_dig_carves(const TerrainSvoPatchDescriptor& patch, Vec3 world, const VoxelEditSet& edits) {
+    for (const VoxelDigEdit& dig : edits.digs) {
+        if (!dig_target_matches(dig, VoxelDigTarget::TerrainSvoPatch) || dig.radius_km <= 0.0f) {
+            continue;
+        }
+        const float radius = kilometers_to_world_units(dig.radius_km);
+        if (length(dig.center_mesh) <= 0.000001f) {
+            continue;
+        }
 
-    auto append_quad = [&](Vec3 a, Vec3 b, Vec3 c, Vec3 d, Vec3 preferred_normal) {
-        append_surface_net_triangle(surface_net, a, b, c, preferred_normal, max_vertices, depth_tag);
-        append_surface_net_triangle(surface_net, a, c, d, preferred_normal, max_vertices, depth_tag);
-    };
+        const Vec3 axis = normalize(dig.center_mesh);
+        const float dig_x = dot(dig.center_mesh - patch.center_mesh, patch.tangent_mesh);
+        const float dig_y = dot(dig.center_mesh - patch.center_mesh, patch.bitangent_mesh);
+        const Vec3 dig_local{dig_x, dig_y, 0.0f};
+        if (!terrain_svo_patch_pixel_solid(patch, dig_local)) {
+            continue;
+        }
 
+        const Vec3 offset = world - dig.center_mesh;
+        const float inward_distance = -dot(offset, axis);
+        const float usable_depth = std::max(0.0f, patch.cap_depth_mesh - radius * 1.25f);
+        const float pocket_depth = std::clamp(
+            std::max(radius * 0.65f, kilometers_to_world_units(4.0f)),
+            kilometers_to_world_units(2.0f),
+            std::max(kilometers_to_world_units(2.0f), usable_depth)
+        );
+        if (inward_distance < -radius * 0.15f || inward_distance > pocket_depth) {
+            continue;
+        }
+
+        const Vec3 axis_point = dig.center_mesh - axis * inward_distance;
+        const float tangent_distance = length(world - axis_point);
+        const float lateral = tangent_distance / radius;
+        const float depth = std::max(0.0f, inward_distance) / pocket_depth;
+        if (lateral * lateral + depth * depth <= 1.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool terrain_svo_patch_air_contains(
+    const TerrainSvoPatchDescriptor& patch,
+    const VoxelEditSet& edits,
+    Vec3 local
+) {
+    if (local.z < 0.0f) {
+        return true;
+    }
+    if (!terrain_svo_patch_pixel_solid(patch, local)) {
+        return true;
+    }
+    if (local.z > patch.cap_depth_mesh) {
+        return false;
+    }
+    const Vec3 world = terrain_svo_patch_local_to_world(patch, local);
+    return terrain_svo_patch_dig_carves(patch, world, edits);
+}
+
+bool terrain_svo_patch_solid_contains(
+    const TerrainSvoPatchDescriptor& patch,
+    const VoxelEditSet& edits,
+    Vec3 local
+) {
+    if (local.z < 0.0f || local.z > patch.cap_depth_mesh) {
+        return false;
+    }
+    if (!terrain_svo_patch_pixel_solid(patch, local)) {
+        return false;
+    }
+    const Vec3 world = terrain_svo_patch_local_to_world(patch, local);
+    return !terrain_svo_patch_dig_carves(patch, world, edits);
+}
+
+std::vector<TerrainSvoPatchDescriptor> terrain_svo_patch_descriptors_for_patch(
+    const LocalSurfaceNetPatch& local_patch,
+    const QuantizedMesh& mesh,
+    const MarchingCubesConfig& config
+) {
+    std::vector<TerrainSvoPatchDescriptor> descriptors;
+    constexpr float TerrainSvoPatchCapDepthKm = 32.0f;
+    const float cap_depth_mesh = kilometers_to_world_units(TerrainSvoPatchCapDepthKm);
     for (const TerrainHeightMask& mask : config.voxel_edits.terrain_masks) {
+        const TerrainMaskHoleBounds bounds = terrain_height_mask_hole_bounds(mask);
+        if (!bounds.any) {
+            continue;
+        }
         Vec3 footprint_center{};
         float footprint_radius = 0.0f;
         if (!terrain_height_mask_hole_footprint(mask, footprint_center, footprint_radius)) {
             continue;
         }
-        if (length(footprint_center - patch.center_mesh) > patch.extraction_radius_mesh + footprint_radius) {
+        if (length(footprint_center - local_patch.center_mesh) > local_patch.extraction_radius_mesh + footprint_radius) {
             continue;
         }
 
-        const int32_t resolution = static_cast<int32_t>(mask.resolution);
-        for (int32_t y = 0; y < resolution; ++y) {
-            for (int32_t x = 0; x < resolution; ++x) {
-                if (!terrain_mask_pixel_is_hole(mask, x, y)) {
+        float surface_radius = std::max(0.000001f, length(footprint_center));
+        uint32_t sample_count = 0u;
+        for (const Vec3& vertex : mesh.surface_net_base_cache.vertices) {
+            float px = 0.0f;
+            float py = 0.0f;
+            if (!terrain_height_mask_project(mask, vertex, px, py)) {
+                continue;
+            }
+            if (px + 1.0f < static_cast<float>(bounds.min_x) ||
+                py + 1.0f < static_cast<float>(bounds.min_y) ||
+                px > static_cast<float>(bounds.max_x) + 1.0f ||
+                py > static_cast<float>(bounds.max_y) + 1.0f) {
+                continue;
+            }
+            surface_radius = std::max(surface_radius, length(vertex));
+            ++sample_count;
+        }
+        (void)sample_count;
+
+        descriptors.push_back({
+            &mask,
+            footprint_center,
+            normalize(mask.center_mesh),
+            normalize(mask.tangent_mesh),
+            normalize(mask.bitangent_mesh),
+            bounds,
+            std::clamp(surface_radius, 0.000001f, mesh_voxel_bounds_radius(mesh)),
+            cap_depth_mesh,
+            std::clamp(config.voxel_edits.local_depth, 1u, MaxSvoDepth),
+        });
+    }
+    return descriptors;
+}
+
+SurfaceNetMesh build_single_terrain_svo_patch_surface_net(
+    const TerrainSvoPatchDescriptor& patch,
+    const MarchingCubesConfig& config,
+    float grid_radius
+) {
+    SurfaceNetMesh surface_net;
+    if (patch.mask == nullptr || !config.enable_surface_net_generation) {
+        return surface_net;
+    }
+
+    const TerrainHeightMask& mask = *patch.mask;
+    const uint32_t depth = std::clamp(patch.depth, 1u, MaxSvoDepth);
+    constexpr uint32_t TerrainSvoPatchDisplayDepth = 8u;
+    const uint32_t resolution = cave_surface_net_resolution(depth);
+    const uint32_t cube_resolution = resolution - 1u;
+    const float pixel_pad = 2.5f;
+    const float min_x = terrain_mask_local_coord(mask, static_cast<float>(patch.bounds.min_x) - pixel_pad);
+    const float max_x = terrain_mask_local_coord(mask, static_cast<float>(patch.bounds.max_x) + pixel_pad);
+    const float min_y = terrain_mask_local_coord(mask, static_cast<float>(patch.bounds.min_y) - pixel_pad);
+    const float max_y = terrain_mask_local_coord(mask, static_cast<float>(patch.bounds.max_y) + pixel_pad);
+    const float z_min = -std::max(kilometers_to_world_units(1.0f), patch.cap_depth_mesh * 0.05f);
+    const float z_max = patch.cap_depth_mesh + std::max(kilometers_to_world_units(1.0f), patch.cap_depth_mesh * 0.05f);
+    const Vec3 local_min{min_x, min_y, z_min};
+    const Vec3 local_max{max_x, max_y, z_max};
+    const Vec3 local_size = local_max - local_min;
+    const float step = std::max({local_size.x, local_size.y, local_size.z, 0.000001f}) / static_cast<float>(resolution - 1u);
+    const Vec3 padded_size{
+        step * static_cast<float>(resolution - 1u),
+        step * static_cast<float>(resolution - 1u),
+        step * static_cast<float>(resolution - 1u),
+    };
+    const Vec3 origin{
+        (local_min.x + local_max.x - padded_size.x) * 0.5f,
+        (local_min.y + local_max.y - padded_size.y) * 0.5f,
+        (local_min.z + local_max.z - padded_size.z) * 0.5f,
+    };
+
+    const uint32_t grid_count = resolution * resolution * resolution;
+    std::vector<uint64_t> occupancy((grid_count + 63u) / 64u, 0u);
+    uint32_t occupied_count = 0u;
+    for (uint32_t z = 0; z < resolution; ++z) {
+        for (uint32_t y = 0; y < resolution; ++y) {
+            for (uint32_t x = 0; x < resolution; ++x) {
+                const Vec3 local = origin + Vec3{
+                    static_cast<float>(x) * step,
+                    static_cast<float>(y) * step,
+                    static_cast<float>(z) * step,
+                };
+                if (!terrain_svo_patch_air_contains(patch, config.voxel_edits, local)) {
                     continue;
                 }
+                set_surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution));
+                ++occupied_count;
+            }
+        }
+    }
+    if (occupied_count == 0u) {
+        return surface_net;
+    }
 
-                const float x0 = static_cast<float>(x) - 0.5f;
-                const float x1 = static_cast<float>(x) + 0.5f;
-                const float y0 = static_cast<float>(y) - 0.5f;
-                const float y1 = static_cast<float>(y) + 0.5f;
+    const uint32_t cube_count = cube_resolution * cube_resolution * cube_resolution;
+    std::vector<CaveSurfaceCubeCandidate> cube_candidates;
+    cube_candidates.reserve(32768u);
+    const uint64_t edge_candidate_count =
+        static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * static_cast<uint64_t>(resolution) * 3ull;
+    std::vector<uint64_t> edge_candidate_bits(static_cast<size_t>((edge_candidate_count + 63ull) / 64ull), 0u);
+    std::vector<SurfaceNetEdgeKey> edge_candidates;
+    edge_candidates.reserve(65536u);
 
-                struct Edge {
-                    int32_t nx;
-                    int32_t ny;
-                    float ax;
-                    float ay;
-                    float bx;
-                    float by;
-                };
-                constexpr std::array<Edge, 4> Edges = {{
-                    {-1, 0, -0.5f, -0.5f, -0.5f,  0.5f},
-                    { 1, 0,  0.5f,  0.5f,  0.5f, -0.5f},
-                    {0, -1,  0.5f, -0.5f, -0.5f, -0.5f},
-                    {0,  1, -0.5f,  0.5f,  0.5f,  0.5f},
-                }};
-
-                for (const Edge& edge : Edges) {
-                    if (terrain_mask_pixel_is_hole(mask, x + edge.nx, y + edge.ny)) {
-                        continue;
-                    }
-                    const Vec3 top_a = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.ax, static_cast<float>(y) + edge.ay, top_radius);
-                    const Vec3 top_b = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.bx, static_cast<float>(y) + edge.by, top_radius);
-                    const Vec3 bottom_a = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.ax, static_cast<float>(y) + edge.ay, bottom_radius);
-                    const Vec3 bottom_b = terrain_mask_surface_point(mask, static_cast<float>(x) + edge.bx, static_cast<float>(y) + edge.by, bottom_radius);
-                    const Vec3 wall_normal = normalize(cross(top_b - top_a, bottom_a - top_a));
-                    append_quad(top_a, top_b, bottom_b, bottom_a, wall_normal);
+    for (uint32_t z = 0; z < cube_resolution; ++z) {
+        for (uint32_t y = 0; y < cube_resolution; ++y) {
+            for (uint32_t x = 0; x < cube_resolution; ++x) {
+                const uint32_t inside_mask = surface_net_dense_corner_mask(occupancy, resolution, x, y, z);
+                if (inside_mask != 0u && inside_mask != 0xffu) {
+                    cube_candidates.push_back({{x, y, z}, static_cast<uint8_t>(inside_mask)});
                 }
             }
         }
     }
+
+    for (uint32_t z = 0; z < resolution; ++z) {
+        for (uint32_t y = 0; y < resolution; ++y) {
+            for (uint32_t x = 0; x < resolution; ++x) {
+                if (!surface_net_bit(occupancy, surface_net_grid_index(x, y, z, resolution))) {
+                    continue;
+                }
+                SurfaceNetEdgeKey edge = {};
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 0u, false, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 0u, true, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 1u, false, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 1u, true, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 2u, false, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+                if (set_surface_net_edge_candidate_bit(edge_candidate_bits, occupancy, resolution, x, y, z, 2u, true, &edge)) {
+                    edge_candidates.push_back(edge);
+                }
+            }
+        }
+    }
+
+    const uint32_t max_vertices = std::max(1u, config.surface_net_max_vertices);
+    std::vector<int32_t> cube_vertices(cube_count, -1);
+    surface_net.source_depth = depth;
+    surface_net.bounds_radius = grid_radius;
+    surface_net.material_id = config.surface_net_material_id;
+    surface_net.dig_edit_count = static_cast<uint32_t>(config.voxel_edits.digs.size());
+    surface_net.local_edit_depth = config.voxel_edits.local_depth;
+    surface_net.occupied_voxel_count = occupied_count;
+    surface_net.candidate_cube_count = static_cast<uint32_t>(cube_candidates.size());
+    surface_net.vertices.reserve(std::min<uint32_t>(surface_net.candidate_cube_count, max_vertices));
+    surface_net.normals.reserve(surface_net.vertices.capacity());
+    surface_net.vertex_depths.reserve(surface_net.vertices.capacity());
+
+    for (const CaveSurfaceCubeCandidate& candidate : cube_candidates) {
+        if (surface_net.vertices.size() >= max_vertices) {
+            break;
+        }
+        const VoxelKey cube = candidate.key;
+        const Vec3 local_base = origin + Vec3{
+            static_cast<float>(cube.x) * step,
+            static_cast<float>(cube.y) * step,
+            static_cast<float>(cube.z) * step,
+        };
+        const SurfaceNetPlacement placement = surface_net_mask_placement(
+            candidate.inside_mask,
+            local_base,
+            step,
+            config.enable_surface_net_dual_contouring
+        );
+        if (length(placement.normal) <= 0.000001f) {
+            continue;
+        }
+
+        const Vec3 world_position = terrain_svo_patch_local_to_world(patch, placement.position);
+        Vec3 world_normal = normalize(
+            patch.tangent_mesh * placement.normal.x +
+            patch.bitangent_mesh * placement.normal.y -
+            patch.normal_mesh * placement.normal.z
+        );
+        if (length(world_normal) <= 0.000001f) {
+            world_normal = normalize(world_position);
+        }
+        const uint32_t vertex_index = static_cast<uint32_t>(surface_net.vertices.size());
+        surface_net.vertices.push_back(world_position);
+        surface_net.normals.push_back(world_normal);
+        surface_net.vertex_depths.push_back(TerrainSvoPatchDisplayDepth);
+        cube_vertices[surface_net_cube_index(cube.x, cube.y, cube.z, cube_resolution)] = static_cast<int32_t>(vertex_index);
+    }
+
+    surface_net.triangle_indices.resize(edge_candidates.size() * 6u);
+    uint32_t* triangle_write = surface_net.triangle_indices.data();
+    for (SurfaceNetEdgeKey edge : edge_candidates) {
+        if (write_surface_net_edge_candidate_quad(cube_vertices, cube_resolution, edge, triangle_write)) {
+            triangle_write += 6u;
+        }
+    }
+    surface_net.triangle_indices.resize(static_cast<size_t>(triangle_write - surface_net.triangle_indices.data()));
+    return surface_net;
+}
+
+SurfaceNetMesh build_terrain_svo_patch_surface_net(
+    const QuantizedMesh& mesh,
+    const LocalSurfaceNetPatch& local_patch,
+    float grid_radius,
+    const MarchingCubesConfig& config
+) {
+    SurfaceNetMesh combined;
+    combined.source_depth = std::clamp(config.voxel_edits.local_depth, 1u, MaxSvoDepth);
+    combined.bounds_radius = grid_radius;
+    combined.material_id = config.surface_net_material_id;
+    combined.local_edit_depth = config.voxel_edits.local_depth;
+    const std::vector<TerrainSvoPatchDescriptor> descriptors =
+        terrain_svo_patch_descriptors_for_patch(local_patch, mesh, config);
+    for (const TerrainSvoPatchDescriptor& descriptor : descriptors) {
+        SurfaceNetMesh patch_mesh = build_single_terrain_svo_patch_surface_net(descriptor, config, grid_radius);
+        if (!patch_mesh.vertices.empty() && !patch_mesh.triangle_indices.empty()) {
+            append_surface_net_mesh(combined, patch_mesh);
+        }
+    }
+    combined.local_patch_count = static_cast<uint32_t>(descriptors.size());
+    combined.local_patch_depth = combined.source_depth;
+    combined.local_vertex_count = static_cast<uint32_t>(combined.vertices.size());
+    combined.local_triangle_count = static_cast<uint32_t>(combined.triangle_indices.size() / 3u);
+    return combined;
 }
 
 void append_local_surface_net_transition_fill(
@@ -6339,13 +6524,6 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
     surface_net.source_depth = depth;
     surface_net.bounds_radius = grid_radius;
     surface_net.material_id = config.surface_net_material_id;
-    if (!config.voxel_edits.terrain_masks.empty()) {
-        const float mask_fill_depth = std::max(voxel_size * 4.0f, kilometers_to_world_units(4.0f));
-        append_terrain_mask_svo_fill(surface_net, patch, config, replaced_surface_radius, mask_fill_depth, depth);
-        surface_net.occupied_voxel_count = static_cast<uint32_t>(surface_net.vertices.size());
-        surface_net.candidate_cube_count = static_cast<uint32_t>(surface_net.triangle_indices.size() / 3u);
-        return surface_net;
-    }
 
     surface_net.vertices.reserve(std::min<uint32_t>((u_segments + 1u) * (v_segments + 1u), max_vertices));
     surface_net.normals.reserve(surface_net.vertices.capacity());
@@ -6356,9 +6534,6 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
         return normalize(plane_origin + tangent * u + bitangent * v) * replaced_surface_radius;
     };
     auto sample_carved = [&](Vec3 position) {
-        if (terrain_height_masks_carve(position, config.voxel_edits.terrain_masks)) {
-            return true;
-        }
         for (const PreparedVoxelDig& dig : digs) {
             if (length(dig.center_mesh) <= 0.000001f) {
                 continue;
@@ -6484,8 +6659,6 @@ SurfaceNetMesh build_fast_local_radial_surface_patch_mesh(
             append_wall(grid_vertices[grid_index(x, y)], grid_vertices[grid_index(x, y + 1u)]);
         }
     }
-
-    append_terrain_mask_svo_fill(surface_net, patch, config, replaced_surface_radius, wall_depth, depth);
 
     surface_net.occupied_voxel_count = static_cast<uint32_t>(surface_net.vertices.size());
     surface_net.candidate_cube_count = static_cast<uint32_t>(u_segments * v_segments);

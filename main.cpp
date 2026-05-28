@@ -145,7 +145,8 @@ bool ray_surface_net_intersection(
     const ae::SurfaceNetMesh& surface_net,
     ae::Vec3 origin_mesh,
     ae::Vec3 direction,
-    ae::Vec3& hit_mesh
+    ae::Vec3& hit_mesh,
+    float* hit_t = nullptr
 ) {
     if (surface_net.vertices.empty() || surface_net.triangle_indices.empty()) {
         return false;
@@ -181,6 +182,9 @@ bool ray_surface_net_intersection(
     }
 
     hit_mesh = origin_mesh + direction * closest_t;
+    if (hit_t != nullptr) {
+        *hit_t = closest_t;
+    }
     return true;
 }
 
@@ -447,6 +451,15 @@ bool terrain_mask_project(const ae::TerrainHeightMask& mask, ae::Vec3 point_mesh
     return true;
 }
 
+ae::Vec3 terrain_mask_pixel_to_mesh(const ae::TerrainHeightMask& mask, uint32_t x, uint32_t y) {
+    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
+    const float radius_mesh = ae::kilometers_to_world_units(mask.radius_km);
+    const float local_x = ((static_cast<float>(x) / resolution_minus_one) - 0.5f) * radius_mesh * 2.0f;
+    const float local_y = ((static_cast<float>(y) / resolution_minus_one) - 0.5f) * radius_mesh * 2.0f;
+    const float surface_radius = std::max(0.000001f, ae::length(mask.center_mesh));
+    return ae::normalize(mask.center_mesh + mask.tangent_mesh * local_x + mask.bitangent_mesh * local_y) * surface_radius;
+}
+
 size_t terrain_mask_for_point(ae::VoxelEditSet& edits, ae::Vec3 point_mesh) {
     size_t best = edits.terrain_masks.size();
     float best_margin = -1.0f;
@@ -535,95 +548,116 @@ void paint_terrain_mask_point(ae::VoxelEditSet& edits, size_t mask_index, ae::Ve
 
 std::vector<ae::LocalVoxelFeature> build_terrain_dig_holes(const ae::VoxelEditSet& edits) {
     std::vector<ae::LocalVoxelFeature> holes;
-    struct TerrainDig {
-        ae::Vec3 center;
-        float radius_km = 0.0f;
-        uint32_t depth = 16u;
-        uint32_t source_index = 0u;
-    };
+    constexpr uint32_t TerrainHoleFeatureIdBase = 0x80000000u;
+    constexpr uint16_t TerrainHeightHoleValue = TerrainHeightHole;
+    constexpr uint32_t TerrainHoleMinComponentPixels = 48u;
+    constexpr float TerrainHoleMinCaveRadiusKm = 6.0f;
 
-    std::vector<TerrainDig> terrain_digs;
-    terrain_digs.reserve(edits.digs.size());
-    for (uint32_t i = 0; i < edits.digs.size(); ++i) {
-        const ae::VoxelDigEdit& dig = edits.digs[i];
-        if (dig.target != ae::VoxelDigTarget::Terrain || dig.radius_km <= 0.0f || ae::length(dig.center_mesh) <= 0.000001f) {
-            continue;
-        }
-        terrain_digs.push_back({dig.center_mesh, dig.radius_km, dig.depth, i});
-    }
-
-    std::vector<uint8_t> visited(terrain_digs.size(), 0u);
-    std::vector<size_t> stack;
-    std::vector<size_t> cluster;
-    holes.reserve(terrain_digs.size());
-    for (size_t start = 0; start < terrain_digs.size(); ++start) {
-        if (visited[start] != 0u) {
+    for (uint32_t mask_index = 0; mask_index < edits.terrain_masks.size(); ++mask_index) {
+        const ae::TerrainHeightMask& mask = edits.terrain_masks[mask_index];
+        const size_t pixel_count = static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution);
+        if (mask.resolution == 0u || mask.heights.size() != pixel_count || ae::length(mask.center_mesh) <= 0.000001f) {
             continue;
         }
 
-        stack.clear();
-        cluster.clear();
-        visited[start] = 1u;
-        stack.push_back(start);
-        while (!stack.empty()) {
-            const size_t current = stack.back();
-            stack.pop_back();
-            cluster.push_back(current);
-            for (size_t candidate = 0; candidate < terrain_digs.size(); ++candidate) {
-                if (visited[candidate] != 0u) {
+        std::vector<uint8_t> visited(pixel_count, 0u);
+        std::vector<uint32_t> stack;
+        std::vector<uint32_t> component;
+        uint32_t component_index = 0u;
+        stack.reserve(256u);
+        component.reserve(256u);
+
+        for (uint32_t start_y = 0; start_y < mask.resolution; ++start_y) {
+            for (uint32_t start_x = 0; start_x < mask.resolution; ++start_x) {
+                const uint32_t start_index = start_y * mask.resolution + start_x;
+                if (visited[start_index] != 0u || mask.heights[start_index] != TerrainHeightHoleValue) {
                     continue;
                 }
-                const float distance_km = ae::world_units_to_kilometers(ae::length(terrain_digs[current].center - terrain_digs[candidate].center));
-                if (distance_km <= (terrain_digs[current].radius_km + terrain_digs[candidate].radius_km) * 1.08f) {
-                    visited[candidate] = 1u;
-                    stack.push_back(candidate);
+
+                stack.clear();
+                component.clear();
+                visited[start_index] = 1u;
+                stack.push_back(start_index);
+                while (!stack.empty()) {
+                    const uint32_t current = stack.back();
+                    stack.pop_back();
+                    component.push_back(current);
+                    const uint32_t cx = current % mask.resolution;
+                    const uint32_t cy = current / mask.resolution;
+                    for (int32_t oy = -1; oy <= 1; ++oy) {
+                        for (int32_t ox = -1; ox <= 1; ++ox) {
+                            if (ox == 0 && oy == 0) {
+                                continue;
+                            }
+                            const int32_t nx = static_cast<int32_t>(cx) + ox;
+                            const int32_t ny = static_cast<int32_t>(cy) + oy;
+                            if (nx < 0 || ny < 0 || nx >= static_cast<int32_t>(mask.resolution) || ny >= static_cast<int32_t>(mask.resolution)) {
+                                continue;
+                            }
+                            const uint32_t neighbor = static_cast<uint32_t>(ny) * mask.resolution + static_cast<uint32_t>(nx);
+                            if (visited[neighbor] != 0u || mask.heights[neighbor] != TerrainHeightHoleValue) {
+                                continue;
+                            }
+                            visited[neighbor] = 1u;
+                            stack.push_back(neighbor);
+                        }
+                    }
                 }
+
+                if (component.size() < TerrainHoleMinComponentPixels) {
+                    ++component_index;
+                    continue;
+                }
+
+                ae::Vec3 center_sum{};
+                for (uint32_t pixel : component) {
+                    center_sum = center_sum + terrain_mask_pixel_to_mesh(mask, pixel % mask.resolution, pixel / mask.resolution);
+                }
+                if (component.empty() || ae::length(center_sum) <= 0.000001f) {
+                    ++component_index;
+                    continue;
+                }
+
+                const ae::Vec3 center = center_sum * (1.0f / static_cast<float>(component.size()));
+                float radius_km = 0.0f;
+                for (uint32_t pixel : component) {
+                    const ae::Vec3 pixel_position = terrain_mask_pixel_to_mesh(mask, pixel % mask.resolution, pixel / mask.resolution);
+                    radius_km = std::max(radius_km, ae::world_units_to_kilometers(ae::length(pixel_position - center)));
+                }
+                const float pixel_radius_km = mask.radius_km / static_cast<float>(std::max(1u, mask.resolution - 1u));
+                radius_km = std::clamp(radius_km + pixel_radius_km * 2.0f, 4.0f, 56.0f);
+                if (radius_km < TerrainHoleMinCaveRadiusKm) {
+                    ++component_index;
+                    continue;
+                }
+
+                const ae::Vec3 normal = ae::normalize(center);
+                const ae::Vec3 tangent = ae::length(mask.tangent_mesh) > 0.000001f
+                    ? ae::normalize(mask.tangent_mesh)
+                    : ae::normalize(ae::cross(std::fabs(normal.y) < 0.92f ? ae::Vec3{0.0f, 1.0f, 0.0f} : ae::Vec3{1.0f, 0.0f, 0.0f}, normal));
+                const ae::Vec3 bitangent = ae::normalize(ae::cross(normal, tangent));
+                const uint32_t seed = 0x71d1d5u ^
+                    (mask_index * 0x9e3779b9u) ^
+                    (component_index * 0x85ebca6bu) ^
+                    (mask.revision * 0xc2b2ae35u);
+
+                ae::LocalVoxelFeature hole;
+                hole.kind = ae::VoxelFeatureKind::CaveSystem;
+                hole.feature_id = TerrainHoleFeatureIdBase | ((mask_index & 0x7fffu) << 16u) | (component_index & 0xffffu);
+                hole.center_mesh = center;
+                hole.normal_mesh = normal;
+                hole.tangent_mesh = tangent;
+                hole.bitangent_mesh = bitangent;
+                hole.entrance_radius_km = radius_km;
+                hole.tunnel_radius_km = std::max(3.0f, radius_km * 0.62f);
+                hole.chamber_radius_km = std::max(8.0f, radius_km * 1.35f);
+                hole.depth_km = std::clamp(radius_km * 3.5f, 18.0f, 140.0f);
+                hole.svo_depth = edits.local_depth;
+                hole.seed = seed;
+                holes.push_back(hole);
+                ++component_index;
             }
         }
-
-        ae::Vec3 center_sum{};
-        float weight_sum = 0.0f;
-        uint32_t depth = 1u;
-        uint32_t seed_index = terrain_digs[cluster.front()].source_index;
-        for (size_t index : cluster) {
-            const float weight = std::max(terrain_digs[index].radius_km, 0.001f);
-            center_sum = center_sum + terrain_digs[index].center * weight;
-            weight_sum += weight;
-            depth = std::max(depth, terrain_digs[index].depth);
-            seed_index = std::min(seed_index, terrain_digs[index].source_index);
-        }
-        if (weight_sum <= 0.0f || ae::length(center_sum) <= 0.000001f) {
-            continue;
-        }
-
-        const ae::Vec3 center = center_sum * (1.0f / weight_sum);
-        float radius_km = 0.0f;
-        for (size_t index : cluster) {
-            radius_km = std::max(
-                radius_km,
-                ae::world_units_to_kilometers(ae::length(terrain_digs[index].center - center)) + terrain_digs[index].radius_km
-            );
-        }
-
-        const ae::Vec3 normal = ae::normalize(center);
-        const ae::Vec3 reference = std::fabs(normal.y) < 0.92f ? ae::Vec3{0.0f, 1.0f, 0.0f} : ae::Vec3{1.0f, 0.0f, 0.0f};
-        const ae::Vec3 tangent = ae::normalize(ae::cross(reference, normal));
-        const ae::Vec3 bitangent = ae::cross(normal, tangent);
-
-        ae::LocalVoxelFeature hole;
-        hole.kind = ae::VoxelFeatureKind::CaveSystem;
-        hole.feature_id = 100000u + seed_index;
-        hole.center_mesh = center;
-        hole.normal_mesh = normal;
-        hole.tangent_mesh = tangent;
-        hole.bitangent_mesh = bitangent;
-        hole.entrance_radius_km = radius_km;
-        hole.tunnel_radius_km = radius_km;
-        hole.chamber_radius_km = radius_km;
-        hole.depth_km = radius_km;
-        hole.svo_depth = depth;
-        hole.seed = 0x71d1d5u ^ (seed_index * 0x9e3779b9u);
-        holes.push_back(hole);
     }
     return holes;
 }
@@ -636,6 +670,112 @@ std::vector<ae::LocalVoxelFeature> merge_hole_lists(
     holes.reserve(cave_holes.size() + terrain_holes.size());
     holes.insert(holes.end(), cave_holes.begin(), cave_holes.end());
     holes.insert(holes.end(), terrain_holes.begin(), terrain_holes.end());
+    return holes;
+}
+
+bool is_terrain_hole_feature_id(uint32_t feature_id) {
+    return (feature_id & 0x80000000u) != 0u;
+}
+
+uint32_t cave_priority_hash_u32(uint32_t value) {
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+ae::Vec3 cave_feature_local_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
+    const ae::Vec3 offset = point_mesh - feature.center_mesh;
+    return {
+        ae::world_units_to_kilometers(ae::dot(offset, feature.tangent_mesh)),
+        ae::world_units_to_kilometers(ae::dot(offset, feature.bitangent_mesh)),
+        ae::world_units_to_kilometers(-ae::dot(offset, feature.normal_mesh)),
+    };
+}
+
+float cave_tunnel_sdf_km(ae::Vec3 local, float entrance_radius, float tunnel_radius, float depth) {
+    const float z0 = 0.0f;
+    const float z1 = depth;
+    const float t = std::clamp((local.z - z0) / std::max(0.000001f, z1 - z0), 0.0f, 1.0f);
+    const float radius = entrance_radius * (1.0f - t) + tunnel_radius * t;
+    const float radial = std::sqrt(local.x * local.x + local.y * local.y) - radius;
+    return std::max(radial, std::max(z0 - local.z, local.z - z1));
+}
+
+float cave_feature_sdf_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
+    const ae::Vec3 local = cave_feature_local_km(feature, point_mesh);
+    float sdf = cave_tunnel_sdf_km(
+        local,
+        feature.entrance_radius_km,
+        feature.tunnel_radius_km,
+        feature.depth_km
+    );
+
+    const uint32_t side_hash = cave_priority_hash_u32(feature.seed ^ 0x9e3779b9u);
+    const float angle = (static_cast<float>(side_hash & 0xffffu) / 65535.0f) * 2.0f * ae::Pi;
+    const float side_distance = feature.chamber_radius_km * 0.42f;
+    const ae::Vec3 chamber_center{
+        std::cos(angle) * side_distance,
+        std::sin(angle) * side_distance,
+        feature.depth_km * 0.86f,
+    };
+    sdf = std::min(sdf, ae::length(local - chamber_center) - feature.chamber_radius_km);
+
+    const uint32_t lobe_hash = cave_priority_hash_u32(feature.seed ^ 0x51ed270bu);
+    const float lobe_angle = (static_cast<float>(lobe_hash & 0xffffu) / 65535.0f) * 2.0f * ae::Pi;
+    const ae::Vec3 lobe_center{
+        std::cos(lobe_angle) * feature.chamber_radius_km * 0.72f,
+        std::sin(lobe_angle) * feature.chamber_radius_km * 0.72f,
+        feature.depth_km * 0.58f,
+    };
+    return std::min(sdf, ae::length(local - lobe_center) - feature.chamber_radius_km * 0.48f);
+}
+
+float cave_feature_stream_distance_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
+    const float sdf = cave_feature_sdf_km(feature, point_mesh);
+    if (sdf <= 0.0f) {
+        return sdf;
+    }
+    const float center_distance = ae::world_units_to_kilometers(ae::length(point_mesh - feature.center_mesh));
+    return std::min(sdf, center_distance);
+}
+
+uint32_t nearest_cave_feature_id_for_point(
+    const std::vector<ae::LocalVoxelFeature>& features,
+    ae::Vec3 point_mesh
+) {
+    uint32_t best_feature_id = 0u;
+    float best_score = std::numeric_limits<float>::max();
+    for (const ae::LocalVoxelFeature& feature : features) {
+        if (feature.kind != ae::VoxelFeatureKind::CaveSystem) {
+            continue;
+        }
+        const float score = std::fabs(cave_feature_sdf_km(feature, point_mesh));
+        if (score < best_score) {
+            best_score = score;
+            best_feature_id = feature.feature_id;
+        }
+    }
+    return best_feature_id;
+}
+
+std::vector<ae::LocalVoxelFeature> build_goldberg_clip_holes(
+    const std::vector<ae::LocalVoxelFeature>& active_holes,
+    const ae::VoxelEditSet& edits
+) {
+    std::vector<ae::LocalVoxelFeature> holes;
+    (void)edits;
+    holes.reserve(active_holes.size());
+    for (const ae::LocalVoxelFeature& hole : active_holes) {
+        if (hole.kind != ae::VoxelFeatureKind::CaveSystem ||
+            hole.entrance_radius_km <= 0.0f ||
+            ae::length(hole.center_mesh) <= 0.000001f) {
+            continue;
+        }
+        holes.push_back(hole);
+    }
     return holes;
 }
 
@@ -659,7 +799,7 @@ struct CaveInteriorBuildResult {
 class CaveInteriorStreamer {
 public:
     void configure(const ae::QuantizedMesh& mesh, const ae::MarchingCubesConfig& config) {
-        features_ = mesh.voxel_features;
+        base_features_ = mesh.voxel_features;
         config_ = config;
         config_.progress_callback = {};
         grid_radius_ = mesh_bounds_radius(mesh);
@@ -674,16 +814,20 @@ public:
         last_rescore_ = std::chrono::steady_clock::time_point{};
         build_serial_ = 0;
         stats_ = {};
+        refresh_feature_list(false);
         stats_.descriptors = static_cast<uint32_t>(features_.size());
-        worker_count_ = 8u;
+        const uint32_t hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+        worker_count_ = std::max(1u, std::min(4u, hardware_threads > 1u ? hardware_threads - 1u : 1u));
     }
 
     void update_config(const ae::MarchingCubesConfig& config) {
         config_ = config;
         config_.progress_callback = {};
+        refresh_feature_list(true);
     }
 
     bool update(const ae::CameraView& view, ae::Vec3 aim_direction, uint32_t targeted_feature_id) {
+        current_eye_mesh_ = view.eye / ae::PlanetRadiusKilometers;
         bool changed = collect_ready_jobs();
         const auto now = std::chrono::steady_clock::now();
         const bool should_rescore =
@@ -740,6 +884,10 @@ public:
         return active_surface_;
     }
 
+    const std::vector<ae::LocalVoxelFeature>& features() const {
+        return features_;
+    }
+
     const std::vector<ae::LocalVoxelFeature>& active_holes() const {
         return active_holes_;
     }
@@ -749,9 +897,10 @@ public:
     }
 
 private:
-    static constexpr uint32_t ActiveBudget = 32u;
-    static constexpr uint32_t CacheBudget = 128u;
-    static constexpr uint32_t RenderedInteriorBudget = 8u;
+    static constexpr uint32_t ActiveBudget = 48u;
+    static constexpr uint32_t CacheBudget = 192u;
+    static constexpr uint32_t RenderedInteriorBudget = 16u;
+    static constexpr float AlwaysRenderedRadiusKm = 180.0f;
 
     struct CachedInterior {
         ae::SurfaceNetMesh surface;
@@ -765,6 +914,70 @@ private:
         uint32_t generation = 0;
         std::future<CaveInteriorBuildResult> future;
     };
+
+    void refresh_feature_list(bool activate_terrain_holes) {
+        const std::vector<ae::LocalVoxelFeature> terrain_holes = build_terrain_dig_holes(config_.voxel_edits);
+        std::unordered_set<uint32_t> old_terrain_ids = terrain_feature_ids_;
+        std::unordered_set<uint32_t> new_terrain_ids;
+        new_terrain_ids.reserve(terrain_holes.size());
+        for (const ae::LocalVoxelFeature& feature : terrain_holes) {
+            new_terrain_ids.insert(feature.feature_id);
+        }
+
+        bool terrain_features_changed = old_terrain_ids.size() != new_terrain_ids.size();
+        if (!terrain_features_changed) {
+            for (uint32_t feature_id : new_terrain_ids) {
+                if (old_terrain_ids.find(feature_id) == old_terrain_ids.end()) {
+                    terrain_features_changed = true;
+                    break;
+                }
+            }
+        }
+        if (!terrain_features_changed && terrain_holes.size() == terrain_feature_count_) {
+            for (const ae::LocalVoxelFeature& new_feature : terrain_holes) {
+                auto old_it = std::find_if(features_.begin(), features_.end(), [&](const ae::LocalVoxelFeature& old_feature) {
+                    return old_feature.feature_id == new_feature.feature_id;
+                });
+                if (old_it == features_.end() ||
+                    old_it->seed != new_feature.seed ||
+                    std::fabs(old_it->entrance_radius_km - new_feature.entrance_radius_km) > 0.001f ||
+                    ae::length(old_it->center_mesh - new_feature.center_mesh) > 0.000001f) {
+                    terrain_features_changed = true;
+                    break;
+                }
+            }
+        }
+
+        features_ = merge_hole_lists(base_features_, terrain_holes);
+        terrain_feature_ids_ = std::move(new_terrain_ids);
+        terrain_feature_count_ = terrain_holes.size();
+        stats_.descriptors = static_cast<uint32_t>(features_.size());
+
+        if (!terrain_features_changed) {
+            return;
+        }
+
+        for (uint32_t feature_id : old_terrain_ids) {
+            cache_.erase(feature_id);
+            queued_ids_.erase(feature_id);
+        }
+        for (uint32_t feature_id : terrain_feature_ids_) {
+            cache_.erase(feature_id);
+            queued_ids_.erase(feature_id);
+        }
+        active_ids_.erase(std::remove_if(active_ids_.begin(), active_ids_.end(), is_terrain_hole_feature_id), active_ids_.end());
+        if (activate_terrain_holes) {
+            for (auto it = terrain_holes.rbegin(); it != terrain_holes.rend(); ++it) {
+                active_ids_.insert(active_ids_.begin(), it->feature_id);
+            }
+            if (active_ids_.size() > ActiveBudget) {
+                active_ids_.resize(ActiveBudget);
+            }
+        }
+        ++edit_generation_;
+        last_rescore_ = std::chrono::steady_clock::time_point{};
+        active_surface_dirty_ = true;
+    }
 
     bool collect_ready_jobs() {
         bool changed = false;
@@ -813,15 +1026,54 @@ private:
             : ae::Vec3{0.0f, 1.0f, 0.0f};
         aim_direction = ae::normalize(aim_direction);
 
+        std::vector<std::pair<float, uint32_t>> nearby;
+        nearby.reserve(RenderedInteriorBudget);
+        for (const ae::LocalVoxelFeature& feature : features_) {
+            if (active_ids_.size() >= ActiveBudget) {
+                break;
+            }
+            if (std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
+                continue;
+            }
+            const float distance_km = cave_feature_stream_distance_km(feature, current_eye_mesh_);
+            if (distance_km <= AlwaysRenderedRadiusKm) {
+                nearby.push_back({distance_km, feature.feature_id});
+            }
+        }
+        std::sort(nearby.begin(), nearby.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.first < rhs.first;
+        });
+        for (const auto& [distance_km, feature_id] : nearby) {
+            (void)distance_km;
+            if (active_ids_.size() >= ActiveBudget) {
+                break;
+            }
+            active_ids_.push_back(feature_id);
+        }
+
+        for (const ae::LocalVoxelFeature& feature : features_) {
+            if (active_ids_.size() >= ActiveBudget) {
+                break;
+            }
+            if (!is_terrain_hole_feature_id(feature.feature_id) ||
+                std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
+                continue;
+            }
+            active_ids_.push_back(feature.feature_id);
+        }
+
         std::vector<std::pair<float, uint32_t>> best;
         best.reserve(ActiveBudget);
         for (const ae::LocalVoxelFeature& feature : features_) {
-            if (feature.feature_id == targeted_feature_id) {
+            if (std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
                 continue;
             }
+            const float stream_distance = cave_feature_stream_distance_km(feature, current_eye_mesh_);
             const float proximity = ae::dot(surface_focus, feature.center_mesh);
             const float aim = std::max(0.0f, ae::dot(aim_direction, feature.center_mesh));
-            const float score = proximity * 2.0f + aim * 0.35f;
+            const float distance_score = -std::max(stream_distance, 0.0f) * 0.012f;
+            const float inside_bonus = stream_distance <= 0.0f ? 12.0f : 0.0f;
+            const float score = inside_bonus + distance_score + proximity * 1.35f + aim * 0.28f;
             if (best.size() < ActiveBudget) {
                 best.push_back({score, feature.feature_id});
                 continue;
@@ -937,29 +1189,55 @@ private:
         active_surface_.material_id = config_.surface_net_material_id;
         active_surface_.bounds_radius = grid_radius_;
         active_surface_.local_patch_depth = config_.voxel_features.cave_depth;
+        struct RenderCandidate {
+            float distance_km = 0.0f;
+            uint32_t active_order = 0u;
+            const ae::LocalVoxelFeature* feature = nullptr;
+            const CachedInterior* cached = nullptr;
+        };
+        std::vector<RenderCandidate> render_candidates;
+        render_candidates.reserve(active_ids_.size());
         for (uint32_t feature_id : active_ids_) {
-            const size_t feature_index = static_cast<size_t>(feature_id - 1u);
-            if (feature_index < features_.size() && features_[feature_index].feature_id == feature_id) {
-                active_holes_.push_back(features_[feature_index]);
-                continue;
-            }
-            auto feature_it = std::find_if(features_.begin(), features_.end(), [feature_id](const ae::LocalVoxelFeature& feature) {
-                return feature.feature_id == feature_id;
-            });
-            if (feature_it != features_.end()) {
-                active_holes_.push_back(*feature_it);
-            }
-        }
-        uint32_t rendered_count = 0u;
-        for (uint32_t feature_id : active_ids_) {
-            if (rendered_count >= RenderedInteriorBudget) {
-                break;
-            }
             auto found = cache_.find(feature_id);
             if (found == cache_.end()) {
                 continue;
             }
-            append_surface_mesh(active_surface_, found->second.surface);
+            const ae::LocalVoxelFeature* feature = nullptr;
+            const size_t feature_index = static_cast<size_t>(feature_id - 1u);
+            if (feature_index < features_.size() && features_[feature_index].feature_id == feature_id) {
+                feature = &features_[feature_index];
+            } else {
+                auto feature_it = std::find_if(features_.begin(), features_.end(), [feature_id](const ae::LocalVoxelFeature& feature) {
+                    return feature.feature_id == feature_id;
+                });
+                if (feature_it != features_.end()) {
+                    feature = &*feature_it;
+                }
+            }
+            if (feature == nullptr) {
+                continue;
+            }
+            render_candidates.push_back({
+                cave_feature_stream_distance_km(*feature, current_eye_mesh_),
+                static_cast<uint32_t>(render_candidates.size()),
+                feature,
+                &found->second,
+            });
+        }
+        std::sort(render_candidates.begin(), render_candidates.end(), [](const RenderCandidate& lhs, const RenderCandidate& rhs) {
+            if (std::fabs(lhs.distance_km - rhs.distance_km) > 0.001f) {
+                return lhs.distance_km < rhs.distance_km;
+            }
+            return lhs.active_order < rhs.active_order;
+        });
+
+        uint32_t rendered_count = 0u;
+        for (const RenderCandidate& candidate : render_candidates) {
+            if (rendered_count >= RenderedInteriorBudget) {
+                break;
+            }
+            active_holes_.push_back(*candidate.feature);
+            append_surface_mesh(active_surface_, candidate.cached->surface);
             ++rendered_count;
         }
         active_surface_.local_patch_count = static_cast<uint32_t>(active_ids_.size());
@@ -969,12 +1247,16 @@ private:
     }
 
     std::vector<ae::LocalVoxelFeature> features_;
+    std::vector<ae::LocalVoxelFeature> base_features_;
+    std::unordered_set<uint32_t> terrain_feature_ids_;
+    size_t terrain_feature_count_ = 0u;
     ae::MarchingCubesConfig config_;
     float grid_radius_ = 1.0f;
     uint32_t worker_count_ = 1u;
     uint64_t build_serial_ = 0u;
     uint32_t edit_generation_ = 0u;
     uint32_t last_targeted_feature_id_ = 0u;
+    ae::Vec3 current_eye_mesh_ = {};
     std::chrono::steady_clock::time_point last_rescore_ = {};
     std::vector<uint32_t> active_ids_;
     std::unordered_map<uint32_t, CachedInterior> cache_;
@@ -1222,7 +1504,8 @@ int main() {
     cave_streamer.configure(current_mesh, mesh_config);
     renderer.update_cave_interiors(cave_streamer.active_surface());
     auto sync_terrain_hole_renderer = [&]() {
-        renderer.update_terrain_holes(cave_streamer.active_holes());
+        renderer.update_terrain_holes(build_goldberg_clip_holes(cave_streamer.active_holes(), voxel_edits));
+        renderer.update_cave_dig_transitions(cave_streamer.active_holes(), voxel_edits);
         renderer.update_terrain_height_masks(voxel_edits.terrain_masks);
     };
     sync_terrain_hole_renderer();
@@ -1390,16 +1673,23 @@ int main() {
                 const ae::Vec3 dig_direction = ae::normalize(dig_view.target - dig_view.eye);
                 ae::Vec3 hit_mesh = {};
                 uint32_t hit_feature_id = 0u;
+                ae::Vec3 cave_surface_hit_mesh = {};
+                float cave_surface_hit_t = std::numeric_limits<float>::max();
                 const bool hit_active_cave = ray_surface_net_intersection(
                     cave_streamer.active_surface(),
                     dig_view.eye / ae::PlanetRadiusKilometers,
                     dig_direction,
-                    hit_mesh
+                    cave_surface_hit_mesh,
+                    &cave_surface_hit_t
                 );
+                if (hit_active_cave) {
+                    hit_mesh = cave_surface_hit_mesh;
+                    hit_feature_id = nearest_cave_feature_id_for_point(cave_streamer.active_holes(), hit_mesh);
+                }
                 bool hit_cave_feature = hit_active_cave;
                 CaveFeatureRayHit cave_hit = {};
                 if (!hit_cave_feature && ray_cave_feature_hit(
-                        current_mesh.voxel_features,
+                        cave_streamer.features(),
                         dig_view.eye / ae::PlanetRadiusKilometers,
                         dig_direction,
                         cave_hit,
@@ -1416,14 +1706,15 @@ int main() {
                         8.0f,
                         voxel_edits.local_depth,
                         ae::VoxelDigTarget::CaveInterior,
+                        hit_feature_id,
                     });
                     mesh_config.voxel_edits = voxel_edits;
                     cave_streamer.update_config(mesh_config);
                     mesh_config.lod_camera_position = dig_view.eye;
-                    if (hit_active_cave) {
-                        cave_streamer.invalidate_active();
-                    } else if (hit_feature_id != 0u) {
+                    if (hit_feature_id != 0u) {
                         cave_streamer.invalidate_feature(hit_feature_id);
+                    } else if (hit_active_cave) {
+                        cave_streamer.invalidate_active();
                     }
                     sync_terrain_hole_renderer();
                     std::cout << "Dig edit " << voxel_edits.digs.size()
@@ -1441,13 +1732,10 @@ int main() {
                     mesh_config.voxel_edits = voxel_edits;
                     cave_streamer.update_config(mesh_config);
                     mesh_config.lod_camera_position = dig_view.eye;
-                    request_voxel_mesh_rebuild("terrain dig");
                     sync_terrain_hole_renderer();
                     std::cout << "Terrain height mask stroke: brush 8 km, masks "
                               << voxel_edits.terrain_masks.size()
-                              << ", promotion threshold "
-                              << mesh_config.terrain_svo_promotion_radius_km
-                              << " km" << std::endl;
+                              << ", streamed cave requested" << std::endl;
                 }
             } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
                 terrain_paint_active = false;
@@ -1478,7 +1766,6 @@ int main() {
                     mesh_config.voxel_edits = voxel_edits;
                     cave_streamer.update_config(mesh_config);
                     mesh_config.lod_camera_position = paint_view.eye;
-                    request_voxel_mesh_rebuild("terrain dig");
                     sync_terrain_hole_renderer();
                 }
             } else if (event.type == SDL_EVENT_MOUSE_MOTION && render_options.follow_ship) {
@@ -1554,7 +1841,7 @@ int main() {
             cave_target_now - last_cave_target_update >= std::chrono::milliseconds(125)) {
             CaveFeatureRayHit targeted_cave = {};
             targeted_feature_id = ray_cave_feature_hit(
-                current_mesh.voxel_features,
+                cave_streamer.features(),
                 camera_view.eye / ae::PlanetRadiusKilometers,
                 frame_aim_direction,
                 targeted_cave,

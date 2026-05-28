@@ -15,6 +15,7 @@ namespace ae {
 enum class VoxelDigTarget : uint8_t {
     CaveInterior = 0,
     Terrain = 1,
+    TerrainSvoPatch = 2,
 };
 
 struct VoxelDigEdit {
@@ -22,6 +23,7 @@ struct VoxelDigEdit {
     float radius_km = 8.0f;
     uint32_t depth = 16;
     VoxelDigTarget target = VoxelDigTarget::CaveInterior;
+    uint32_t feature_id = 0;
 };
 
 struct TerrainHeightMask {
