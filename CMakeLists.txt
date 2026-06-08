@@ -22,11 +22,8 @@ find_package(OpenGL REQUIRED)
 
 add_executable(AETHERONUS
     main.cpp
-    src/debug_renderer.cpp
     src/math.cpp
-    src/meshing.cpp
     src/point_cloud.cpp
-    src/spaceship.cpp
     src/topology.cpp
     glad/src/glad.c
 )

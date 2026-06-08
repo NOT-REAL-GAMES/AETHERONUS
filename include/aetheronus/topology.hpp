@@ -20,6 +20,15 @@ struct GeodesicMesh {
     uint32_t original_vertex_count = 0;
 };
 
+struct GoldbergConfig {
+    uint32_t m = 4;
+    uint32_t n = 0;
+
+    uint32_t frequency() const {
+        return m * m + m * n + n * n;
+    }
+};
+
 enum class GoldbergCellKind : uint8_t {
     Pentagon,
     Hexagon,
@@ -38,6 +47,8 @@ struct GoldbergCell {
 };
 
 struct GoldbergTopology {
+    GoldbergConfig config;
+    uint32_t frequency = 0;
     GeodesicMesh geodesic;
     std::vector<GoldbergVertex> vertices;
     std::vector<GoldbergCell> cells;
@@ -49,7 +60,7 @@ struct TopologyValidation {
     std::string message;
 };
 
-GoldbergTopology build_goldberg_topology(uint32_t subdivision_level);
+GoldbergTopology build_goldberg_topology(GoldbergConfig config = {});
 TopologyValidation validate_topology(const GoldbergTopology& topology, uint32_t point_count);
 
 } // namespace ae

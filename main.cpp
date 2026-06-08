@@ -1,8 +1,6 @@
-#include "aetheronus/debug_renderer.hpp"
-#include "aetheronus/meshing.hpp"
-#include "aetheronus/planet_scale.hpp"
+#include "aetheronus/marching_cubes_tables.hpp"
+#include "aetheronus/math.hpp"
 #include "aetheronus/point_cloud.hpp"
-#include "aetheronus/spaceship.hpp"
 #include "aetheronus/topology.hpp"
 
 #include <glad/glad.h>
@@ -10,674 +8,336 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <future>
+#include <cstdint>
+#include <cstdlib>
+#include <atomic>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <numeric>
+#include <queue>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <condition_variable>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 #include <vector>
 
 namespace {
 
-constexpr uint32_t DefaultSvoDepth = 8;
-constexpr uint32_t HighSvoDepth = 16;
-constexpr uint32_t StreamedCaveDepth = 4;
-constexpr uint32_t SvoDebugDrawDepth = 8;
+constexpr float PlanetRadius = 1.0f;
+constexpr float GridRadius = 1.08f;
+constexpr float CoreVoidRadius = 0.20f;
 
-enum class MeshBuildMode {
-    Full,
-    VoxelsOnly,
+struct RenderVertex {
+    ae::Vec3 position;
+    ae::Vec3 normal;
+    ae::Vec3 color;
 };
 
-void print_gl_string(GLenum name, const char* label) {
-    const GLubyte* value = glGetString(name);
-    std::cout << label << ": " << (value != nullptr ? reinterpret_cast<const char*>(value) : "unknown") << '\n';
-}
-
-bool set_gl_attribute(SDL_GLAttr attribute, int value, const char* name) {
-    if (SDL_GL_SetAttribute(attribute, value)) {
-        return true;
-    }
-
-    std::cerr << "SDL_GL_SetAttribute failed for " << name << ": " << SDL_GetError() << std::endl;
-    return false;
-}
-
-ae::Vec3 free_camera_forward(const ae::FreeCamera& camera) {
-    const float cp = std::cos(camera.pitch);
-    return {
-        cp * std::sin(camera.yaw),
-        std::sin(camera.pitch),
-        cp * std::cos(camera.yaw),
-    };
-}
-
-ae::Vec3 free_camera_right(const ae::FreeCamera& camera) {
-    return ae::normalize(ae::cross(free_camera_forward(camera), {0.0f, 1.0f, 0.0f}));
-}
-
-ae::Vec3 free_camera_eye(const ae::FreeCamera& camera) {
-    return camera.target - free_camera_forward(camera) * camera.distance;
-}
-
-ae::CameraView make_free_camera_view(const ae::FreeCamera& camera) {
-    const ae::Vec3 forward = free_camera_forward(camera);
-    return {free_camera_eye(camera), camera.target, {0.0f, 1.0f, 0.0f}};
-}
-
-ae::CameraView make_ship_follow_view(const ae::SpaceshipState& ship) {
-    const ae::Vec3 ship_up = ae::normalize(ship.up);
-    const ae::Vec3 forward = ae::normalize(ship.forward);
-    const ae::Vec3 position = ae::spaceship_position(ship);
-    return {
-        position - forward * 0.70f + ship_up * 0.24f,
-        position + forward * 0.55f,
-        ship_up,
-    };
-}
-
-bool ray_sphere_intersection(ae::Vec3 origin, ae::Vec3 direction, float radius, ae::Vec3& hit) {
-    direction = ae::normalize(direction);
-    const float b = 2.0f * ae::dot(origin, direction);
-    const float c = ae::dot(origin, origin) - radius * radius;
-    const float discriminant = b * b - 4.0f * c;
-    if (discriminant < 0.0f) {
-        return false;
-    }
-
-    const float root = std::sqrt(discriminant);
-    const float t0 = (-b - root) * 0.5f;
-    const float t1 = (-b + root) * 0.5f;
-    const float t = t0 > 0.0f ? t0 : t1;
-    if (t <= 0.0f) {
-        return false;
-    }
-
-    hit = origin + direction * t;
-    return true;
-}
-
-bool ray_triangle_intersection(
-    ae::Vec3 origin,
-    ae::Vec3 direction,
-    ae::Vec3 a,
-    ae::Vec3 b,
-    ae::Vec3 c,
-    float& t
-) {
-    constexpr float Epsilon = 0.0000001f;
-    const ae::Vec3 edge_ab = b - a;
-    const ae::Vec3 edge_ac = c - a;
-    const ae::Vec3 p = ae::cross(direction, edge_ac);
-    const float determinant = ae::dot(edge_ab, p);
-    if (std::fabs(determinant) < Epsilon) {
-        return false;
-    }
-
-    const float inverse_determinant = 1.0f / determinant;
-    const ae::Vec3 s = origin - a;
-    const float u = inverse_determinant * ae::dot(s, p);
-    if (u < 0.0f || u > 1.0f) {
-        return false;
-    }
-
-    const ae::Vec3 q = ae::cross(s, edge_ab);
-    const float v = inverse_determinant * ae::dot(direction, q);
-    if (v < 0.0f || u + v > 1.0f) {
-        return false;
-    }
-
-    t = inverse_determinant * ae::dot(edge_ac, q);
-    return t > Epsilon;
-}
-
-bool ray_surface_net_intersection(
-    const ae::SurfaceNetMesh& surface_net,
-    ae::Vec3 origin_mesh,
-    ae::Vec3 direction,
-    ae::Vec3& hit_mesh,
-    float* hit_t = nullptr
-) {
-    if (surface_net.vertices.empty() || surface_net.triangle_indices.empty()) {
-        return false;
-    }
-
-    direction = ae::normalize(direction);
-    bool found = false;
-    float closest_t = std::numeric_limits<float>::max();
-    for (uint32_t i = 0; i + 2 < surface_net.triangle_indices.size(); i += 3) {
-        const uint32_t ia = surface_net.triangle_indices[i];
-        const uint32_t ib = surface_net.triangle_indices[i + 1u];
-        const uint32_t ic = surface_net.triangle_indices[i + 2u];
-        if (ia >= surface_net.vertices.size() || ib >= surface_net.vertices.size() || ic >= surface_net.vertices.size()) {
-            continue;
-        }
-
-        float t = 0.0f;
-        if (ray_triangle_intersection(
-                origin_mesh,
-                direction,
-                surface_net.vertices[ia],
-                surface_net.vertices[ib],
-                surface_net.vertices[ic],
-                t
-            ) && t < closest_t) {
-            closest_t = t;
-            found = true;
-        }
-    }
-
-    if (!found) {
-        return false;
-    }
-
-    hit_mesh = origin_mesh + direction * closest_t;
-    if (hit_t != nullptr) {
-        *hit_t = closest_t;
-    }
-    return true;
-}
-
-bool ray_quantized_mesh_intersection(
-    const ae::QuantizedMesh& mesh,
-    ae::Vec3 origin_mesh,
-    ae::Vec3 direction,
-    ae::Vec3& hit_mesh
-) {
-    if (mesh.vertices.empty()) {
-        return false;
-    }
-
-    direction = ae::normalize(direction);
-    bool found = false;
-    float closest_t = std::numeric_limits<float>::max();
-    auto scan_indices = [&](const std::vector<uint32_t>& indices) {
-        for (uint32_t i = 0; i + 2u < indices.size(); i += 3u) {
-            const uint32_t ia = indices[i];
-            const uint32_t ib = indices[i + 1u];
-            const uint32_t ic = indices[i + 2u];
-            if (ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size()) {
-                continue;
-            }
-
-            float t = 0.0f;
-            if (ray_triangle_intersection(
-                    origin_mesh,
-                    direction,
-                    mesh.vertices[ia].position,
-                    mesh.vertices[ib].position,
-                    mesh.vertices[ic].position,
-                    t
-                ) && t < closest_t) {
-                closest_t = t;
-                found = true;
-            }
-        }
-    };
-
-    scan_indices(mesh.triangle_indices);
-    scan_indices(mesh.stitch_triangle_indices);
-    if (!found) {
-        return false;
-    }
-
-    hit_mesh = origin_mesh + direction * closest_t;
-    return true;
-}
-
-struct CaveFeatureRayHit {
-    uint32_t feature_id = 0;
-    ae::Vec3 hit_mesh = {};
+struct MinePath {
+    std::vector<ae::Vec3> points;
+    float radius = 0.045f;
+    bool primary = false;
 };
 
-constexpr float CaveViewTargetMaxDistanceKm = 900.0f;
-constexpr float CaveClickTargetMaxDistanceKm = 1200.0f;
-constexpr uint32_t CaveRayCandidateLimit = 32u;
-
-bool ray_cave_feature_hit(
-    const std::vector<ae::LocalVoxelFeature>& features,
-    ae::Vec3 origin_mesh,
-    ae::Vec3 direction,
-    CaveFeatureRayHit& hit,
-    float max_distance_km = CaveViewTargetMaxDistanceKm
-) {
-    direction = ae::normalize(direction);
-    const float max_distance_mesh = ae::kilometers_to_world_units(max_distance_km);
-    const float max_distance_sq = max_distance_mesh * max_distance_mesh;
-    struct Candidate {
-        float projected_distance = 0.0f;
-        const ae::LocalVoxelFeature* feature = nullptr;
-    };
-    std::array<Candidate, CaveRayCandidateLimit> candidates = {};
-    uint32_t candidate_count = 0u;
-
-    auto keep_candidate = [&](float projected_distance, const ae::LocalVoxelFeature& feature) {
-        if (candidate_count < CaveRayCandidateLimit) {
-            candidates[candidate_count++] = {projected_distance, &feature};
-            return;
-        }
-        uint32_t worst_index = 0u;
-        float worst_distance = candidates[0].projected_distance;
-        for (uint32_t i = 1u; i < CaveRayCandidateLimit; ++i) {
-            if (candidates[i].projected_distance > worst_distance) {
-                worst_distance = candidates[i].projected_distance;
-                worst_index = i;
-            }
-        }
-        if (projected_distance < worst_distance) {
-            candidates[worst_index] = {projected_distance, &feature};
-        }
-    };
-
-    for (const ae::LocalVoxelFeature& feature : features) {
-        if (feature.kind != ae::VoxelFeatureKind::CaveSystem) {
-            continue;
-        }
-
-        const ae::Vec3 to_center = feature.center_mesh - origin_mesh;
-        const float center_distance_sq = ae::dot(to_center, to_center);
-        if (center_distance_sq > max_distance_sq) {
-            continue;
-        }
-
-        const float projected_distance = ae::dot(to_center, direction);
-        if (projected_distance <= 0.0f || projected_distance > max_distance_mesh) {
-            continue;
-        }
-
-        const float entrance_radius = ae::kilometers_to_world_units(feature.entrance_radius_km) * 1.65f;
-        const float perpendicular_sq = center_distance_sq - projected_distance * projected_distance;
-        if (perpendicular_sq > entrance_radius * entrance_radius) {
-            continue;
-        }
-
-        keep_candidate(projected_distance, feature);
-    }
-
-    bool found = false;
-    float closest_t = std::numeric_limits<float>::max();
-    ae::Vec3 closest_hit = {};
-    uint32_t closest_feature_id = 0;
-
-    for (uint32_t candidate_index = 0u; candidate_index < candidate_count; ++candidate_index) {
-        const ae::LocalVoxelFeature* feature = candidates[candidate_index].feature;
-        if (feature == nullptr) {
-            continue;
-        }
-
-        const float denominator = ae::dot(direction, feature->normal_mesh);
-        if (std::fabs(denominator) <= 0.000001f) {
-            continue;
-        }
-
-        const float t = ae::dot(feature->center_mesh - origin_mesh, feature->normal_mesh) / denominator;
-        if (t <= 0.0f || t >= closest_t || t > max_distance_mesh) {
-            continue;
-        }
-
-        const ae::Vec3 plane_hit = origin_mesh + direction * t;
-        const ae::Vec3 offset = plane_hit - feature->center_mesh;
-        const float u = ae::dot(offset, feature->tangent_mesh);
-        const float v = ae::dot(offset, feature->bitangent_mesh);
-        const float entrance_radius = ae::kilometers_to_world_units(feature->entrance_radius_km) * 1.15f;
-        if ((u * u + v * v) > entrance_radius * entrance_radius) {
-            continue;
-        }
-
-        const float seed_depth = std::max(
-            ae::kilometers_to_world_units(2.0f),
-            ae::kilometers_to_world_units(feature->tunnel_radius_km) * 0.45f
-        );
-        closest_hit = plane_hit - feature->normal_mesh * seed_depth;
-        closest_t = t;
-        closest_feature_id = feature->feature_id;
-        found = true;
-    }
-
-    if (!found) {
-        return false;
-    }
-
-    hit.feature_id = closest_feature_id;
-    hit.hit_mesh = closest_hit;
-    return true;
-}
-
-struct MeshBuildResult {
-    ae::QuantizedMesh mesh;
-    ae::QuantizedMeshValidation validation;
-    ae::Vec3 camera_position;
-    ae::Vec3 lod_focus;
-    uint32_t revision = 0;
-    MeshBuildMode mode = MeshBuildMode::Full;
-    std::string reason;
-    double queue_wait_ms = 0.0;
-    double async_build_ms = 0.0;
-    double validation_ms = 0.0;
+struct MineChamber {
+    ae::Vec3 center;
+    float radius = 0.08f;
+    bool resource = false;
 };
 
-struct BuildProgressState {
-    static constexpr double UnitsPerDone = 1000000000.0;
-    std::atomic<uint64_t> units = 0;
-    mutable std::mutex label_mutex;
-    std::string label = "Queued";
+struct MineEntrance {
+    uint32_t sample_id = 0;
+    ae::Vec3 direction;
+};
 
-    void set(double progress, const char* next_label) {
-        const double clamped = std::clamp(progress, 0.0, 1.0);
-        units.store(static_cast<uint64_t>(std::round(clamped * UnitsPerDone)), std::memory_order_relaxed);
-        if (next_label != nullptr) {
-            std::lock_guard lock(label_mutex);
-            label = next_label;
+struct MineNetwork {
+    std::vector<MineEntrance> entrances;
+    std::vector<MinePath> primary_shafts;
+    std::vector<MinePath> branches;
+    std::vector<MineChamber> chambers;
+};
+
+struct MineSettings {
+    uint32_t seed = 1337u;
+    uint32_t mine_density = 24u;
+    float tunnel_radius = 0.046f;
+    uint32_t requested_grid_resolution = 512u;
+};
+
+enum class SdfEditMode : uint8_t {
+    Carve,
+    Fill,
+};
+
+enum class SdfEditShape : uint8_t {
+    Sphere,
+    Capsule,
+};
+
+enum class EditMaterial : uint8_t {
+    Auto,
+    Crust,
+    MineWall,
+    Resource,
+    Fill,
+};
+
+enum class EditableObjectKind : uint8_t {
+    Chamber,
+    Tunnel,
+};
+
+struct SdfEdit {
+    uint32_t id = 0;
+    uint32_t object_id = 0;
+    SdfEditMode mode = SdfEditMode::Carve;
+    SdfEditShape shape = SdfEditShape::Sphere;
+    ae::Vec3 center;
+    ae::Vec3 a;
+    ae::Vec3 b;
+    float radius = 0.05f;
+    float blend = 0.020f;
+    EditMaterial material = EditMaterial::MineWall;
+};
+
+struct EditableMineObject {
+    uint32_t id = 0;
+    EditableObjectKind kind = EditableObjectKind::Chamber;
+    std::vector<ae::Vec3> points;
+    float radius = 0.06f;
+    EditMaterial material = EditMaterial::MineWall;
+    bool enabled = true;
+};
+
+struct BuildStats {
+    bool ok = false;
+    uint32_t seed = 0;
+    uint32_t entrances = 0;
+    uint32_t primary_shafts = 0;
+    uint32_t branch_tunnels = 0;
+    uint32_t chambers = 0;
+    uint32_t grid_resolution = 0;
+    uint32_t vertices = 0;
+    uint32_t triangles = 0;
+    uint32_t invalid_indices = 0;
+    uint32_t degenerate_triangles = 0;
+    uint32_t open_edges = 0;
+    uint32_t nonmanifold_edges = 0;
+    uint32_t edit_count = 0;
+    uint32_t dirty_chunks = 0;
+    float brush_radius = 0.046f;
+    double last_remesh_ms = 0.0;
+    std::string message;
+};
+
+struct TestbedMesh {
+    std::vector<RenderVertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<RenderVertex> graph_lines;
+    BuildStats stats;
+};
+
+struct GpuMesh {
+    uint32_t line_vao = 0;
+    uint32_t line_vbo = 0;
+    uint32_t line_vertex_count = 0;
+    uint32_t chunk_index_count = 0;
+};
+
+struct GpuChunk {
+    uint32_t vao = 0;
+    uint32_t vbo = 0;
+    uint32_t ebo = 0;
+    uint32_t index_count = 0;
+    uint32_t generation = 0;
+};
+
+struct GpuChunkStore {
+    std::unordered_map<uint64_t, GpuChunk> chunks;
+    std::deque<uint64_t> urgent_uploads;
+    std::deque<uint64_t> pending_uploads;
+    std::unordered_set<uint64_t> urgent_codes;
+    std::unordered_set<uint64_t> pending_codes;
+};
+
+struct MortonChunkKey {
+    uint64_t code = 0;
+    uint32_t lod = 0;
+    uint32_t x = 0;
+    uint32_t y = 0;
+    uint32_t z = 0;
+};
+
+enum class ChunkState : uint8_t {
+    Empty,
+    Queued,
+    Building,
+    Ready,
+};
+
+struct MineSdfChunk {
+    MortonChunkKey key;
+    uint32_t min_x = 0;
+    uint32_t min_y = 0;
+    uint32_t min_z = 0;
+    uint32_t max_x = 0;
+    uint32_t max_y = 0;
+    uint32_t max_z = 0;
+    ChunkState state = ChunkState::Empty;
+    bool dirty = true;
+    bool queued = false;
+    bool gpu_dirty = true;
+    bool urgent = false;
+    uint32_t build_serial = 1;
+    float priority = 0.0f;
+    std::vector<float> values;
+    std::vector<uint8_t> material_tags;
+    std::vector<RenderVertex> vertices;
+    std::vector<uint32_t> indices;
+    uint32_t invalid_indices = 0;
+    uint32_t degenerate_triangles = 0;
+};
+
+struct SdfPrimitive {
+    SdfEditMode mode = SdfEditMode::Carve;
+    SdfEditShape shape = SdfEditShape::Sphere;
+    ae::Vec3 center;
+    ae::Vec3 a;
+    ae::Vec3 b;
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    float radius = 0.05f;
+    float blend = 0.02f;
+    EditMaterial material = EditMaterial::MineWall;
+};
+
+struct ChunkBuildJob {
+    uint32_t generation = 0;
+    MortonChunkKey key;
+    float priority = 0.0f;
+};
+
+struct ChunkBuildResult {
+    uint32_t generation = 0;
+    uint32_t build_serial = 0;
+    MortonChunkKey key;
+    MineSdfChunk chunk;
+};
+
+struct MineSdfField {
+    uint32_t resolution = 0;
+    uint32_t point_resolution = 0;
+    uint32_t chunk_size = 16;
+    uint32_t chunks_x = 0;
+    uint32_t chunks_y = 0;
+    uint32_t chunks_z = 0;
+    float voxel = 0.0f;
+    float brush_radius = 0.046f;
+    double last_remesh_ms = 0.0;
+    uint32_t generation = 1;
+    bool streaming_paused = false;
+    uint32_t next_edit_id = 1;
+    uint32_t next_object_id = 1;
+    std::vector<SdfPrimitive> procedural_primitives;
+    std::vector<SdfPrimitive> edit_primitives;
+    std::vector<MortonChunkKey> active_keys;
+    std::unordered_map<uint64_t, MineSdfChunk> chunks;
+    std::unordered_set<uint64_t> queued_codes;
+    std::vector<SdfEdit> edits;
+    std::vector<SdfEdit> redo_edits;
+    std::vector<EditableMineObject> objects;
+    bool has_tunnel_mark = false;
+    ae::Vec3 tunnel_mark;
+    uint32_t completed_jobs_total = 0;
+    uint32_t completed_jobs_last_frame = 0;
+    uint32_t queued_jobs_last_frame = 0;
+    uint32_t uploaded_chunks_last_frame = 0;
+    std::array<uint32_t, 3u> visible_lod_counts = {0u, 0u, 0u};
+    uint32_t transition_triangle_count = 0;
+    uint32_t stale_result_drops = 0;
+    double fps_estimate = 0.0;
+};
+
+struct WorkerTask {
+    uint32_t generation = 0;
+    uint64_t sequence = 0;
+    float priority = 0.0f;
+    std::function<ChunkBuildResult()> build;
+};
+
+struct WorkerTaskCompare {
+    bool operator()(const WorkerTask& lhs, const WorkerTask& rhs) const {
+        if (lhs.priority != rhs.priority) {
+            return lhs.priority > rhs.priority;
         }
-    }
-
-    double progress() const {
-        return static_cast<double>(units.load(std::memory_order_relaxed)) / UnitsPerDone;
-    }
-
-    std::string label_copy() const {
-        std::lock_guard lock(label_mutex);
-        return label;
+        return lhs.sequence > rhs.sequence;
     }
 };
 
-float mesh_bounds_radius(const ae::QuantizedMesh& mesh) {
-    float radius = 1.0f;
-    for (const ae::QuantizedMeshVertex& vertex : mesh.vertices) {
-        radius = std::max(radius, ae::length(vertex.position));
+struct WorkerPool {
+    std::vector<std::thread> threads;
+    std::priority_queue<WorkerTask, std::vector<WorkerTask>, WorkerTaskCompare> queue;
+    std::vector<ChunkBuildResult> completed;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> stop = false;
+    uint64_t next_sequence = 1;
+    uint32_t worker_count = 0;
+};
+
+struct Camera {
+    bool fly_mode = true;
+    ae::Vec3 position = {0.0f, 0.0f, 0.78f};
+    ae::Vec3 forward = {0.0f, 0.0f, -1.0f};
+    ae::Vec3 right = {1.0f, 0.0f, 0.0f};
+    ae::Vec3 up = {0.0f, 1.0f, 0.0f};
+    float orbit_yaw = 3.8f;
+    float orbit_pitch = -0.35f;
+    float orbit_distance = 3.0f;
+};
+
+struct EdgeKey {
+    uint32_t a = 0;
+    uint32_t b = 0;
+
+    bool operator==(EdgeKey rhs) const {
+        return a == rhs.a && b == rhs.b;
     }
-    return radius * 1.025f;
-}
+};
 
-void append_surface_mesh(ae::SurfaceNetMesh& destination, const ae::SurfaceNetMesh& source) {
-    const uint32_t vertex_offset = static_cast<uint32_t>(destination.vertices.size());
-    destination.vertices.insert(destination.vertices.end(), source.vertices.begin(), source.vertices.end());
-    destination.normals.insert(destination.normals.end(), source.normals.begin(), source.normals.end());
-    destination.vertex_depths.insert(destination.vertex_depths.end(), source.vertex_depths.begin(), source.vertex_depths.end());
-    destination.triangle_indices.reserve(destination.triangle_indices.size() + source.triangle_indices.size());
-    for (uint32_t index : source.triangle_indices) {
-        destination.triangle_indices.push_back(vertex_offset + index);
+struct EdgeKeyHash {
+    size_t operator()(EdgeKey key) const {
+        return (static_cast<size_t>(key.a) << 32u) ^ static_cast<size_t>(key.b);
     }
-}
+};
 
-constexpr uint16_t TerrainHeightHole = 0u;
-constexpr uint16_t TerrainHeightGoldberg = 8191u;
-constexpr uint16_t TerrainHeightMax = 16383u;
-constexpr uint32_t TerrainMaskResolution = 128u;
-constexpr float TerrainMaskRadiusKm = 64.0f;
+struct VertexKey {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t z = 0;
 
-ae::TerrainHeightMask make_terrain_height_mask(ae::Vec3 center_mesh) {
-    const ae::Vec3 normal = ae::normalize(center_mesh);
-    const ae::Vec3 reference = std::fabs(normal.y) < 0.92f ? ae::Vec3{0.0f, 1.0f, 0.0f} : ae::Vec3{1.0f, 0.0f, 0.0f};
-    const ae::Vec3 tangent = ae::normalize(ae::cross(reference, normal));
-    const ae::Vec3 bitangent = ae::cross(normal, tangent);
-
-    ae::TerrainHeightMask mask;
-    mask.center_mesh = normal;
-    mask.tangent_mesh = tangent;
-    mask.bitangent_mesh = bitangent;
-    mask.radius_km = TerrainMaskRadiusKm;
-    mask.resolution = TerrainMaskResolution;
-    mask.heights.assign(static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution), TerrainHeightGoldberg);
-    mask.revision = 1u;
-    return mask;
-}
-
-bool terrain_mask_project(const ae::TerrainHeightMask& mask, ae::Vec3 point_mesh, float& px, float& py) {
-    if (mask.resolution == 0u || mask.radius_km <= 0.0f || ae::length(mask.center_mesh) <= 0.000001f) {
-        return false;
+    bool operator==(VertexKey rhs) const {
+        return x == rhs.x && y == rhs.y && z == rhs.z;
     }
-    const float radius_mesh = ae::kilometers_to_world_units(mask.radius_km);
-    const ae::Vec3 relative = ae::normalize(point_mesh) - ae::normalize(mask.center_mesh);
-    const float local_x = ae::dot(relative, mask.tangent_mesh);
-    const float local_y = ae::dot(relative, mask.bitangent_mesh);
-    const float u = local_x / (radius_mesh * 2.0f) + 0.5f;
-    const float v = local_y / (radius_mesh * 2.0f) + 0.5f;
-    if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) {
-        return false;
+};
+
+struct VertexKeyHash {
+    size_t operator()(VertexKey key) const {
+        size_t h = static_cast<size_t>(key.x) * 73856093ull;
+        h ^= static_cast<size_t>(key.y) * 19349663ull;
+        h ^= static_cast<size_t>(key.z) * 83492791ull;
+        return h;
     }
-    px = u * static_cast<float>(mask.resolution - 1u);
-    py = v * static_cast<float>(mask.resolution - 1u);
-    return true;
-}
+};
 
-ae::Vec3 terrain_mask_pixel_to_mesh(const ae::TerrainHeightMask& mask, uint32_t x, uint32_t y) {
-    const float resolution_minus_one = static_cast<float>(std::max(1u, mask.resolution - 1u));
-    const float radius_mesh = ae::kilometers_to_world_units(mask.radius_km);
-    const float local_x = ((static_cast<float>(x) / resolution_minus_one) - 0.5f) * radius_mesh * 2.0f;
-    const float local_y = ((static_cast<float>(y) / resolution_minus_one) - 0.5f) * radius_mesh * 2.0f;
-    const float surface_radius = std::max(0.000001f, ae::length(mask.center_mesh));
-    return ae::normalize(mask.center_mesh + mask.tangent_mesh * local_x + mask.bitangent_mesh * local_y) * surface_radius;
-}
-
-size_t terrain_mask_for_point(ae::VoxelEditSet& edits, ae::Vec3 point_mesh) {
-    size_t best = edits.terrain_masks.size();
-    float best_margin = -1.0f;
-    for (size_t i = 0; i < edits.terrain_masks.size(); ++i) {
-        float px = 0.0f;
-        float py = 0.0f;
-        ae::TerrainHeightMask& mask = edits.terrain_masks[i];
-        if (!terrain_mask_project(mask, point_mesh, px, py)) {
-            continue;
-        }
-        const float margin = std::min({px, py, static_cast<float>(mask.resolution - 1u) - px, static_cast<float>(mask.resolution - 1u) - py});
-        if (margin > best_margin) {
-            best_margin = margin;
-            best = i;
-        }
-    }
-    if (best != edits.terrain_masks.size() && best_margin >= static_cast<float>(TerrainMaskResolution) * 0.12f) {
-        return best;
-    }
-
-    edits.terrain_masks.push_back(make_terrain_height_mask(point_mesh));
-    return edits.terrain_masks.size() - 1u;
-}
-
-void paint_terrain_mask_line(
-    ae::TerrainHeightMask& mask,
-    ae::Vec3 from_mesh,
-    ae::Vec3 to_mesh,
-    float brush_radius_km,
-    uint16_t height_value
-) {
-    if (mask.heights.size() != static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution)) {
-        mask.heights.assign(static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution), TerrainHeightGoldberg);
-    }
-    float x0 = 0.0f;
-    float y0 = 0.0f;
-    float x1 = 0.0f;
-    float y1 = 0.0f;
-    if (!terrain_mask_project(mask, from_mesh, x0, y0) || !terrain_mask_project(mask, to_mesh, x1, y1)) {
-        return;
-    }
-
-    const float brush_pixels = std::max(
-        1.0f,
-        (brush_radius_km / std::max(1.0f, mask.radius_km * 2.0f)) * static_cast<float>(mask.resolution)
-    );
-    const float min_xf = std::floor(std::min(x0, x1) - brush_pixels - 1.0f);
-    const float max_xf = std::ceil(std::max(x0, x1) + brush_pixels + 1.0f);
-    const float min_yf = std::floor(std::min(y0, y1) - brush_pixels - 1.0f);
-    const float max_yf = std::ceil(std::max(y0, y1) + brush_pixels + 1.0f);
-    const int min_x = std::clamp(static_cast<int>(min_xf), 0, static_cast<int>(mask.resolution - 1u));
-    const int max_x = std::clamp(static_cast<int>(max_xf), 0, static_cast<int>(mask.resolution - 1u));
-    const int min_y = std::clamp(static_cast<int>(min_yf), 0, static_cast<int>(mask.resolution - 1u));
-    const int max_y = std::clamp(static_cast<int>(max_yf), 0, static_cast<int>(mask.resolution - 1u));
-
-    const float dx = x1 - x0;
-    const float dy = y1 - y0;
-    const float segment_length_sq = dx * dx + dy * dy;
-    const float brush_sq = brush_pixels * brush_pixels;
-    for (int y = min_y; y <= max_y; ++y) {
-        for (int x = min_x; x <= max_x; ++x) {
-            const float px = static_cast<float>(x) + 0.5f;
-            const float py = static_cast<float>(y) + 0.5f;
-            const float t = segment_length_sq <= 0.000001f
-                ? 0.0f
-                : std::clamp(((px - x0) * dx + (py - y0) * dy) / segment_length_sq, 0.0f, 1.0f);
-            const float cx = x0 + dx * t;
-            const float cy = y0 + dy * t;
-            const float dist_x = px - cx;
-            const float dist_y = py - cy;
-            if (dist_x * dist_x + dist_y * dist_y <= brush_sq) {
-                mask.heights[static_cast<size_t>(y) * mask.resolution + static_cast<size_t>(x)] =
-                    std::min<uint16_t>(mask.heights[static_cast<size_t>(y) * mask.resolution + static_cast<size_t>(x)], height_value);
-            }
-        }
-    }
-    ++mask.revision;
-}
-
-void paint_terrain_mask_point(ae::VoxelEditSet& edits, size_t mask_index, ae::Vec3 point_mesh, float brush_radius_km) {
-    if (mask_index >= edits.terrain_masks.size()) {
-        return;
-    }
-    paint_terrain_mask_line(edits.terrain_masks[mask_index], point_mesh, point_mesh, brush_radius_km, TerrainHeightHole);
-}
-
-std::vector<ae::LocalVoxelFeature> build_terrain_dig_holes(const ae::VoxelEditSet& edits) {
-    std::vector<ae::LocalVoxelFeature> holes;
-    constexpr uint32_t TerrainHoleFeatureIdBase = 0x80000000u;
-    constexpr uint16_t TerrainHeightHoleValue = TerrainHeightHole;
-    constexpr uint32_t TerrainHoleMinComponentPixels = 48u;
-    constexpr float TerrainHoleMinCaveRadiusKm = 6.0f;
-
-    for (uint32_t mask_index = 0; mask_index < edits.terrain_masks.size(); ++mask_index) {
-        const ae::TerrainHeightMask& mask = edits.terrain_masks[mask_index];
-        const size_t pixel_count = static_cast<size_t>(mask.resolution) * static_cast<size_t>(mask.resolution);
-        if (mask.resolution == 0u || mask.heights.size() != pixel_count || ae::length(mask.center_mesh) <= 0.000001f) {
-            continue;
-        }
-
-        std::vector<uint8_t> visited(pixel_count, 0u);
-        std::vector<uint32_t> stack;
-        std::vector<uint32_t> component;
-        uint32_t component_index = 0u;
-        stack.reserve(256u);
-        component.reserve(256u);
-
-        for (uint32_t start_y = 0; start_y < mask.resolution; ++start_y) {
-            for (uint32_t start_x = 0; start_x < mask.resolution; ++start_x) {
-                const uint32_t start_index = start_y * mask.resolution + start_x;
-                if (visited[start_index] != 0u || mask.heights[start_index] != TerrainHeightHoleValue) {
-                    continue;
-                }
-
-                stack.clear();
-                component.clear();
-                visited[start_index] = 1u;
-                stack.push_back(start_index);
-                while (!stack.empty()) {
-                    const uint32_t current = stack.back();
-                    stack.pop_back();
-                    component.push_back(current);
-                    const uint32_t cx = current % mask.resolution;
-                    const uint32_t cy = current / mask.resolution;
-                    for (int32_t oy = -1; oy <= 1; ++oy) {
-                        for (int32_t ox = -1; ox <= 1; ++ox) {
-                            if (ox == 0 && oy == 0) {
-                                continue;
-                            }
-                            const int32_t nx = static_cast<int32_t>(cx) + ox;
-                            const int32_t ny = static_cast<int32_t>(cy) + oy;
-                            if (nx < 0 || ny < 0 || nx >= static_cast<int32_t>(mask.resolution) || ny >= static_cast<int32_t>(mask.resolution)) {
-                                continue;
-                            }
-                            const uint32_t neighbor = static_cast<uint32_t>(ny) * mask.resolution + static_cast<uint32_t>(nx);
-                            if (visited[neighbor] != 0u || mask.heights[neighbor] != TerrainHeightHoleValue) {
-                                continue;
-                            }
-                            visited[neighbor] = 1u;
-                            stack.push_back(neighbor);
-                        }
-                    }
-                }
-
-                if (component.size() < TerrainHoleMinComponentPixels) {
-                    ++component_index;
-                    continue;
-                }
-
-                ae::Vec3 center_sum{};
-                for (uint32_t pixel : component) {
-                    center_sum = center_sum + terrain_mask_pixel_to_mesh(mask, pixel % mask.resolution, pixel / mask.resolution);
-                }
-                if (component.empty() || ae::length(center_sum) <= 0.000001f) {
-                    ++component_index;
-                    continue;
-                }
-
-                const ae::Vec3 center = center_sum * (1.0f / static_cast<float>(component.size()));
-                float radius_km = 0.0f;
-                for (uint32_t pixel : component) {
-                    const ae::Vec3 pixel_position = terrain_mask_pixel_to_mesh(mask, pixel % mask.resolution, pixel / mask.resolution);
-                    radius_km = std::max(radius_km, ae::world_units_to_kilometers(ae::length(pixel_position - center)));
-                }
-                const float pixel_radius_km = mask.radius_km / static_cast<float>(std::max(1u, mask.resolution - 1u));
-                radius_km = std::clamp(radius_km + pixel_radius_km * 2.0f, 4.0f, 56.0f);
-                if (radius_km < TerrainHoleMinCaveRadiusKm) {
-                    ++component_index;
-                    continue;
-                }
-
-                const ae::Vec3 normal = ae::normalize(center);
-                const ae::Vec3 tangent = ae::length(mask.tangent_mesh) > 0.000001f
-                    ? ae::normalize(mask.tangent_mesh)
-                    : ae::normalize(ae::cross(std::fabs(normal.y) < 0.92f ? ae::Vec3{0.0f, 1.0f, 0.0f} : ae::Vec3{1.0f, 0.0f, 0.0f}, normal));
-                const ae::Vec3 bitangent = ae::normalize(ae::cross(normal, tangent));
-                const uint32_t seed = 0x71d1d5u ^
-                    (mask_index * 0x9e3779b9u) ^
-                    (component_index * 0x85ebca6bu) ^
-                    (mask.revision * 0xc2b2ae35u);
-
-                ae::LocalVoxelFeature hole;
-                hole.kind = ae::VoxelFeatureKind::CaveSystem;
-                hole.feature_id = TerrainHoleFeatureIdBase | ((mask_index & 0x7fffu) << 16u) | (component_index & 0xffffu);
-                hole.center_mesh = center;
-                hole.normal_mesh = normal;
-                hole.tangent_mesh = tangent;
-                hole.bitangent_mesh = bitangent;
-                hole.entrance_radius_km = radius_km;
-                hole.tunnel_radius_km = std::max(3.0f, radius_km * 0.62f);
-                hole.chamber_radius_km = std::max(8.0f, radius_km * 1.35f);
-                hole.depth_km = std::clamp(radius_km * 3.5f, 18.0f, 140.0f);
-                hole.svo_depth = edits.local_depth;
-                hole.seed = seed;
-                holes.push_back(hole);
-                ++component_index;
-            }
-        }
-    }
-    return holes;
-}
-
-std::vector<ae::LocalVoxelFeature> merge_hole_lists(
-    const std::vector<ae::LocalVoxelFeature>& cave_holes,
-    const std::vector<ae::LocalVoxelFeature>& terrain_holes
-) {
-    std::vector<ae::LocalVoxelFeature> holes;
-    holes.reserve(cave_holes.size() + terrain_holes.size());
-    holes.insert(holes.end(), cave_holes.begin(), cave_holes.end());
-    holes.insert(holes.end(), terrain_holes.begin(), terrain_holes.end());
-    return holes;
-}
-
-bool is_terrain_hole_feature_id(uint32_t feature_id) {
-    return (feature_id & 0x80000000u) != 0u;
-}
-
-uint32_t cave_priority_hash_u32(uint32_t value) {
+uint32_t hash_u32(uint32_t value) {
     value ^= value >> 16u;
     value *= 0x7feb352du;
     value ^= value >> 15u;
@@ -686,738 +346,2129 @@ uint32_t cave_priority_hash_u32(uint32_t value) {
     return value;
 }
 
-ae::Vec3 cave_feature_local_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
-    const ae::Vec3 offset = point_mesh - feature.center_mesh;
+float hash_unit(uint32_t value) {
+    return static_cast<float>(hash_u32(value) & 0x00ffffffu) / static_cast<float>(0x01000000u);
+}
+
+float saturate(float value) {
+    return std::clamp(value, 0.0f, 1.0f);
+}
+
+float lerp_float(float a, float b, float t) {
+    return a * (1.0f - t) + b * t;
+}
+
+float smooth_min(float a, float b, float k) {
+    if (k <= 0.0f) {
+        return std::min(a, b);
+    }
+    const float h = saturate(0.5f + 0.5f * (b - a) / k);
+    return lerp_float(b, a, h) - k * h * (1.0f - h);
+}
+
+EdgeKey make_edge_key(uint32_t a, uint32_t b) {
+    if (b < a) {
+        std::swap(a, b);
+    }
+    return {a, b};
+}
+
+bool finite_vec3(ae::Vec3 value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+ae::Vec3 color_crust() { return {0.11f, 0.47f, 0.53f}; }
+ae::Vec3 color_mine_wall() { return {0.12f, 0.14f, 0.15f}; }
+ae::Vec3 color_resource() { return {1.0f, 0.55f, 0.12f}; }
+ae::Vec3 color_primary_line() { return {1.0f, 0.82f, 0.20f}; }
+ae::Vec3 color_branch_line() { return {0.95f, 0.35f, 0.10f}; }
+ae::Vec3 color_chamber_line() { return {0.35f, 0.82f, 1.0f}; }
+ae::Vec3 color_fill_line() { return {0.62f, 0.95f, 0.72f}; }
+ae::Vec3 color_brush_line() { return {1.0f, 1.0f, 1.0f}; }
+
+uint8_t material_tag(EditMaterial material) {
+    return static_cast<uint8_t>(material);
+}
+
+EditMaterial tag_material(uint8_t tag) {
+    return static_cast<EditMaterial>(tag);
+}
+
+uint32_t compile_shader(uint32_t type, const char* source) {
+    const uint32_t shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    int ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048] = {};
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        std::cerr << "Shader compile failed: " << log << std::endl;
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+uint32_t build_shader_program() {
+    const char* vertex_source = R"GLSL(
+#version 430 core
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec3 a_color;
+uniform mat4 u_mvp;
+uniform mat4 u_model;
+out vec3 v_position;
+out vec3 v_normal;
+out vec3 v_color;
+void main() {
+    vec4 world = u_model * vec4(a_position, 1.0);
+    v_position = world.xyz;
+    v_normal = mat3(u_model) * a_normal;
+    v_color = a_color;
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+}
+)GLSL";
+
+    const char* fragment_source = R"GLSL(
+#version 430 core
+in vec3 v_position;
+in vec3 v_normal;
+in vec3 v_color;
+uniform vec3 u_camera_position;
+uniform bool u_cutaway;
+out vec4 frag_color;
+void main() {
+    if (u_cutaway && v_position.x > 0.03 && v_position.z > -0.18) {
+        discard;
+    }
+    vec3 normal = normalize(v_normal);
+    vec3 view_dir = normalize(u_camera_position - v_position);
+    if (dot(normal, view_dir) < 0.0) {
+        normal = -normal;
+    }
+    vec3 light_dir = normalize(vec3(-0.42, 0.68, 0.56));
+    float diffuse = max(dot(normal, light_dir), 0.0);
+    float rim = pow(max(1.0 - dot(normal, view_dir), 0.0), 2.0);
+    vec3 color = v_color * (0.23 + diffuse * 0.72) + rim * vec3(0.06, 0.12, 0.15);
+    frag_color = vec4(color, 1.0);
+}
+)GLSL";
+
+    const uint32_t vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_source);
+    const uint32_t fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        return 0;
+    }
+
+    const uint32_t program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    int ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048] = {};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        std::cerr << "Shader link failed: " << log << std::endl;
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+std::vector<uint32_t> candidate_entrance_samples(const ae::PointCloud& points) {
+    std::vector<uint32_t> candidates;
+    candidates.reserve(points.size());
+    for (uint32_t i = 0; i < points.size(); ++i) {
+        if (i >= points.sample_kinds.size()) {
+            continue;
+        }
+        const ae::PointSampleKind kind = points.sample_kinds[i];
+        if (kind == ae::PointSampleKind::Center ||
+            kind == ae::PointSampleKind::Spoke ||
+            kind == ae::PointSampleKind::Interior) {
+            candidates.push_back(i);
+        }
+    }
+    return candidates;
+}
+
+void path_basis(ae::Vec3 direction, ae::Vec3& u, ae::Vec3& v) {
+    const ae::Vec3 up = std::fabs(direction.y) < 0.88f ? ae::Vec3{0.0f, 1.0f, 0.0f} : ae::Vec3{1.0f, 0.0f, 0.0f};
+    u = ae::normalize(ae::cross(up, direction));
+    v = ae::normalize(ae::cross(direction, u));
+}
+
+ae::Vec3 path_sample(const MinePath& path, float t) {
+    if (path.points.empty()) {
+        return {};
+    }
+    if (path.points.size() == 1u) {
+        return path.points.front();
+    }
+    const float scaled = saturate(t) * static_cast<float>(path.points.size() - 1u);
+    const uint32_t a = std::min(static_cast<uint32_t>(scaled), static_cast<uint32_t>(path.points.size() - 2u));
+    const float local_t = scaled - static_cast<float>(a);
+    return ae::lerp(path.points[a], path.points[a + 1u], local_t);
+}
+
+MinePath make_wavy_path(
+    ae::Vec3 start,
+    ae::Vec3 end,
+    float radius,
+    uint32_t segments,
+    uint32_t seed,
+    bool primary
+) {
+    MinePath path;
+    path.radius = radius;
+    path.primary = primary;
+    path.points.reserve(segments + 1u);
+
+    const ae::Vec3 axis = ae::normalize(end - start);
+    ae::Vec3 u;
+    ae::Vec3 v;
+    path_basis(axis, u, v);
+    const float amplitude = primary ? 0.035f : 0.055f;
+    const float phase_a = hash_unit(seed ^ 0x8da6b343u) * ae::Pi * 2.0f;
+    const float phase_b = hash_unit(seed ^ 0xd8163841u) * ae::Pi * 2.0f;
+    const float waves = primary ? 1.25f : 1.85f;
+
+    for (uint32_t i = 0; i <= segments; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(segments);
+        const float envelope = std::sin(t * ae::Pi);
+        const ae::Vec3 base = ae::lerp(start, end, t);
+        const ae::Vec3 wobble =
+            u * (std::sin(t * waves * ae::Pi * 2.0f + phase_a) * amplitude * envelope) +
+            v * (std::cos(t * (waves + 0.55f) * ae::Pi * 2.0f + phase_b) * amplitude * envelope);
+        path.points.push_back(base + wobble);
+    }
+    return path;
+}
+
+MineNetwork build_mine_network(const ae::PointCloud& points, const MineSettings& settings) {
+    MineNetwork network;
+    network.chambers.push_back({{0.0f, 0.0f, 0.0f}, CoreVoidRadius, true});
+
+    struct RankedCandidate {
+        uint32_t point_index = 0;
+        uint32_t rank = 0;
+    };
+
+    std::vector<RankedCandidate> ranked;
+    const std::vector<uint32_t> candidates = candidate_entrance_samples(points);
+    ranked.reserve(candidates.size());
+    for (uint32_t point_index : candidates) {
+        ranked.push_back({point_index, hash_u32(settings.seed ^ (point_index * 0x9e3779b9u))});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const RankedCandidate& lhs, const RankedCandidate& rhs) {
+        return lhs.rank < rhs.rank;
+    });
+
+    const uint32_t entrance_count = std::min(settings.mine_density, static_cast<uint32_t>(ranked.size()));
+    network.entrances.reserve(entrance_count);
+    network.primary_shafts.reserve(entrance_count);
+    for (uint32_t i = 0; i < entrance_count; ++i) {
+        const uint32_t sample_id = ranked[i].point_index;
+        const ae::Vec3 entrance_dir = ae::normalize(points.positions[sample_id]);
+        network.entrances.push_back({sample_id, entrance_dir});
+
+        ae::Vec3 u;
+        ae::Vec3 v;
+        path_basis(entrance_dir, u, v);
+        const uint32_t shaft_seed = settings.seed ^ (i * 0x632be59bu) ^ 0x51ed270bu;
+        const uint32_t segment_count = 8u + (hash_u32(shaft_seed) % 4u);
+        MinePath shaft;
+        shaft.primary = true;
+        shaft.radius = settings.tunnel_radius * (0.86f + hash_unit(shaft_seed ^ 0x22ae35u) * 0.38f);
+        shaft.points.reserve(segment_count + 1u);
+
+        const ae::Vec3 core_bias = ae::normalize(
+            entrance_dir * 0.55f +
+            u * ((hash_unit(shaft_seed ^ 0xa511e9b3u) - 0.5f) * 0.55f) +
+            v * ((hash_unit(shaft_seed ^ 0x63d83595u) - 0.5f) * 0.55f)
+        );
+        for (uint32_t step = 0; step <= segment_count; ++step) {
+            const float t = static_cast<float>(step) / static_cast<float>(segment_count);
+            const float radial = lerp_float(0.995f, 0.11f + hash_unit(shaft_seed ^ 0x97a1f3u) * 0.04f, std::pow(t, 0.92f));
+            const float envelope = std::sin(t * ae::Pi);
+            const ae::Vec3 direction = ae::normalize(
+                ae::lerp(entrance_dir, core_bias, t * 0.70f) +
+                u * (std::sin(t * ae::Pi * 4.0f + hash_unit(shaft_seed) * ae::Pi * 2.0f) * 0.09f * envelope) +
+                v * (std::cos(t * ae::Pi * 3.3f + hash_unit(shaft_seed ^ 0x8421u) * ae::Pi * 2.0f) * 0.07f * envelope)
+            );
+            shaft.points.push_back(direction * radial);
+        }
+        network.primary_shafts.push_back(shaft);
+
+        for (uint32_t c = 0; c < 2u; ++c) {
+            const float t = 0.26f + static_cast<float>(c) * 0.31f + hash_unit(shaft_seed ^ (c * 0x6c8e9cf5u)) * 0.08f;
+            network.chambers.push_back({
+                path_sample(network.primary_shafts.back(), t),
+                shaft.radius * (1.75f + hash_unit(shaft_seed ^ c ^ 0xc2b2ae35u) * 0.85f),
+                false,
+            });
+        }
+        network.chambers.push_back({
+            path_sample(network.primary_shafts.back(), 0.80f + hash_unit(shaft_seed ^ 0x165667b1u) * 0.12f),
+            shaft.radius * (1.45f + hash_unit(shaft_seed ^ 0x7feb352du) * 0.95f),
+            true,
+        });
+    }
+
+    const uint32_t branch_count = entrance_count * 2u;
+    network.branches.reserve(branch_count);
+    for (uint32_t i = 0; i < branch_count && network.primary_shafts.size() > 1u; ++i) {
+        const uint32_t branch_seed = settings.seed ^ (i * 0x85ebca6bu) ^ 0xd1b54a35u;
+        uint32_t a_index = hash_u32(branch_seed) % static_cast<uint32_t>(network.primary_shafts.size());
+        uint32_t b_index = hash_u32(branch_seed ^ 0x27d4eb2du) % static_cast<uint32_t>(network.primary_shafts.size());
+        if (a_index == b_index) {
+            b_index = (b_index + 1u) % static_cast<uint32_t>(network.primary_shafts.size());
+        }
+        const float at = 0.18f + hash_unit(branch_seed ^ 0xa2bfe8a1u) * 0.67f;
+        const float bt = 0.22f + hash_unit(branch_seed ^ 0x9e3779b9u) * 0.64f;
+        const ae::Vec3 start = path_sample(network.primary_shafts[a_index], at);
+        const ae::Vec3 end = path_sample(network.primary_shafts[b_index], bt);
+        MinePath branch = make_wavy_path(
+            start,
+            end,
+            settings.tunnel_radius * (0.58f + hash_unit(branch_seed ^ 0x6a09e667u) * 0.24f),
+            5u + (hash_u32(branch_seed ^ 0x3c6ef372u) % 4u),
+            branch_seed,
+            false
+        );
+        network.branches.push_back(branch);
+
+        if ((hash_u32(branch_seed ^ 0xbb67ae85u) & 3u) != 0u) {
+            network.chambers.push_back({
+                path_sample(network.branches.back(), 0.45f + hash_unit(branch_seed ^ 0x510e527fu) * 0.16f),
+                settings.tunnel_radius * (1.15f + hash_unit(branch_seed ^ 0x1f83d9abu) * 0.85f),
+                (hash_u32(branch_seed ^ 0x5be0cd19u) & 1u) != 0u,
+            });
+        }
+    }
+
+    return network;
+}
+
+float distance_to_segment(ae::Vec3 p, ae::Vec3 a, ae::Vec3 b) {
+    const ae::Vec3 ab = b - a;
+    const float len_sq = ae::dot(ab, ab);
+    if (len_sq <= 0.0000001f) {
+        return ae::length(p - a);
+    }
+    const float t = std::clamp(ae::dot(p - a, ab) / len_sq, 0.0f, 1.0f);
+    return ae::length(p - (a + ab * t));
+}
+
+float mine_air_sdf(ae::Vec3 p, const MineNetwork& network) {
+    float sdf = std::numeric_limits<float>::max();
+    for (const MineChamber& chamber : network.chambers) {
+        const float chamber_sdf = ae::length(p - chamber.center) - chamber.radius;
+        sdf = smooth_min(sdf, chamber_sdf, chamber.resource ? 0.030f : 0.022f);
+    }
+    auto add_path = [&](const MinePath& path) {
+        if (path.points.size() < 2u) {
+            return;
+        }
+        for (uint32_t i = 0; i + 1u < path.points.size(); ++i) {
+            const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(path.points.size() - 1u);
+            const float pulse = 0.90f + 0.16f * std::sin(t * ae::Pi * 6.0f);
+            const float capsule_sdf = distance_to_segment(p, path.points[i], path.points[i + 1u]) - path.radius * pulse;
+            sdf = smooth_min(sdf, capsule_sdf, path.primary ? 0.018f : 0.024f);
+        }
+    };
+    for (const MinePath& path : network.primary_shafts) {
+        add_path(path);
+    }
+    for (const MinePath& path : network.branches) {
+        add_path(path);
+    }
+    return sdf;
+}
+
+float solid_sdf(ae::Vec3 p, const MineNetwork& network) {
+    const float sphere_sdf = ae::length(p) - PlanetRadius;
+    const float air_sdf = mine_air_sdf(p, network);
+    return std::max(sphere_sdf, -air_sdf);
+}
+
+ae::Vec3 material_color(ae::Vec3 p, const MineNetwork& network) {
+    if (ae::length(p) > 0.935f) {
+        return color_crust();
+    }
+    if (ae::length(p) < CoreVoidRadius + 0.055f) {
+        return color_resource();
+    }
+    for (const MineChamber& chamber : network.chambers) {
+        if (chamber.resource && ae::length(p - chamber.center) < chamber.radius + 0.045f) {
+            return color_resource();
+        }
+    }
+    return color_mine_wall();
+}
+
+ae::Vec3 estimate_normal(ae::Vec3 p, const MineNetwork& network) {
+    constexpr float Epsilon = 0.0035f;
+    const float dx = solid_sdf(p + ae::Vec3{Epsilon, 0.0f, 0.0f}, network) - solid_sdf(p - ae::Vec3{Epsilon, 0.0f, 0.0f}, network);
+    const float dy = solid_sdf(p + ae::Vec3{0.0f, Epsilon, 0.0f}, network) - solid_sdf(p - ae::Vec3{0.0f, Epsilon, 0.0f}, network);
+    const float dz = solid_sdf(p + ae::Vec3{0.0f, 0.0f, Epsilon}, network) - solid_sdf(p - ae::Vec3{0.0f, 0.0f, Epsilon}, network);
+    return ae::normalize({dx, dy, dz});
+}
+
+uint32_t effective_grid_resolution(const MineSettings& settings, const MineNetwork& network) {
+    (void)network;
+    return std::clamp(settings.requested_grid_resolution, 64u, 512u);
+}
+
+VertexKey vertex_key(ae::Vec3 p) {
+    constexpr float Scale = 50000.0f;
     return {
-        ae::world_units_to_kilometers(ae::dot(offset, feature.tangent_mesh)),
-        ae::world_units_to_kilometers(ae::dot(offset, feature.bitangent_mesh)),
-        ae::world_units_to_kilometers(-ae::dot(offset, feature.normal_mesh)),
+        static_cast<int32_t>(std::lround(p.x * Scale)),
+        static_cast<int32_t>(std::lround(p.y * Scale)),
+        static_cast<int32_t>(std::lround(p.z * Scale)),
     };
 }
 
-float cave_tunnel_sdf_km(ae::Vec3 local, float entrance_radius, float tunnel_radius, float depth) {
-    const float z0 = 0.0f;
-    const float z1 = depth;
-    const float t = std::clamp((local.z - z0) / std::max(0.000001f, z1 - z0), 0.0f, 1.0f);
-    const float radius = entrance_radius * (1.0f - t) + tunnel_radius * t;
-    const float radial = std::sqrt(local.x * local.x + local.y * local.y) - radius;
-    return std::max(radial, std::max(z0 - local.z, local.z - z1));
-}
-
-float cave_feature_sdf_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
-    const ae::Vec3 local = cave_feature_local_km(feature, point_mesh);
-    float sdf = cave_tunnel_sdf_km(
-        local,
-        feature.entrance_radius_km,
-        feature.tunnel_radius_km,
-        feature.depth_km
-    );
-
-    const uint32_t side_hash = cave_priority_hash_u32(feature.seed ^ 0x9e3779b9u);
-    const float angle = (static_cast<float>(side_hash & 0xffffu) / 65535.0f) * 2.0f * ae::Pi;
-    const float side_distance = feature.chamber_radius_km * 0.42f;
-    const ae::Vec3 chamber_center{
-        std::cos(angle) * side_distance,
-        std::sin(angle) * side_distance,
-        feature.depth_km * 0.86f,
-    };
-    sdf = std::min(sdf, ae::length(local - chamber_center) - feature.chamber_radius_km);
-
-    const uint32_t lobe_hash = cave_priority_hash_u32(feature.seed ^ 0x51ed270bu);
-    const float lobe_angle = (static_cast<float>(lobe_hash & 0xffffu) / 65535.0f) * 2.0f * ae::Pi;
-    const ae::Vec3 lobe_center{
-        std::cos(lobe_angle) * feature.chamber_radius_km * 0.72f,
-        std::sin(lobe_angle) * feature.chamber_radius_km * 0.72f,
-        feature.depth_km * 0.58f,
-    };
-    return std::min(sdf, ae::length(local - lobe_center) - feature.chamber_radius_km * 0.48f);
-}
-
-float cave_feature_stream_distance_km(const ae::LocalVoxelFeature& feature, ae::Vec3 point_mesh) {
-    const float sdf = cave_feature_sdf_km(feature, point_mesh);
-    if (sdf <= 0.0f) {
-        return sdf;
-    }
-    const float center_distance = ae::world_units_to_kilometers(ae::length(point_mesh - feature.center_mesh));
-    return std::min(sdf, center_distance);
-}
-
-uint32_t nearest_cave_feature_id_for_point(
-    const std::vector<ae::LocalVoxelFeature>& features,
-    ae::Vec3 point_mesh
+uint32_t add_vertex(
+    TestbedMesh& mesh,
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash>& lookup,
+    ae::Vec3 p,
+    ae::Vec3 normal,
+    ae::Vec3 color
 ) {
-    uint32_t best_feature_id = 0u;
-    float best_score = std::numeric_limits<float>::max();
-    for (const ae::LocalVoxelFeature& feature : features) {
-        if (feature.kind != ae::VoxelFeatureKind::CaveSystem) {
+    const VertexKey key = vertex_key(p);
+    const auto found = lookup.find(key);
+    if (found != lookup.end()) {
+        return found->second;
+    }
+    const uint32_t index = static_cast<uint32_t>(mesh.vertices.size());
+    lookup.emplace(key, index);
+    mesh.vertices.push_back({p, normal, color});
+    return index;
+}
+
+ae::Vec3 interpolate_edge(ae::Vec3 a, ae::Vec3 b, float va, float vb) {
+    const float denom = va - vb;
+    if (std::fabs(denom) <= 0.0000001f) {
+        return (a + b) * 0.5f;
+    }
+    return ae::lerp(a, b, std::clamp(va / denom, 0.0f, 1.0f));
+}
+
+void append_triangle(TestbedMesh& mesh, uint32_t a, uint32_t b, uint32_t c) {
+    if (a == b || b == c || c == a) {
+        ++mesh.stats.degenerate_triangles;
+        return;
+    }
+    const ae::Vec3 pa = mesh.vertices[a].position;
+    const ae::Vec3 pb = mesh.vertices[b].position;
+    const ae::Vec3 pc = mesh.vertices[c].position;
+    const ae::Vec3 face = ae::cross(pb - pa, pc - pa);
+    if (ae::length(face) <= 0.0000008f) {
+        ++mesh.stats.degenerate_triangles;
+        return;
+    }
+    const ae::Vec3 average_normal = ae::normalize(mesh.vertices[a].normal + mesh.vertices[b].normal + mesh.vertices[c].normal);
+    if (ae::dot(face, average_normal) < 0.0f) {
+        std::swap(b, c);
+    }
+    mesh.indices.push_back(a);
+    mesh.indices.push_back(b);
+    mesh.indices.push_back(c);
+}
+
+BuildStats validate_mesh(const TestbedMesh& mesh, const MineSettings& settings, const MineNetwork& network, uint32_t resolution) {
+    BuildStats stats;
+    stats.seed = settings.seed;
+    stats.entrances = static_cast<uint32_t>(network.entrances.size());
+    stats.primary_shafts = static_cast<uint32_t>(network.primary_shafts.size());
+    stats.branch_tunnels = static_cast<uint32_t>(network.branches.size());
+    stats.chambers = static_cast<uint32_t>(network.chambers.size());
+    stats.grid_resolution = resolution;
+    stats.vertices = static_cast<uint32_t>(mesh.vertices.size());
+    stats.triangles = static_cast<uint32_t>(mesh.indices.size() / 3u);
+
+    for (const RenderVertex& vertex : mesh.vertices) {
+        if (!finite_vec3(vertex.position) || !finite_vec3(vertex.normal)) {
+            ++stats.invalid_indices;
+        }
+    }
+
+    std::unordered_map<EdgeKey, uint32_t, EdgeKeyHash> edge_counts;
+    edge_counts.reserve(mesh.indices.size());
+    for (uint32_t i = 0; i + 2u < mesh.indices.size(); i += 3u) {
+        const uint32_t a = mesh.indices[i];
+        const uint32_t b = mesh.indices[i + 1u];
+        const uint32_t c = mesh.indices[i + 2u];
+        if (a >= mesh.vertices.size() || b >= mesh.vertices.size() || c >= mesh.vertices.size()) {
+            ++stats.invalid_indices;
             continue;
         }
-        const float score = std::fabs(cave_feature_sdf_km(feature, point_mesh));
-        if (score < best_score) {
-            best_score = score;
-            best_feature_id = feature.feature_id;
-        }
-    }
-    return best_feature_id;
-}
-
-std::vector<ae::LocalVoxelFeature> build_goldberg_clip_holes(
-    const std::vector<ae::LocalVoxelFeature>& active_holes,
-    const ae::VoxelEditSet& edits
-) {
-    std::vector<ae::LocalVoxelFeature> holes;
-    (void)edits;
-    holes.reserve(active_holes.size());
-    for (const ae::LocalVoxelFeature& hole : active_holes) {
-        if (hole.kind != ae::VoxelFeatureKind::CaveSystem ||
-            hole.entrance_radius_km <= 0.0f ||
-            ae::length(hole.center_mesh) <= 0.000001f) {
+        if (a == b || b == c || c == a ||
+            ae::length(ae::cross(mesh.vertices[b].position - mesh.vertices[a].position, mesh.vertices[c].position - mesh.vertices[a].position)) <= 0.0000008f) {
+            ++stats.degenerate_triangles;
             continue;
         }
-        holes.push_back(hole);
+        ++edge_counts[make_edge_key(a, b)];
+        ++edge_counts[make_edge_key(b, c)];
+        ++edge_counts[make_edge_key(c, a)];
     }
-    return holes;
+    for (const auto& entry : edge_counts) {
+        if (entry.second == 1u) {
+            ++stats.open_edges;
+        } else if (entry.second != 2u) {
+            ++stats.nonmanifold_edges;
+        }
+    }
+
+    stats.ok = stats.invalid_indices == 0u && stats.degenerate_triangles == 0u;
+    std::ostringstream message;
+    message << (stats.ok ? "Mesh validation OK" : "Mesh validation FAILED")
+            << ": seed " << stats.seed
+            << ", entrances " << stats.entrances
+            << ", primary shafts " << stats.primary_shafts
+            << ", branches " << stats.branch_tunnels
+            << ", chambers " << stats.chambers
+            << ", grid " << stats.grid_resolution
+            << ", vertices " << stats.vertices
+            << ", triangles " << stats.triangles
+            << ", invalid " << stats.invalid_indices
+            << ", degenerate " << stats.degenerate_triangles
+            << ", open " << stats.open_edges
+            << ", nonmanifold " << stats.nonmanifold_edges;
+    stats.message = message.str();
+    return stats;
 }
 
-struct CaveStreamStats {
-    uint32_t descriptors = 0;
-    uint32_t active = 0;
-    uint32_t cached = 0;
-    uint32_t queued = 0;
-    uint32_t rendered = 0;
-    double last_build_ms = 0.0;
-};
+uint32_t part1by2(uint32_t value) {
+    value &= 0x000003ffu;
+    value = (value ^ (value << 16u)) & 0xff0000ffu;
+    value = (value ^ (value << 8u)) & 0x0300f00fu;
+    value = (value ^ (value << 4u)) & 0x030c30c3u;
+    value = (value ^ (value << 2u)) & 0x09249249u;
+    return value;
+}
 
-struct CaveInteriorBuildResult {
-    uint32_t feature_id = 0;
-    uint32_t generation = 0;
-    ae::SurfaceNetMesh surface;
-    ae::CaveFeatureBuildStats stats;
-    double build_ms = 0.0;
-};
+uint64_t morton_encode_chunk(uint32_t x, uint32_t y, uint32_t z) {
+    return static_cast<uint64_t>(part1by2(x)) |
+           (static_cast<uint64_t>(part1by2(y)) << 1u) |
+           (static_cast<uint64_t>(part1by2(z)) << 2u);
+}
 
-class CaveInteriorStreamer {
-public:
-    void configure(const ae::QuantizedMesh& mesh, const ae::MarchingCubesConfig& config) {
-        base_features_ = mesh.voxel_features;
-        config_ = config;
-        config_.progress_callback = {};
-        grid_radius_ = mesh_bounds_radius(mesh);
-        cache_.clear();
-        queued_ids_.clear();
-        active_ids_.clear();
-        active_holes_.clear();
-        active_surface_ = {};
-        active_surface_dirty_ = true;
-        last_targeted_feature_id_ = 0;
-        ++edit_generation_;
-        last_rescore_ = std::chrono::steady_clock::time_point{};
-        build_serial_ = 0;
-        stats_ = {};
-        refresh_feature_list(false);
-        stats_.descriptors = static_cast<uint32_t>(features_.size());
-        const uint32_t hardware_threads = std::max(1u, std::thread::hardware_concurrency());
-        worker_count_ = std::max(1u, std::min(4u, hardware_threads > 1u ? hardware_threads - 1u : 1u));
-    }
+uint32_t lod_resolution(uint32_t lod) {
+    return 128u << std::min(lod, 2u);
+}
 
-    void update_config(const ae::MarchingCubesConfig& config) {
-        config_ = config;
-        config_.progress_callback = {};
-        refresh_feature_list(true);
-    }
+uint32_t lod_chunks_per_axis(uint32_t lod, uint32_t chunk_size) {
+    return (lod_resolution(lod) + chunk_size - 1u) / chunk_size;
+}
 
-    bool update(const ae::CameraView& view, ae::Vec3 aim_direction, uint32_t targeted_feature_id) {
-        current_eye_mesh_ = view.eye / ae::PlanetRadiusKilometers;
-        bool changed = collect_ready_jobs();
-        const auto now = std::chrono::steady_clock::now();
-        const bool should_rescore =
-            active_ids_.empty() ||
-            targeted_feature_id != last_targeted_feature_id_ ||
-            last_rescore_ == std::chrono::steady_clock::time_point{} ||
-            now - last_rescore_ >= std::chrono::milliseconds(250);
-        if (should_rescore) {
-            last_targeted_feature_id_ = targeted_feature_id;
-            last_rescore_ = now;
-            changed = choose_active_features(view, aim_direction, targeted_feature_id) || changed;
-        }
-        queue_missing_active_features();
-        evict_cache();
-        if (active_surface_dirty_ || changed) {
-            rebuild_active_surface();
-            active_surface_dirty_ = false;
-            changed = true;
-        }
-        stats_.descriptors = static_cast<uint32_t>(features_.size());
-        stats_.active = static_cast<uint32_t>(active_ids_.size());
-        stats_.cached = static_cast<uint32_t>(cache_.size());
-        stats_.queued = static_cast<uint32_t>(jobs_.size());
-        return changed;
-    }
+MortonChunkKey make_chunk_key(uint32_t lod, uint32_t x, uint32_t y, uint32_t z) {
+    const uint64_t lod_bits = static_cast<uint64_t>(std::min(lod, 2u)) << 60u;
+    return {lod_bits | morton_encode_chunk(x, y, z), std::min(lod, 2u), x, y, z};
+}
 
-    void invalidate_feature(uint32_t feature_id) {
-        if (feature_id == 0u) {
-            return;
-        }
-        cache_.erase(feature_id);
-        queued_ids_.erase(feature_id);
-        ++edit_generation_;
-        active_ids_.erase(std::remove(active_ids_.begin(), active_ids_.end(), feature_id), active_ids_.end());
-        active_ids_.insert(active_ids_.begin(), feature_id);
-        if (active_ids_.size() > ActiveBudget) {
-            active_ids_.resize(ActiveBudget);
-        }
-        queue_feature(feature_id);
-        active_surface_dirty_ = true;
-    }
+uint32_t chunk_sample_resolution(uint32_t chunk_size) {
+    return chunk_size + 1u;
+}
 
-    void invalidate_active() {
-        for (uint32_t feature_id : active_ids_) {
-            cache_.erase(feature_id);
-            queued_ids_.erase(feature_id);
-        }
-        ++edit_generation_;
-        queue_missing_active_features();
-        active_surface_dirty_ = true;
-    }
+size_t chunk_sample_index(uint32_t chunk_size, uint32_t x, uint32_t y, uint32_t z) {
+    const uint32_t sample_resolution = chunk_sample_resolution(chunk_size);
+    return static_cast<size_t>(z) * sample_resolution * sample_resolution +
+           static_cast<size_t>(y) * sample_resolution +
+           static_cast<size_t>(x);
+}
 
-    const ae::SurfaceNetMesh& active_surface() const {
-        return active_surface_;
-    }
-
-    const std::vector<ae::LocalVoxelFeature>& features() const {
-        return features_;
-    }
-
-    const std::vector<ae::LocalVoxelFeature>& active_holes() const {
-        return active_holes_;
-    }
-
-    const CaveStreamStats& stats() const {
-        return stats_;
-    }
-
-private:
-    static constexpr uint32_t ActiveBudget = 48u;
-    static constexpr uint32_t CacheBudget = 192u;
-    static constexpr uint32_t RenderedInteriorBudget = 16u;
-    static constexpr float AlwaysRenderedRadiusKm = 180.0f;
-
-    struct CachedInterior {
-        ae::SurfaceNetMesh surface;
-        ae::CaveFeatureBuildStats stats;
-        uint64_t last_used = 0;
-        double build_ms = 0.0;
+ae::Vec3 field_position(uint32_t resolution, uint32_t x, uint32_t y, uint32_t z) {
+    const float voxel = (GridRadius * 2.0f) / static_cast<float>(resolution);
+    return {
+        -GridRadius + static_cast<float>(x) * voxel,
+        -GridRadius + static_cast<float>(y) * voxel,
+        -GridRadius + static_cast<float>(z) * voxel,
     };
+}
 
-    struct CaveBuildJob {
-        uint32_t feature_id = 0;
-        uint32_t generation = 0;
-        std::future<CaveInteriorBuildResult> future;
+ae::Vec3 field_position(const MineSdfField& field, uint32_t x, uint32_t y, uint32_t z) {
+    return field_position(field.resolution, x, y, z);
+}
+
+int32_t field_coord(const MineSdfField& field, float value) {
+    return static_cast<int32_t>(std::floor((value + GridRadius) / field.voxel));
+}
+
+uint32_t clamp_point(const MineSdfField& field, int32_t value) {
+    return static_cast<uint32_t>(std::clamp(value, 0, static_cast<int32_t>(field.point_resolution - 1u)));
+}
+
+void chunk_world_bounds(uint32_t resolution, uint32_t chunk_size, MortonChunkKey key, ae::Vec3& minimum, ae::Vec3& maximum) {
+    const uint32_t min_x = key.x * chunk_size;
+    const uint32_t min_y = key.y * chunk_size;
+    const uint32_t min_z = key.z * chunk_size;
+    const uint32_t max_x = std::min(resolution, (key.x + 1u) * chunk_size);
+    const uint32_t max_y = std::min(resolution, (key.y + 1u) * chunk_size);
+    const uint32_t max_z = std::min(resolution, (key.z + 1u) * chunk_size);
+    minimum = field_position(resolution, min_x, min_y, min_z);
+    maximum = field_position(resolution, max_x, max_y, max_z);
+}
+
+void chunk_world_bounds(uint32_t chunk_size, MortonChunkKey key, ae::Vec3& minimum, ae::Vec3& maximum) {
+    chunk_world_bounds(lod_resolution(key.lod), chunk_size, key, minimum, maximum);
+}
+
+bool boxes_overlap(ae::Vec3 a_min, ae::Vec3 a_max, ae::Vec3 b_min, ae::Vec3 b_max) {
+    return a_min.x <= b_max.x && a_max.x >= b_min.x &&
+           a_min.y <= b_max.y && a_max.y >= b_min.y &&
+           a_min.z <= b_max.z && a_max.z >= b_min.z;
+}
+
+float min_distance_to_box_origin(ae::Vec3 minimum, ae::Vec3 maximum) {
+    auto axis_distance = [](float min_value, float max_value) {
+        if (0.0f < min_value) return min_value;
+        if (0.0f > max_value) return -max_value;
+        return 0.0f;
     };
+    const ae::Vec3 closest{
+        axis_distance(minimum.x, maximum.x),
+        axis_distance(minimum.y, maximum.y),
+        axis_distance(minimum.z, maximum.z),
+    };
+    return ae::length(closest);
+}
 
-    void refresh_feature_list(bool activate_terrain_holes) {
-        const std::vector<ae::LocalVoxelFeature> terrain_holes = build_terrain_dig_holes(config_.voxel_edits);
-        std::unordered_set<uint32_t> old_terrain_ids = terrain_feature_ids_;
-        std::unordered_set<uint32_t> new_terrain_ids;
-        new_terrain_ids.reserve(terrain_holes.size());
-        for (const ae::LocalVoxelFeature& feature : terrain_holes) {
-            new_terrain_ids.insert(feature.feature_id);
-        }
-
-        bool terrain_features_changed = old_terrain_ids.size() != new_terrain_ids.size();
-        if (!terrain_features_changed) {
-            for (uint32_t feature_id : new_terrain_ids) {
-                if (old_terrain_ids.find(feature_id) == old_terrain_ids.end()) {
-                    terrain_features_changed = true;
-                    break;
-                }
-            }
-        }
-        if (!terrain_features_changed && terrain_holes.size() == terrain_feature_count_) {
-            for (const ae::LocalVoxelFeature& new_feature : terrain_holes) {
-                auto old_it = std::find_if(features_.begin(), features_.end(), [&](const ae::LocalVoxelFeature& old_feature) {
-                    return old_feature.feature_id == new_feature.feature_id;
-                });
-                if (old_it == features_.end() ||
-                    old_it->seed != new_feature.seed ||
-                    std::fabs(old_it->entrance_radius_km - new_feature.entrance_radius_km) > 0.001f ||
-                    ae::length(old_it->center_mesh - new_feature.center_mesh) > 0.000001f) {
-                    terrain_features_changed = true;
-                    break;
-                }
-            }
-        }
-
-        features_ = merge_hole_lists(base_features_, terrain_holes);
-        terrain_feature_ids_ = std::move(new_terrain_ids);
-        terrain_feature_count_ = terrain_holes.size();
-        stats_.descriptors = static_cast<uint32_t>(features_.size());
-
-        if (!terrain_features_changed) {
-            return;
-        }
-
-        for (uint32_t feature_id : old_terrain_ids) {
-            cache_.erase(feature_id);
-            queued_ids_.erase(feature_id);
-        }
-        for (uint32_t feature_id : terrain_feature_ids_) {
-            cache_.erase(feature_id);
-            queued_ids_.erase(feature_id);
-        }
-        active_ids_.erase(std::remove_if(active_ids_.begin(), active_ids_.end(), is_terrain_hole_feature_id), active_ids_.end());
-        if (activate_terrain_holes) {
-            for (auto it = terrain_holes.rbegin(); it != terrain_holes.rend(); ++it) {
-                active_ids_.insert(active_ids_.begin(), it->feature_id);
-            }
-            if (active_ids_.size() > ActiveBudget) {
-                active_ids_.resize(ActiveBudget);
-            }
-        }
-        ++edit_generation_;
-        last_rescore_ = std::chrono::steady_clock::time_point{};
-        active_surface_dirty_ = true;
-    }
-
-    bool collect_ready_jobs() {
-        bool changed = false;
-        uint32_t collected = 0u;
-        for (size_t i = 0; i < jobs_.size();) {
-            if (jobs_[i].future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-                ++i;
-                continue;
-            }
-            CaveInteriorBuildResult result = jobs_[i].future.get();
-            queued_ids_.erase(jobs_[i].feature_id);
-            jobs_.erase(jobs_.begin() + static_cast<std::ptrdiff_t>(i));
-            if (result.generation == edit_generation_ &&
-                !result.surface.vertices.empty() &&
-                !result.surface.triangle_indices.empty()) {
-                cache_[result.feature_id] = {
-                    std::move(result.surface),
-                    result.stats,
-                    ++build_serial_,
-                    result.build_ms,
+float max_distance_to_box_origin(ae::Vec3 minimum, ae::Vec3 maximum) {
+    float max_dist_sq = 0.0f;
+    for (uint32_t z = 0; z < 2u; ++z) {
+        for (uint32_t y = 0; y < 2u; ++y) {
+            for (uint32_t x = 0; x < 2u; ++x) {
+                const ae::Vec3 p{
+                    x == 0u ? minimum.x : maximum.x,
+                    y == 0u ? minimum.y : maximum.y,
+                    z == 0u ? minimum.z : maximum.z,
                 };
-                stats_.last_build_ms = result.build_ms;
-                active_surface_dirty_ = true;
-                changed = true;
-            }
-            if (++collected >= 1u) {
-                break;
+                max_dist_sq = std::max(max_dist_sq, ae::dot(p, p));
             }
         }
-        return changed;
     }
+    return std::sqrt(max_dist_sq);
+}
 
-    bool choose_active_features(const ae::CameraView& view, ae::Vec3 aim_direction, uint32_t targeted_feature_id) {
-        std::vector<uint32_t> previous = active_ids_;
-        active_ids_.clear();
-        if (features_.empty()) {
-            return previous != active_ids_;
-        }
+float primitive_sdf(ae::Vec3 p, const SdfPrimitive& primitive) {
+    if (primitive.shape == SdfEditShape::Capsule) {
+        return distance_to_segment(p, primitive.a, primitive.b) - primitive.radius;
+    }
+    return ae::length(p - primitive.center) - primitive.radius;
+}
 
-        if (targeted_feature_id != 0u) {
-            active_ids_.push_back(targeted_feature_id);
-        }
+SdfPrimitive primitive_from_edit(const SdfEdit& edit) {
+    SdfPrimitive primitive;
+    primitive.mode = edit.mode;
+    primitive.shape = edit.shape;
+    primitive.center = edit.center;
+    primitive.a = edit.a;
+    primitive.b = edit.b;
+    primitive.radius = edit.radius;
+    primitive.blend = edit.blend;
+    primitive.material = edit.material;
+    const float extent = edit.radius + edit.blend + 0.018f;
+    if (edit.shape == SdfEditShape::Capsule) {
+        primitive.minimum = {
+            std::min(edit.a.x, edit.b.x) - extent,
+            std::min(edit.a.y, edit.b.y) - extent,
+            std::min(edit.a.z, edit.b.z) - extent,
+        };
+        primitive.maximum = {
+            std::max(edit.a.x, edit.b.x) + extent,
+            std::max(edit.a.y, edit.b.y) + extent,
+            std::max(edit.a.z, edit.b.z) + extent,
+        };
+    } else {
+        primitive.minimum = edit.center - ae::Vec3{extent, extent, extent};
+        primitive.maximum = edit.center + ae::Vec3{extent, extent, extent};
+    }
+    return primitive;
+}
 
-        const ae::Vec3 surface_focus = ae::length(view.eye) > 0.000001f
-            ? ae::normalize(view.eye)
-            : ae::Vec3{0.0f, 1.0f, 0.0f};
-        aim_direction = ae::normalize(aim_direction);
+SdfPrimitive sphere_primitive(ae::Vec3 center, float radius, float blend, EditMaterial material) {
+    SdfEdit edit;
+    edit.mode = SdfEditMode::Carve;
+    edit.shape = SdfEditShape::Sphere;
+    edit.center = center;
+    edit.a = center;
+    edit.b = center;
+    edit.radius = radius;
+    edit.blend = blend;
+    edit.material = material;
+    return primitive_from_edit(edit);
+}
 
-        std::vector<std::pair<float, uint32_t>> nearby;
-        nearby.reserve(RenderedInteriorBudget);
-        for (const ae::LocalVoxelFeature& feature : features_) {
-            if (active_ids_.size() >= ActiveBudget) {
-                break;
-            }
-            if (std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
-                continue;
-            }
-            const float distance_km = cave_feature_stream_distance_km(feature, current_eye_mesh_);
-            if (distance_km <= AlwaysRenderedRadiusKm) {
-                nearby.push_back({distance_km, feature.feature_id});
-            }
-        }
-        std::sort(nearby.begin(), nearby.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.first < rhs.first;
-        });
-        for (const auto& [distance_km, feature_id] : nearby) {
-            (void)distance_km;
-            if (active_ids_.size() >= ActiveBudget) {
-                break;
-            }
-            active_ids_.push_back(feature_id);
-        }
+SdfPrimitive capsule_primitive(ae::Vec3 a, ae::Vec3 b, float radius, float blend, EditMaterial material) {
+    SdfEdit edit;
+    edit.mode = SdfEditMode::Carve;
+    edit.shape = SdfEditShape::Capsule;
+    edit.center = (a + b) * 0.5f;
+    edit.a = a;
+    edit.b = b;
+    edit.radius = radius;
+    edit.blend = blend;
+    edit.material = material;
+    return primitive_from_edit(edit);
+}
 
-        for (const ae::LocalVoxelFeature& feature : features_) {
-            if (active_ids_.size() >= ActiveBudget) {
-                break;
-            }
-            if (!is_terrain_hole_feature_id(feature.feature_id) ||
-                std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
-                continue;
-            }
-            active_ids_.push_back(feature.feature_id);
+float evaluate_sparse_sdf(ae::Vec3 p, const std::vector<SdfPrimitive>& procedural, const std::vector<SdfPrimitive>& edits) {
+    float value = ae::length(p) - PlanetRadius;
+    auto apply = [&](const SdfPrimitive& primitive) {
+        const float sdf = primitive_sdf(p, primitive);
+        if (sdf > primitive.blend) {
+            return;
         }
+        if (primitive.mode == SdfEditMode::Carve) {
+            value = std::max(value, -sdf);
+        } else {
+            value = std::min(value, sdf);
+        }
+    };
+    for (const SdfPrimitive& primitive : procedural) {
+        apply(primitive);
+    }
+    for (const SdfPrimitive& primitive : edits) {
+        apply(primitive);
+    }
+    return value;
+}
 
-        std::vector<std::pair<float, uint32_t>> best;
-        best.reserve(ActiveBudget);
-        for (const ae::LocalVoxelFeature& feature : features_) {
-            if (std::find(active_ids_.begin(), active_ids_.end(), feature.feature_id) != active_ids_.end()) {
-                continue;
-            }
-            const float stream_distance = cave_feature_stream_distance_km(feature, current_eye_mesh_);
-            const float proximity = ae::dot(surface_focus, feature.center_mesh);
-            const float aim = std::max(0.0f, ae::dot(aim_direction, feature.center_mesh));
-            const float distance_score = -std::max(stream_distance, 0.0f) * 0.012f;
-            const float inside_bonus = stream_distance <= 0.0f ? 12.0f : 0.0f;
-            const float score = inside_bonus + distance_score + proximity * 1.35f + aim * 0.28f;
-            if (best.size() < ActiveBudget) {
-                best.push_back({score, feature.feature_id});
-                continue;
-            }
-            auto worst = std::min_element(best.begin(), best.end(), [](const auto& lhs, const auto& rhs) {
-                return lhs.first < rhs.first;
-            });
-            if (worst != best.end() && score > worst->first) {
-                *worst = {score, feature.feature_id};
-            }
+EditMaterial evaluate_sparse_material(ae::Vec3 p, const std::vector<SdfPrimitive>& procedural, const std::vector<SdfPrimitive>& edits) {
+    EditMaterial material = ae::length(p) > 0.935f ? EditMaterial::Crust : EditMaterial::MineWall;
+    for (const SdfPrimitive& primitive : procedural) {
+        if (primitive_sdf(p, primitive) <= 0.0f) {
+            material = primitive.material;
         }
+    }
+    for (const SdfPrimitive& primitive : edits) {
+        if (primitive_sdf(p, primitive) <= 0.0f) {
+            material = primitive.mode == SdfEditMode::Fill ? EditMaterial::Fill : primitive.material;
+        }
+    }
+    if (ae::length(p) < CoreVoidRadius + 0.055f) {
+        material = EditMaterial::Resource;
+    }
+    return material;
+}
 
-        const uint32_t remaining = ActiveBudget > active_ids_.size()
-            ? ActiveBudget - static_cast<uint32_t>(active_ids_.size())
-            : 0u;
-        if (best.size() > remaining) {
-            std::sort(best.begin(), best.end(), [](const auto& lhs, const auto& rhs) {
-                return lhs.first > rhs.first;
-            });
-            best.resize(remaining);
-        }
-        std::sort(best.begin(), best.end(), [](const auto& lhs, const auto& rhs) {
-            return lhs.first > rhs.first;
-        });
-        for (const auto& [score, feature_id] : best) {
-            (void)score;
-            active_ids_.push_back(feature_id);
-        }
+float sample_field(const MineSdfField& field, ae::Vec3 p) {
+    return evaluate_sparse_sdf(p, field.procedural_primitives, field.edit_primitives);
+}
 
-        for (uint32_t feature_id : active_ids_) {
-            auto found = cache_.find(feature_id);
-            if (found != cache_.end()) {
-                found->second.last_used = ++build_serial_;
+ae::Vec3 field_normal(const MineSdfField& field, ae::Vec3 p) {
+    const float h = field.voxel;
+    return ae::normalize({
+        sample_field(field, p + ae::Vec3{h, 0.0f, 0.0f}) - sample_field(field, p - ae::Vec3{h, 0.0f, 0.0f}),
+        sample_field(field, p + ae::Vec3{0.0f, h, 0.0f}) - sample_field(field, p - ae::Vec3{0.0f, h, 0.0f}),
+        sample_field(field, p + ae::Vec3{0.0f, 0.0f, h}) - sample_field(field, p - ae::Vec3{0.0f, 0.0f, h}),
+    });
+}
+
+ae::Vec3 material_color(EditMaterial tag, ae::Vec3 p) {
+    if (tag == EditMaterial::Fill) {
+        return {0.16f, 0.34f, 0.22f};
+    }
+    if (tag == EditMaterial::Resource) {
+        return color_resource();
+    }
+    if (tag == EditMaterial::Crust || ae::length(p) > 0.935f) {
+        return color_crust();
+    }
+    return color_mine_wall();
+}
+
+std::vector<uint64_t> mark_dirty_box(MineSdfField& field, ae::Vec3 minimum, ae::Vec3 maximum, bool urgent = false) {
+    std::vector<uint64_t> touched;
+    for (auto& entry : field.chunks) {
+        ae::Vec3 chunk_min;
+        ae::Vec3 chunk_max;
+        chunk_world_bounds(field.chunk_size, entry.second.key, chunk_min, chunk_max);
+        if (boxes_overlap(minimum, maximum, chunk_min, chunk_max)) {
+            entry.second.dirty = true;
+            entry.second.queued = false;
+            entry.second.gpu_dirty = true;
+            entry.second.urgent = entry.second.urgent || urgent;
+            ++entry.second.build_serial;
+            entry.second.state = ChunkState::Empty;
+            touched.push_back(entry.first);
+        }
+    }
+    return touched;
+}
+
+void mark_all_chunks_dirty(MineSdfField& field) {
+    for (auto& entry : field.chunks) {
+        entry.second.dirty = true;
+        entry.second.queued = false;
+        entry.second.gpu_dirty = true;
+        entry.second.urgent = false;
+        ++entry.second.build_serial;
+        entry.second.state = ChunkState::Empty;
+    }
+}
+
+uint32_t dirty_chunk_count(const MineSdfField& field) {
+    uint32_t count = 0;
+    for (const auto& entry : field.chunks) {
+        count += entry.second.dirty ? 1u : 0u;
+    }
+    return count;
+}
+
+void add_active_chunk(MineSdfField& field, MortonChunkKey key) {
+    if (field.chunks.find(key.code) != field.chunks.end()) {
+        return;
+    }
+    const uint32_t resolution = lod_resolution(key.lod);
+    MineSdfChunk chunk;
+    chunk.key = key;
+    chunk.min_x = key.x * field.chunk_size;
+    chunk.min_y = key.y * field.chunk_size;
+    chunk.min_z = key.z * field.chunk_size;
+    chunk.max_x = std::min(resolution, (key.x + 1u) * field.chunk_size);
+    chunk.max_y = std::min(resolution, (key.y + 1u) * field.chunk_size);
+    chunk.max_z = std::min(resolution, (key.z + 1u) * field.chunk_size);
+    field.active_keys.push_back(key);
+    field.chunks.emplace(key.code, std::move(chunk));
+}
+
+int32_t lod_coord(uint32_t lod, float value) {
+    const float voxel = (GridRadius * 2.0f) / static_cast<float>(lod_resolution(lod));
+    return static_cast<int32_t>(std::floor((value + GridRadius) / voxel));
+}
+
+void add_active_chunks_for_box(MineSdfField& field, uint32_t lod, ae::Vec3 minimum, ae::Vec3 maximum) {
+    const uint32_t chunks_per_axis = lod_chunks_per_axis(lod, field.chunk_size);
+    const uint32_t min_x = static_cast<uint32_t>(std::clamp(lod_coord(lod, minimum.x) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    const uint32_t min_y = static_cast<uint32_t>(std::clamp(lod_coord(lod, minimum.y) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    const uint32_t min_z = static_cast<uint32_t>(std::clamp(lod_coord(lod, minimum.z) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    const uint32_t max_x = static_cast<uint32_t>(std::clamp((lod_coord(lod, maximum.x) + static_cast<int32_t>(field.chunk_size)) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    const uint32_t max_y = static_cast<uint32_t>(std::clamp((lod_coord(lod, maximum.y) + static_cast<int32_t>(field.chunk_size)) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    const uint32_t max_z = static_cast<uint32_t>(std::clamp((lod_coord(lod, maximum.z) + static_cast<int32_t>(field.chunk_size)) / static_cast<int32_t>(field.chunk_size), 0, static_cast<int32_t>(chunks_per_axis - 1u)));
+    for (uint32_t z = min_z; z <= max_z; ++z) {
+        for (uint32_t y = min_y; y <= max_y; ++y) {
+            for (uint32_t x = min_x; x <= max_x; ++x) {
+                add_active_chunk(field, make_chunk_key(lod, x, y, z));
             }
         }
-        if (previous != active_ids_) {
-            active_surface_dirty_ = true;
-            return true;
+    }
+}
+
+struct SdfLodPolicy {
+    float near_radius = 0.34f;
+    float mid_radius = 0.78f;
+    float far_radius = 1.35f;
+    float target_fps = 60.0f;
+    float upload_budget_ms = 2.0f;
+};
+
+void add_focus_lod_chunks(MineSdfField& field, ae::Vec3 focus, const SdfLodPolicy& policy) {
+    const ae::Vec3 mid_extent{policy.mid_radius, policy.mid_radius, policy.mid_radius};
+    const ae::Vec3 near_extent{policy.near_radius, policy.near_radius, policy.near_radius};
+    add_active_chunks_for_box(field, 1u, focus - mid_extent, focus + mid_extent);
+    add_active_chunks_for_box(field, 2u, focus - near_extent, focus + near_extent);
+}
+
+void build_procedural_primitives(MineSdfField& field, const MineNetwork& network) {
+    field.procedural_primitives.clear();
+    for (const MineChamber& chamber : network.chambers) {
+        field.procedural_primitives.push_back(sphere_primitive(
+            chamber.center,
+            chamber.radius,
+            chamber.resource ? 0.030f : 0.022f,
+            chamber.resource ? EditMaterial::Resource : EditMaterial::MineWall
+        ));
+    }
+    auto add_path = [&](const MinePath& path) {
+        if (path.points.size() < 2u) {
+            return;
         }
+        for (uint32_t i = 0; i + 1u < path.points.size(); ++i) {
+            const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(path.points.size() - 1u);
+            const float radius = path.radius * (0.90f + 0.16f * std::sin(t * ae::Pi * 6.0f));
+            field.procedural_primitives.push_back(capsule_primitive(
+                path.points[i],
+                path.points[i + 1u],
+                radius,
+                path.primary ? 0.018f : 0.024f,
+                EditMaterial::MineWall
+            ));
+        }
+    };
+    for (const MinePath& path : network.primary_shafts) {
+        add_path(path);
+    }
+    for (const MinePath& path : network.branches) {
+        add_path(path);
+    }
+}
+
+MineSdfField build_base_mine_field(const MineSettings& settings, const MineNetwork& network) {
+    MineSdfField field;
+    field.resolution = effective_grid_resolution(settings, network);
+    field.point_resolution = field.resolution + 1u;
+    field.voxel = (GridRadius * 2.0f) / static_cast<float>(field.resolution);
+    field.brush_radius = settings.tunnel_radius;
+    field.chunks_x = (field.resolution + field.chunk_size - 1u) / field.chunk_size;
+    field.chunks_y = field.chunks_x;
+    field.chunks_z = field.chunks_x;
+    build_procedural_primitives(field, network);
+
+    for (const SdfPrimitive& primitive : field.procedural_primitives) {
+        add_active_chunks_for_box(field, 0u, primitive.minimum, primitive.maximum);
+        add_active_chunks_for_box(field, 1u, primitive.minimum, primitive.maximum);
+    }
+    const uint32_t coarse_chunks = lod_chunks_per_axis(0u, field.chunk_size);
+    for (uint32_t z = 0; z < coarse_chunks; ++z) {
+        for (uint32_t y = 0; y < coarse_chunks; ++y) {
+            for (uint32_t x = 0; x < coarse_chunks; ++x) {
+                ae::Vec3 minimum;
+                ae::Vec3 maximum;
+                const MortonChunkKey key = make_chunk_key(0u, x, y, z);
+                chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+                if (min_distance_to_box_origin(minimum, maximum) <= PlanetRadius &&
+                    max_distance_to_box_origin(minimum, maximum) >= PlanetRadius) {
+                    add_active_chunk(field, key);
+                }
+            }
+        }
+    }
+    std::sort(field.active_keys.begin(), field.active_keys.end(), [](const MortonChunkKey& lhs, const MortonChunkKey& rhs) {
+        return lhs.code < rhs.code;
+    });
+    return field;
+}
+
+void rebuild_field_from_history(MineSdfField& field) {
+    field.edit_primitives.clear();
+    for (EditableMineObject& object : field.objects) {
+        object.enabled = false;
+    }
+    for (const SdfEdit& edit : field.edits) {
+        const SdfPrimitive primitive = primitive_from_edit(edit);
+        field.edit_primitives.push_back(primitive);
+        add_active_chunks_for_box(field, 0u, primitive.minimum, primitive.maximum);
+        add_active_chunks_for_box(field, 1u, primitive.minimum, primitive.maximum);
+        add_active_chunks_for_box(field, 2u, primitive.minimum, primitive.maximum);
+        if (edit.mode == SdfEditMode::Carve && edit.object_id != 0u) {
+            for (EditableMineObject& object : field.objects) {
+                if (object.id == edit.object_id) {
+                    object.enabled = true;
+                }
+            }
+        }
+        if (edit.mode == SdfEditMode::Fill && edit.object_id != 0u) {
+            for (EditableMineObject& object : field.objects) {
+                if (object.id == edit.object_id) {
+                    object.enabled = false;
+                }
+            }
+        }
+    }
+    mark_all_chunks_dirty(field);
+}
+
+SdfEdit make_sphere_edit(MineSdfField& field, SdfEditMode mode, ae::Vec3 center, float radius, EditMaterial material, uint32_t object_id = 0u) {
+    return {
+        field.next_edit_id++,
+        object_id,
+        mode,
+        SdfEditShape::Sphere,
+        center,
+        center,
+        center,
+        radius,
+        std::max(field.voxel * 1.5f, radius * 0.30f),
+        material,
+    };
+}
+
+SdfEdit make_capsule_edit(MineSdfField& field, SdfEditMode mode, ae::Vec3 a, ae::Vec3 b, float radius, EditMaterial material, uint32_t object_id = 0u) {
+    return {
+        field.next_edit_id++,
+        object_id,
+        mode,
+        SdfEditShape::Capsule,
+        (a + b) * 0.5f,
+        a,
+        b,
+        radius,
+        std::max(field.voxel * 1.5f, radius * 0.30f),
+        material,
+    };
+}
+
+std::vector<uint64_t> apply_sdf_edit(MineSdfField& field, const SdfEdit& edit) {
+    field.edits.push_back(edit);
+    field.redo_edits.clear();
+    const SdfPrimitive primitive = primitive_from_edit(edit);
+    field.edit_primitives.push_back(primitive);
+    add_active_chunks_for_box(field, 0u, primitive.minimum, primitive.maximum);
+    add_active_chunks_for_box(field, 1u, primitive.minimum, primitive.maximum);
+    add_active_chunks_for_box(field, 2u, primitive.minimum, primitive.maximum);
+    std::vector<uint64_t> touched = mark_dirty_box(field, primitive.minimum, primitive.maximum, true);
+    if (edit.mode == SdfEditMode::Fill && edit.object_id != 0u) {
+        for (EditableMineObject& object : field.objects) {
+            if (object.id == edit.object_id) {
+                object.enabled = false;
+            }
+        }
+    }
+    return touched;
+}
+
+bool undo_edit(MineSdfField& field) {
+    if (field.edits.empty()) {
         return false;
     }
+    field.redo_edits.push_back(field.edits.back());
+    field.edits.pop_back();
+    rebuild_field_from_history(field);
+    return true;
+}
 
-    void queue_missing_active_features() {
-        for (uint32_t feature_id : active_ids_) {
-            if (jobs_.size() >= worker_count_) {
-                return;
-            }
-            if (cache_.find(feature_id) != cache_.end() || queued_ids_.find(feature_id) != queued_ids_.end()) {
-                continue;
-            }
-            queue_feature(feature_id);
-        }
+bool redo_edit(MineSdfField& field) {
+    if (field.redo_edits.empty()) {
+        return false;
     }
+    const SdfEdit edit = field.redo_edits.back();
+    field.redo_edits.pop_back();
+    field.edits.push_back(edit);
+    rebuild_field_from_history(field);
+    return true;
+}
 
-    void queue_feature(uint32_t feature_id) {
-        if (feature_id == 0u || jobs_.size() >= worker_count_) {
-            return;
-        }
-        auto feature_it = std::find_if(features_.begin(), features_.end(), [feature_id](const ae::LocalVoxelFeature& feature) {
-            return feature.feature_id == feature_id;
-        });
-        if (feature_it == features_.end()) {
-            return;
-        }
-        queued_ids_.insert(feature_id);
-        ae::LocalVoxelFeature feature = *feature_it;
-        ae::MarchingCubesConfig config = config_;
-        const float grid_radius = grid_radius_;
-        const uint32_t generation = edit_generation_;
-        jobs_.push_back({
-            feature_id,
-            generation,
-            std::async(std::launch::async, [feature, config, grid_radius, generation]() mutable {
-                const auto begin = std::chrono::steady_clock::now();
-                CaveInteriorBuildResult result;
-                result.feature_id = feature.feature_id;
-                result.generation = generation;
-                result.surface = ae::build_cave_surface_net_for_feature(feature, config, grid_radius, &result.stats);
-                result.build_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - begin
-                ).count();
-                return result;
-            })
-        });
-    }
-
-    void evict_cache() {
-        if (cache_.size() <= CacheBudget) {
-            return;
-        }
-        std::unordered_set<uint32_t> active_set(active_ids_.begin(), active_ids_.end());
-        while (cache_.size() > CacheBudget) {
-            auto victim = cache_.end();
-            for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-                if (active_set.find(it->first) != active_set.end()) {
-                    continue;
-                }
-                if (victim == cache_.end() || it->second.last_used < victim->second.last_used) {
-                    victim = it;
-                }
-            }
-            if (victim == cache_.end()) {
-                break;
-            }
-            cache_.erase(victim);
-        }
-    }
-
-    void rebuild_active_surface() {
-        active_surface_ = {};
-        active_holes_.clear();
-        active_surface_.source_depth = config_.voxel_features.cave_depth;
-        active_surface_.material_id = config_.surface_net_material_id;
-        active_surface_.bounds_radius = grid_radius_;
-        active_surface_.local_patch_depth = config_.voxel_features.cave_depth;
-        struct RenderCandidate {
-            float distance_km = 0.0f;
-            uint32_t active_order = 0u;
-            const ae::LocalVoxelFeature* feature = nullptr;
-            const CachedInterior* cached = nullptr;
-        };
-        std::vector<RenderCandidate> render_candidates;
-        render_candidates.reserve(active_ids_.size());
-        for (uint32_t feature_id : active_ids_) {
-            auto found = cache_.find(feature_id);
-            if (found == cache_.end()) {
-                continue;
-            }
-            const ae::LocalVoxelFeature* feature = nullptr;
-            const size_t feature_index = static_cast<size_t>(feature_id - 1u);
-            if (feature_index < features_.size() && features_[feature_index].feature_id == feature_id) {
-                feature = &features_[feature_index];
-            } else {
-                auto feature_it = std::find_if(features_.begin(), features_.end(), [feature_id](const ae::LocalVoxelFeature& feature) {
-                    return feature.feature_id == feature_id;
-                });
-                if (feature_it != features_.end()) {
-                    feature = &*feature_it;
-                }
-            }
-            if (feature == nullptr) {
-                continue;
-            }
-            render_candidates.push_back({
-                cave_feature_stream_distance_km(*feature, current_eye_mesh_),
-                static_cast<uint32_t>(render_candidates.size()),
-                feature,
-                &found->second,
-            });
-        }
-        std::sort(render_candidates.begin(), render_candidates.end(), [](const RenderCandidate& lhs, const RenderCandidate& rhs) {
-            if (std::fabs(lhs.distance_km - rhs.distance_km) > 0.001f) {
-                return lhs.distance_km < rhs.distance_km;
-            }
-            return lhs.active_order < rhs.active_order;
-        });
-
-        uint32_t rendered_count = 0u;
-        for (const RenderCandidate& candidate : render_candidates) {
-            if (rendered_count >= RenderedInteriorBudget) {
-                break;
-            }
-            active_holes_.push_back(*candidate.feature);
-            append_surface_mesh(active_surface_, candidate.cached->surface);
-            ++rendered_count;
-        }
-        active_surface_.local_patch_count = static_cast<uint32_t>(active_ids_.size());
-        active_surface_.local_vertex_count = static_cast<uint32_t>(active_surface_.vertices.size());
-        active_surface_.local_triangle_count = static_cast<uint32_t>(active_surface_.triangle_indices.size() / 3u);
-        stats_.rendered = rendered_count;
-    }
-
-    std::vector<ae::LocalVoxelFeature> features_;
-    std::vector<ae::LocalVoxelFeature> base_features_;
-    std::unordered_set<uint32_t> terrain_feature_ids_;
-    size_t terrain_feature_count_ = 0u;
-    ae::MarchingCubesConfig config_;
-    float grid_radius_ = 1.0f;
-    uint32_t worker_count_ = 1u;
-    uint64_t build_serial_ = 0u;
-    uint32_t edit_generation_ = 0u;
-    uint32_t last_targeted_feature_id_ = 0u;
-    ae::Vec3 current_eye_mesh_ = {};
-    std::chrono::steady_clock::time_point last_rescore_ = {};
-    std::vector<uint32_t> active_ids_;
-    std::unordered_map<uint32_t, CachedInterior> cache_;
-    std::unordered_set<uint32_t> queued_ids_;
-    std::vector<CaveBuildJob> jobs_;
-    ae::SurfaceNetMesh active_surface_;
-    std::vector<ae::LocalVoxelFeature> active_holes_;
-    CaveStreamStats stats_;
-    bool active_surface_dirty_ = true;
+struct ChunkBuildContext {
+    uint32_t generation = 0;
+    uint32_t resolution = 512;
+    uint32_t chunk_size = 16;
+    std::vector<SdfPrimitive> procedural_primitives;
+    std::vector<SdfPrimitive> edit_primitives;
 };
 
-ae::QuantizedMesh make_voxel_rebuild_source(const ae::QuantizedMesh& mesh) {
-    ae::QuantizedMesh result;
-    result.vertices = mesh.vertices;
-    result.triangle_indices = mesh.triangle_indices;
-    result.line_indices = mesh.line_indices;
-    result.stitch_triangle_indices = mesh.stitch_triangle_indices;
-    result.stitch_line_indices = mesh.stitch_line_indices;
-    result.surface_net_base_cache = mesh.surface_net_base_cache;
-    result.voxel_occupancy_cache = mesh.voxel_occupancy_cache;
-    result.voxel_features = mesh.voxel_features;
-    result.cave_anchor_points = mesh.cave_anchor_points;
-    result.triangle_count = mesh.triangle_count;
-    result.rejected_triangle_count = mesh.rejected_triangle_count;
-    result.stitch_triangle_count = mesh.stitch_triangle_count;
-    result.boundary_edge_count = mesh.boundary_edge_count;
-    result.chain_stitch_triangle_count = mesh.chain_stitch_triangle_count;
-    result.fallback_stitch_triangle_count = mesh.fallback_stitch_triangle_count;
-    result.boundary_run_count = mesh.boundary_run_count;
-    result.paired_boundary_run_count = mesh.paired_boundary_run_count;
-    result.rejected_stitch_run_count = mesh.rejected_stitch_run_count;
-    result.unstitched_gap_count = mesh.unstitched_gap_count;
-    result.clipped_triangle_count = mesh.clipped_triangle_count;
-    result.discarded_clipped_triangle_count = mesh.discarded_clipped_triangle_count;
-    result.shared_edge_path_count = mesh.shared_edge_path_count;
-    result.greedy_path_step_count = mesh.greedy_path_step_count;
-    result.rejected_greedy_jump_count = mesh.rejected_greedy_jump_count;
-    result.cell_count = mesh.cell_count;
-    result.min_cell_subdivisions = mesh.min_cell_subdivisions;
-    result.max_cell_subdivisions = mesh.max_cell_subdivisions;
-    result.lod_level_count = mesh.lod_level_count;
+float sample_context_field(const ChunkBuildContext& context, ae::Vec3 p) {
+    return evaluate_sparse_sdf(p, context.procedural_primitives, context.edit_primitives);
+}
+
+ae::Vec3 context_normal(const ChunkBuildContext& context, ae::Vec3 p) {
+    const float h = (GridRadius * 2.0f) / static_cast<float>(context.resolution);
+    return ae::normalize({
+        sample_context_field(context, p + ae::Vec3{h, 0.0f, 0.0f}) - sample_context_field(context, p - ae::Vec3{h, 0.0f, 0.0f}),
+        sample_context_field(context, p + ae::Vec3{0.0f, h, 0.0f}) - sample_context_field(context, p - ae::Vec3{0.0f, h, 0.0f}),
+        sample_context_field(context, p + ae::Vec3{0.0f, 0.0f, h}) - sample_context_field(context, p - ae::Vec3{0.0f, 0.0f, h}),
+    });
+}
+
+ChunkBuildResult build_chunk_result(const ChunkBuildContext& context, MortonChunkKey key, uint32_t build_serial) {
+    static constexpr std::array<std::array<uint32_t, 3u>, 8u> CornerOffset = {{
+        {{0u, 0u, 0u}}, {{1u, 0u, 0u}}, {{1u, 1u, 0u}}, {{0u, 1u, 0u}},
+        {{0u, 0u, 1u}}, {{1u, 0u, 1u}}, {{1u, 1u, 1u}}, {{0u, 1u, 1u}},
+    }};
+    static constexpr std::array<std::array<uint32_t, 2u>, 12u> EdgeCorners = {{
+        {{0u, 1u}}, {{1u, 2u}}, {{2u, 3u}}, {{3u, 0u}},
+        {{4u, 5u}}, {{5u, 6u}}, {{6u, 7u}}, {{7u, 4u}},
+        {{0u, 4u}}, {{1u, 5u}}, {{2u, 6u}}, {{3u, 7u}},
+    }};
+
+    ChunkBuildResult result;
+    result.generation = context.generation;
+    result.build_serial = build_serial;
+    result.key = key;
+    result.chunk.key = key;
+    result.chunk.build_serial = build_serial;
+    const uint32_t chunk_resolution = lod_resolution(key.lod);
+    result.chunk.min_x = key.x * context.chunk_size;
+    result.chunk.min_y = key.y * context.chunk_size;
+    result.chunk.min_z = key.z * context.chunk_size;
+    result.chunk.max_x = std::min(chunk_resolution, (key.x + 1u) * context.chunk_size);
+    result.chunk.max_y = std::min(chunk_resolution, (key.y + 1u) * context.chunk_size);
+    result.chunk.max_z = std::min(chunk_resolution, (key.z + 1u) * context.chunk_size);
+    result.chunk.state = ChunkState::Ready;
+    result.chunk.dirty = false;
+    result.chunk.queued = false;
+
+    ae::Vec3 chunk_min;
+    ae::Vec3 chunk_max;
+    chunk_world_bounds(context.chunk_size, key, chunk_min, chunk_max);
+    std::vector<SdfPrimitive> relevant_procedural;
+    std::vector<SdfPrimitive> relevant_edits;
+    relevant_procedural.reserve(context.procedural_primitives.size());
+    relevant_edits.reserve(context.edit_primitives.size());
+    for (const SdfPrimitive& primitive : context.procedural_primitives) {
+        if (boxes_overlap(chunk_min, chunk_max, primitive.minimum, primitive.maximum)) {
+            relevant_procedural.push_back(primitive);
+        }
+    }
+    for (const SdfPrimitive& primitive : context.edit_primitives) {
+        if (boxes_overlap(chunk_min, chunk_max, primitive.minimum, primitive.maximum)) {
+            relevant_edits.push_back(primitive);
+        }
+    }
+    auto relevant_normal = [&](ae::Vec3 p) {
+        const float h = (GridRadius * 2.0f) / static_cast<float>(chunk_resolution);
+        return ae::normalize({
+            evaluate_sparse_sdf(p + ae::Vec3{h, 0.0f, 0.0f}, relevant_procedural, relevant_edits) -
+                evaluate_sparse_sdf(p - ae::Vec3{h, 0.0f, 0.0f}, relevant_procedural, relevant_edits),
+            evaluate_sparse_sdf(p + ae::Vec3{0.0f, h, 0.0f}, relevant_procedural, relevant_edits) -
+                evaluate_sparse_sdf(p - ae::Vec3{0.0f, h, 0.0f}, relevant_procedural, relevant_edits),
+            evaluate_sparse_sdf(p + ae::Vec3{0.0f, 0.0f, h}, relevant_procedural, relevant_edits) -
+                evaluate_sparse_sdf(p - ae::Vec3{0.0f, 0.0f, h}, relevant_procedural, relevant_edits),
+        });
+    };
+
+    const uint32_t sample_resolution = chunk_sample_resolution(context.chunk_size);
+    result.chunk.values.resize(static_cast<size_t>(sample_resolution) * sample_resolution * sample_resolution);
+    result.chunk.material_tags.resize(result.chunk.values.size(), material_tag(EditMaterial::Auto));
+    for (uint32_t z = 0; z < sample_resolution; ++z) {
+        for (uint32_t y = 0; y < sample_resolution; ++y) {
+            for (uint32_t x = 0; x < sample_resolution; ++x) {
+                const uint32_t gx = result.chunk.min_x + x;
+                const uint32_t gy = result.chunk.min_y + y;
+                const uint32_t gz = result.chunk.min_z + z;
+                const ae::Vec3 p = field_position(chunk_resolution, gx, gy, gz);
+                const size_t sample_index = chunk_sample_index(context.chunk_size, x, y, z);
+                result.chunk.values[sample_index] = evaluate_sparse_sdf(p, relevant_procedural, relevant_edits);
+                result.chunk.material_tags[sample_index] = material_tag(evaluate_sparse_material(p, relevant_procedural, relevant_edits));
+            }
+        }
+    }
+
+    auto chunk_value = [&](uint32_t x, uint32_t y, uint32_t z) {
+        return result.chunk.values[chunk_sample_index(context.chunk_size, x, y, z)];
+    };
+    auto chunk_material = [&](uint32_t x, uint32_t y, uint32_t z) {
+        return tag_material(result.chunk.material_tags[chunk_sample_index(context.chunk_size, x, y, z)]);
+    };
+
+    TestbedMesh local;
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash> vertex_lookup;
+    vertex_lookup.reserve((context.chunk_size + 1u) * (context.chunk_size + 1u) * 4u);
+    for (uint32_t z = 0; z < result.chunk.max_z - result.chunk.min_z; ++z) {
+        for (uint32_t y = 0; y < result.chunk.max_y - result.chunk.min_y; ++y) {
+            for (uint32_t x = 0; x < result.chunk.max_x - result.chunk.min_x; ++x) {
+                std::array<float, 8u> cube_values = {};
+                std::array<ae::Vec3, 8u> cube_positions = {};
+                uint32_t cube_index_value = 0;
+                for (uint32_t corner = 0; corner < 8u; ++corner) {
+                    const uint32_t cx = x + CornerOffset[corner][0u];
+                    const uint32_t cy = y + CornerOffset[corner][1u];
+                    const uint32_t cz = z + CornerOffset[corner][2u];
+                    cube_values[corner] = chunk_value(cx, cy, cz);
+                    cube_positions[corner] = field_position(
+                        chunk_resolution,
+                        result.chunk.min_x + cx,
+                        result.chunk.min_y + cy,
+                        result.chunk.min_z + cz
+                    );
+                    if (cube_values[corner] < 0.0f) {
+                        cube_index_value |= 1u << corner;
+                    }
+                }
+                const int edge_mask = ae::mc_tables::EdgeTable[cube_index_value];
+                if (edge_mask == 0) {
+                    continue;
+                }
+                std::array<uint32_t, 12u> edge_vertices = {};
+                for (uint32_t edge = 0; edge < 12u; ++edge) {
+                    if ((edge_mask & (1 << edge)) == 0) {
+                        continue;
+                    }
+                    const uint32_t a = EdgeCorners[edge][0u];
+                    const uint32_t b = EdgeCorners[edge][1u];
+                    const ae::Vec3 p = interpolate_edge(cube_positions[a], cube_positions[b], cube_values[a], cube_values[b]);
+                    const EditMaterial tag = chunk_material(
+                        std::min<uint32_t>(context.chunk_size, x + CornerOffset[a][0u]),
+                        std::min<uint32_t>(context.chunk_size, y + CornerOffset[a][1u]),
+                        std::min<uint32_t>(context.chunk_size, z + CornerOffset[a][2u])
+                    );
+                    edge_vertices[edge] = add_vertex(local, vertex_lookup, p, relevant_normal(p), material_color(tag, p));
+                }
+                for (uint32_t tri = 0; tri < 16u && ae::mc_tables::TriTable[cube_index_value][tri] != -1; tri += 3u) {
+                    append_triangle(
+                        local,
+                        edge_vertices[static_cast<uint32_t>(ae::mc_tables::TriTable[cube_index_value][tri])],
+                        edge_vertices[static_cast<uint32_t>(ae::mc_tables::TriTable[cube_index_value][tri + 1u])],
+                        edge_vertices[static_cast<uint32_t>(ae::mc_tables::TriTable[cube_index_value][tri + 2u])]
+                    );
+                }
+            }
+        }
+    }
+    result.chunk.vertices = std::move(local.vertices);
+    result.chunk.indices = std::move(local.indices);
+    result.chunk.invalid_indices = 0;
+    result.chunk.degenerate_triangles = 0;
     return result;
 }
 
-MeshBuildResult build_lod_mesh_async(
-    const ae::GoldbergTopology& topology,
-    const ae::PointCloud& points,
-    ae::MarchingCubesConfig config,
-    uint32_t revision,
-    std::string reason,
-    std::chrono::steady_clock::time_point queued_at,
-    std::shared_ptr<BuildProgressState> progress
-) {
-    const auto build_begin = std::chrono::steady_clock::now();
-    MeshBuildResult result;
-    result.camera_position = config.lod_camera_position;
-    result.lod_focus = ae::normalize(config.lod_camera_position);
-    result.revision = revision;
-    result.mode = MeshBuildMode::Full;
-    result.reason = std::move(reason);
-    result.queue_wait_ms = std::chrono::duration<double, std::milli>(build_begin - queued_at).count();
-    if (progress) {
-        progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail build" : "Starting mesh build");
-        config.progress_callback = [progress](double value, const char* label) {
-            progress->set(value, label);
-        };
-    }
-    result.mesh = ae::build_quantized_marching_cubes(topology, points, config);
-    const auto validation_begin = std::chrono::steady_clock::now();
-    if (progress) {
-        progress->set(0.985f, "Validating mesh");
-    }
-    result.validation = ae::validate_quantized_mesh(result.mesh);
-    result.validation_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - validation_begin
-    ).count();
-    result.async_build_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - build_begin
-    ).count();
-    if (progress) {
-        progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Mesh ready" : "Mesh validation failed");
-    }
-    return result;
+bool chunk_ready(const MineSdfField& field, MortonChunkKey key) {
+    const auto found = field.chunks.find(key.code);
+    return found != field.chunks.end() && found->second.state == ChunkState::Ready;
 }
 
-MeshBuildResult build_voxel_mesh_async(
-    ae::QuantizedMesh mesh,
-    ae::MarchingCubesConfig config,
-    uint32_t revision,
-    std::string reason,
-    std::chrono::steady_clock::time_point queued_at,
-    std::shared_ptr<BuildProgressState> progress
+MortonChunkKey parent_chunk_key(MortonChunkKey key) {
+    return make_chunk_key(key.lod - 1u, key.x / 2u, key.y / 2u, key.z / 2u);
+}
+
+bool all_child_chunks_ready(const MineSdfField& field, MortonChunkKey parent) {
+    if (parent.lod >= 2u) {
+        return false;
+    }
+    const uint32_t child_lod = parent.lod + 1u;
+    const uint32_t child_base_x = parent.x * 2u;
+    const uint32_t child_base_y = parent.y * 2u;
+    const uint32_t child_base_z = parent.z * 2u;
+    for (uint32_t z = 0; z < 2u; ++z) {
+        for (uint32_t y = 0; y < 2u; ++y) {
+            for (uint32_t x = 0; x < 2u; ++x) {
+                if (!chunk_ready(field, make_chunk_key(child_lod, child_base_x + x, child_base_y + y, child_base_z + z))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool should_draw_lod_chunk(const MineSdfField& field, MortonChunkKey key) {
+    if (!chunk_ready(field, key)) {
+        return false;
+    }
+    if (key.lod > 0u) {
+        const MortonChunkKey parent = parent_chunk_key(key);
+        if (chunk_ready(field, parent) && !all_child_chunks_ready(field, parent)) {
+            return false;
+        }
+    }
+    if (all_child_chunks_ready(field, key)) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<MortonChunkKey> collect_visible_lod_keys(MineSdfField& field) {
+    field.visible_lod_counts = {0u, 0u, 0u};
+    std::vector<MortonChunkKey> visible_keys;
+    visible_keys.reserve(field.active_keys.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        if (!should_draw_lod_chunk(field, key)) {
+            continue;
+        }
+        visible_keys.push_back(key);
+        if (key.lod < field.visible_lod_counts.size()) {
+            ++field.visible_lod_counts[key.lod];
+        }
+    }
+    return visible_keys;
+}
+
+bool chunk_gpu_ready(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey key) {
+    const auto chunk = field.chunks.find(key.code);
+    if (chunk == field.chunks.end() || chunk->second.state != ChunkState::Ready || chunk->second.gpu_dirty) {
+        return false;
+    }
+    const auto gpu_chunk = store.chunks.find(key.code);
+    return gpu_chunk != store.chunks.end() && gpu_chunk->second.generation == field.generation && gpu_chunk->second.index_count > 0u;
+}
+
+bool all_child_chunks_gpu_ready(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey parent) {
+    if (parent.lod >= 2u) {
+        return false;
+    }
+    const uint32_t child_lod = parent.lod + 1u;
+    const uint32_t child_base_x = parent.x * 2u;
+    const uint32_t child_base_y = parent.y * 2u;
+    const uint32_t child_base_z = parent.z * 2u;
+    for (uint32_t z = 0; z < 2u; ++z) {
+        for (uint32_t y = 0; y < 2u; ++y) {
+            for (uint32_t x = 0; x < 2u; ++x) {
+                if (!chunk_gpu_ready(field, store, make_chunk_key(child_lod, child_base_x + x, child_base_y + y, child_base_z + z))) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool should_draw_gpu_lod_chunk(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey key) {
+    if (!chunk_gpu_ready(field, store, key)) {
+        return false;
+    }
+    if (key.lod > 0u) {
+        const MortonChunkKey parent = parent_chunk_key(key);
+        if (chunk_gpu_ready(field, store, parent) && !all_child_chunks_gpu_ready(field, store, parent)) {
+            return false;
+        }
+    }
+    if (all_child_chunks_gpu_ready(field, store, key)) {
+        return false;
+    }
+    return true;
+}
+
+std::vector<MortonChunkKey> collect_gpu_visible_lod_keys(MineSdfField& field, const GpuChunkStore& store) {
+    field.visible_lod_counts = {0u, 0u, 0u};
+    std::vector<MortonChunkKey> visible_keys;
+    visible_keys.reserve(field.active_keys.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        if (!should_draw_gpu_lod_chunk(field, store, key)) {
+            continue;
+        }
+        visible_keys.push_back(key);
+        if (key.lod < field.visible_lod_counts.size()) {
+            ++field.visible_lod_counts[key.lod];
+        }
+    }
+    return visible_keys;
+}
+
+float axis_value(ae::Vec3 p, uint32_t axis) {
+    if (axis == 0u) return p.x;
+    if (axis == 1u) return p.y;
+    return p.z;
+}
+
+ae::Vec3 axis_offset(uint32_t axis, float amount) {
+    if (axis == 0u) return {amount, 0.0f, 0.0f};
+    if (axis == 1u) return {0.0f, amount, 0.0f};
+    return {0.0f, 0.0f, amount};
+}
+
+struct VisibleLodIndex {
+    std::unordered_set<uint64_t> codes;
+};
+
+uint32_t chunk_coord_for_point(uint32_t lod, float value, uint32_t chunk_size) {
+    const uint32_t chunks_per_axis = lod_chunks_per_axis(lod, chunk_size);
+    const int32_t coord = lod_coord(lod, value);
+    return static_cast<uint32_t>(std::clamp(
+        coord / static_cast<int32_t>(chunk_size),
+        0,
+        static_cast<int32_t>(chunks_per_axis - 1u)
+    ));
+}
+
+int visible_lower_lod_at_point(const VisibleLodIndex& visible_index, const MineSdfField& field, ae::Vec3 p, MortonChunkKey current) {
+    for (int32_t lod = static_cast<int32_t>(current.lod) - 1; lod >= 0; --lod) {
+        const uint32_t lod_u = static_cast<uint32_t>(lod);
+        const MortonChunkKey candidate = make_chunk_key(
+            lod_u,
+            chunk_coord_for_point(lod_u, p.x, field.chunk_size),
+            chunk_coord_for_point(lod_u, p.y, field.chunk_size),
+            chunk_coord_for_point(lod_u, p.z, field.chunk_size)
+        );
+        if (visible_index.codes.find(candidate.code) != visible_index.codes.end()) {
+            return lod;
+        }
+    }
+    return -1;
+}
+
+bool face_needs_transition(
+    const MineSdfField& field,
+    MortonChunkKey key,
+    const VisibleLodIndex& visible_index,
+    ae::Vec3 minimum,
+    ae::Vec3 maximum,
+    uint32_t axis,
+    float sign
 ) {
-    const auto build_begin = std::chrono::steady_clock::now();
-    MeshBuildResult result;
-    result.camera_position = config.lod_camera_position;
-    result.lod_focus = ae::normalize(config.lod_camera_position);
-    result.revision = revision;
-    result.mode = MeshBuildMode::VoxelsOnly;
-    result.reason = std::move(reason);
-    result.queue_wait_ms = std::chrono::duration<double, std::milli>(build_begin - queued_at).count();
-    if (progress) {
-        progress->set(0.0f, config.local_surface_net_depth >= HighSvoDepth ? "Starting depth-16 detail rebuild" : "Starting voxel rebuild");
-        config.progress_callback = [progress](double value, const char* label) {
-            progress->set(value, label);
-        };
+    const ae::Vec3 center = (minimum + maximum) * 0.5f;
+    const float step = (GridRadius * 2.0f) / static_cast<float>(lod_resolution(key.lod));
+    ae::Vec3 probe = center;
+    if (axis == 0u) probe.x = sign < 0.0f ? minimum.x : maximum.x;
+    if (axis == 1u) probe.y = sign < 0.0f ? minimum.y : maximum.y;
+    if (axis == 2u) probe.z = sign < 0.0f ? minimum.z : maximum.z;
+    probe = probe + axis_offset(axis, sign * step * 0.65f);
+    if (std::fabs(probe.x) > GridRadius || std::fabs(probe.y) > GridRadius || std::fabs(probe.z) > GridRadius) {
+        return false;
     }
-    result.mesh = ae::rebuild_quantized_mesh_voxels(std::move(mesh), config);
-    const auto validation_begin = std::chrono::steady_clock::now();
-    if (progress) {
-        progress->set(0.985f, "Validating voxel rebuild");
+    const int neighbor_lod = visible_lower_lod_at_point(visible_index, field, probe, key);
+    return neighbor_lod >= 0 && key.lod > static_cast<uint32_t>(neighbor_lod);
+}
+
+void append_lod_transition_strips(
+    TestbedMesh& mesh,
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash>& combined_lookup,
+    const MineSdfChunk& chunk,
+    uint32_t chunk_size,
+    const std::array<bool, 6u>& transition_faces
+) {
+    if (!std::any_of(transition_faces.begin(), transition_faces.end(), [](bool value) { return value; })) {
+        return;
     }
-    result.validation = ae::validate_quantized_mesh(result.mesh);
-    result.validation_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - validation_begin
-    ).count();
-    result.async_build_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - build_begin
-    ).count();
-    if (progress) {
-        progress->set(result.validation.ok ? 1.0f : 0.0f, result.validation.ok ? "Voxel rebuild ready" : "Voxel validation failed");
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    chunk_world_bounds(chunk_size, chunk.key, minimum, maximum);
+    const float step = (GridRadius * 2.0f) / static_cast<float>(lod_resolution(chunk.key.lod));
+    const float epsilon = step * 0.035f;
+    const float skirt = step * 0.70f;
+    auto on_face = [&](ae::Vec3 p, uint32_t face) {
+        const uint32_t axis = face / 2u;
+        const bool min_face = (face % 2u) == 0u;
+        const float plane = axis_value(min_face ? minimum : maximum, axis);
+        return std::fabs(axis_value(p, axis) - plane) <= epsilon;
+    };
+    auto skirt_offset = [&](uint32_t face) {
+        const uint32_t axis = face / 2u;
+        const float sign = (face % 2u) == 0u ? -1.0f : 1.0f;
+        return axis_offset(axis, sign * skirt);
+    };
+    auto add_transition_vertex = [&](ae::Vec3 p, ae::Vec3 normal) {
+        return add_vertex(mesh, combined_lookup, p, normal, ae::Vec3{0.20f, 0.15f, 0.10f});
+    };
+    auto append_transition_triangle = [&](uint32_t a, uint32_t b, uint32_t c) {
+        if (a == b || b == c || c == a) {
+            return;
+        }
+        const ae::Vec3 pa = mesh.vertices[a].position;
+        const ae::Vec3 pb = mesh.vertices[b].position;
+        const ae::Vec3 pc = mesh.vertices[c].position;
+        const ae::Vec3 face = ae::cross(pb - pa, pc - pa);
+        if (ae::length(face) <= 0.0000008f) {
+            return;
+        }
+        ae::Vec3 average_normal = ae::normalize(mesh.vertices[a].normal + mesh.vertices[b].normal + mesh.vertices[c].normal);
+        if (ae::length(average_normal) <= 0.000001f) {
+            average_normal = ae::normalize(face);
+        }
+        if (ae::dot(face, average_normal) < 0.0f) {
+            std::swap(b, c);
+        }
+        mesh.indices.push_back(a);
+        mesh.indices.push_back(b);
+        mesh.indices.push_back(c);
+    };
+    for (uint32_t i = 0; i + 2u < chunk.indices.size(); i += 3u) {
+        const std::array<uint32_t, 3u> tri = {chunk.indices[i], chunk.indices[i + 1u], chunk.indices[i + 2u]};
+        for (uint32_t edge = 0; edge < 3u; ++edge) {
+            const uint32_t ia = tri[edge];
+            const uint32_t ib = tri[(edge + 1u) % 3u];
+            if (ia >= chunk.vertices.size() || ib >= chunk.vertices.size()) {
+                continue;
+            }
+            const RenderVertex& va = chunk.vertices[ia];
+            const RenderVertex& vb = chunk.vertices[ib];
+            for (uint32_t face = 0; face < 6u; ++face) {
+                if (!transition_faces[face] || !on_face(va.position, face) || !on_face(vb.position, face)) {
+                    continue;
+                }
+                const ae::Vec3 offset = skirt_offset(face);
+                const uint32_t a = add_transition_vertex(va.position, va.normal);
+                const uint32_t b = add_transition_vertex(vb.position, vb.normal);
+                const uint32_t c = add_transition_vertex(vb.position + offset, vb.normal);
+                const uint32_t d = add_transition_vertex(va.position + offset, va.normal);
+                append_transition_triangle(a, b, c);
+                append_transition_triangle(a, c, d);
+            }
+        }
     }
-    return result;
+}
+
+TestbedMesh remesh_dirty_chunks(MineSdfField& field, const MineSettings& settings, const MineNetwork& network) {
+    const auto begin = std::chrono::steady_clock::now();
+    const uint32_t dirty_before = dirty_chunk_count(field);
+
+    TestbedMesh mesh;
+    field.transition_triangle_count = 0u;
+    const std::vector<MortonChunkKey> visible_keys = collect_visible_lod_keys(field);
+    VisibleLodIndex visible_index;
+    visible_index.codes.reserve(visible_keys.size() * 2u + 16u);
+    for (MortonChunkKey key : visible_keys) {
+        visible_index.codes.insert(key.code);
+    }
+
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash> combined_lookup;
+    for (const MortonChunkKey& key : visible_keys) {
+        const auto found = field.chunks.find(key.code);
+        if (found == field.chunks.end() || found->second.state != ChunkState::Ready) {
+            continue;
+        }
+        const MineSdfChunk& chunk = found->second;
+        std::vector<uint32_t> remap(chunk.vertices.size(), UINT32_MAX);
+        for (uint32_t local_index : chunk.indices) {
+            if (local_index >= chunk.vertices.size()) {
+                ++mesh.stats.invalid_indices;
+                continue;
+            }
+            if (remap[local_index] == UINT32_MAX) {
+                const RenderVertex& vertex = chunk.vertices[local_index];
+                remap[local_index] = add_vertex(mesh, combined_lookup, vertex.position, vertex.normal, vertex.color);
+            }
+            mesh.indices.push_back(remap[local_index]);
+        }
+        mesh.stats.invalid_indices += chunk.invalid_indices;
+        mesh.stats.degenerate_triangles += chunk.degenerate_triangles;
+
+        ae::Vec3 minimum;
+        ae::Vec3 maximum;
+        chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+        const std::array<bool, 6u> transition_faces = {{
+            face_needs_transition(field, key, visible_index, minimum, maximum, 0u, -1.0f),
+            face_needs_transition(field, key, visible_index, minimum, maximum, 0u, 1.0f),
+            face_needs_transition(field, key, visible_index, minimum, maximum, 1u, -1.0f),
+            face_needs_transition(field, key, visible_index, minimum, maximum, 1u, 1.0f),
+            face_needs_transition(field, key, visible_index, minimum, maximum, 2u, -1.0f),
+            face_needs_transition(field, key, visible_index, minimum, maximum, 2u, 1.0f),
+        }};
+        const uint32_t before = static_cast<uint32_t>(mesh.indices.size() / 3u);
+        append_lod_transition_strips(mesh, combined_lookup, chunk, field.chunk_size, transition_faces);
+        field.transition_triangle_count += static_cast<uint32_t>(mesh.indices.size() / 3u) - before;
+    }
+
+    mesh.stats.seed = settings.seed;
+    mesh.stats.entrances = static_cast<uint32_t>(network.entrances.size());
+    mesh.stats.primary_shafts = static_cast<uint32_t>(network.primary_shafts.size());
+    mesh.stats.branch_tunnels = static_cast<uint32_t>(network.branches.size());
+    mesh.stats.chambers = static_cast<uint32_t>(network.chambers.size());
+    mesh.stats.grid_resolution = field.resolution;
+    mesh.stats.vertices = static_cast<uint32_t>(mesh.vertices.size());
+    mesh.stats.triangles = static_cast<uint32_t>(mesh.indices.size() / 3u);
+    mesh.stats.ok = mesh.stats.invalid_indices == 0u && mesh.stats.degenerate_triangles == 0u;
+    mesh.stats.edit_count = static_cast<uint32_t>(field.edits.size());
+    mesh.stats.dirty_chunks = dirty_before;
+    mesh.stats.brush_radius = field.brush_radius;
+    mesh.stats.last_remesh_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    field.last_remesh_ms = mesh.stats.last_remesh_ms;
+    std::ostringstream message;
+    message << (mesh.stats.ok ? "Mesh validation OK" : "Mesh validation FAILED")
+            << ": seed " << mesh.stats.seed
+            << ", entrances " << mesh.stats.entrances
+            << ", primary shafts " << mesh.stats.primary_shafts
+            << ", branches " << mesh.stats.branch_tunnels
+            << ", chambers " << mesh.stats.chambers
+            << ", edits " << mesh.stats.edit_count
+            << ", dirty chunks " << mesh.stats.dirty_chunks
+            << ", brush " << mesh.stats.brush_radius
+            << ", remesh " << mesh.stats.last_remesh_ms << " ms"
+            << ", grid " << mesh.stats.grid_resolution
+            << ", vertices " << mesh.stats.vertices
+            << ", triangles " << mesh.stats.triangles
+            << ", invalid " << mesh.stats.invalid_indices
+            << ", degenerate " << mesh.stats.degenerate_triangles
+            << ", open " << mesh.stats.open_edges
+            << ", nonmanifold " << mesh.stats.nonmanifold_edges;
+    mesh.stats.message = message.str();
+    return mesh;
+}
+
+BuildStats update_streaming_stats(
+    MineSdfField& field,
+    const MineSettings& settings,
+    const MineNetwork& network,
+    const std::vector<MortonChunkKey>& visible_keys
+) {
+    const auto begin = std::chrono::steady_clock::now();
+    BuildStats stats;
+    field.transition_triangle_count = 0u;
+    for (MortonChunkKey key : visible_keys) {
+        const auto found = field.chunks.find(key.code);
+        if (found == field.chunks.end() || found->second.state != ChunkState::Ready) {
+            continue;
+        }
+        const MineSdfChunk& chunk = found->second;
+        stats.vertices += static_cast<uint32_t>(chunk.vertices.size());
+        stats.triangles += static_cast<uint32_t>(chunk.indices.size() / 3u);
+        stats.invalid_indices += chunk.invalid_indices;
+        stats.degenerate_triangles += chunk.degenerate_triangles;
+    }
+    stats.seed = settings.seed;
+    stats.entrances = static_cast<uint32_t>(network.entrances.size());
+    stats.primary_shafts = static_cast<uint32_t>(network.primary_shafts.size());
+    stats.branch_tunnels = static_cast<uint32_t>(network.branches.size());
+    stats.chambers = static_cast<uint32_t>(network.chambers.size());
+    stats.grid_resolution = field.resolution;
+    stats.ok = stats.invalid_indices == 0u && stats.degenerate_triangles == 0u;
+    stats.edit_count = static_cast<uint32_t>(field.edits.size());
+    stats.dirty_chunks = dirty_chunk_count(field);
+    stats.brush_radius = field.brush_radius;
+    stats.last_remesh_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+    field.last_remesh_ms = stats.last_remesh_ms;
+    std::ostringstream message;
+    message << (stats.ok ? "Streaming mesh OK" : "Streaming mesh CHECK")
+            << ": seed " << stats.seed
+            << ", visible chunks " << visible_keys.size()
+            << ", grid " << stats.grid_resolution
+            << ", vertices " << stats.vertices
+            << ", triangles " << stats.triangles
+            << ", invalid " << stats.invalid_indices
+            << ", degenerate " << stats.degenerate_triangles;
+    stats.message = message.str();
+    return stats;
+}
+
+void start_worker_pool(WorkerPool& pool) {
+    pool.worker_count = std::max(1u, std::thread::hardware_concurrency() > 2u ? std::thread::hardware_concurrency() - 1u : 1u);
+    for (uint32_t i = 0; i < pool.worker_count; ++i) {
+        pool.threads.emplace_back([&pool]() {
+            while (!pool.stop.load()) {
+                WorkerTask task;
+                {
+                    std::unique_lock<std::mutex> lock(pool.mutex);
+                    pool.cv.wait(lock, [&]() {
+                        return pool.stop.load() || !pool.queue.empty();
+                    });
+                    if (pool.stop.load()) {
+                        return;
+                    }
+                    task = std::move(const_cast<WorkerTask&>(pool.queue.top()));
+                    pool.queue.pop();
+                }
+                ChunkBuildResult result = task.build();
+                {
+                    std::lock_guard<std::mutex> lock(pool.mutex);
+                    pool.completed.push_back(std::move(result));
+                }
+            }
+        });
+    }
+}
+
+void stop_worker_pool(WorkerPool& pool) {
+    pool.stop.store(true);
+    pool.cv.notify_all();
+    for (std::thread& thread : pool.threads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+}
+
+uint32_t worker_queue_size(WorkerPool& pool) {
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    return static_cast<uint32_t>(pool.queue.size());
+}
+
+void clear_worker_queue(WorkerPool& pool) {
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    while (!pool.queue.empty()) {
+        pool.queue.pop();
+    }
+    pool.completed.clear();
+}
+
+void enqueue_chunk_build(WorkerPool& pool, std::shared_ptr<ChunkBuildContext> context, MortonChunkKey key, uint32_t build_serial, float priority) {
+    WorkerTask task;
+    task.generation = context->generation;
+    task.priority = priority;
+    task.build = [context, key, build_serial]() {
+        return build_chunk_result(*context, key, build_serial);
+    };
+    {
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        task.sequence = pool.next_sequence++;
+        pool.queue.push(std::move(task));
+    }
+    pool.cv.notify_one();
+}
+
+float chunk_priority(const MineSdfField& field, MortonChunkKey key, ae::Vec3 focus) {
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+    const ae::Vec3 center = (minimum + maximum) * 0.5f;
+    const float lod_bias = key.lod == 0u ? -0.55f : key.lod == 1u ? -0.18f : -0.04f;
+    const auto found = field.chunks.find(key.code);
+    const float urgent_bias = found != field.chunks.end() && found->second.urgent ? -4.0f : 0.0f;
+    return urgent_bias + lod_bias + ae::length(center - focus) + static_cast<float>(key.code & 0xffffu) * 0.0000001f;
+}
+
+uint32_t queue_dirty_chunks(MineSdfField& field, WorkerPool& pool, ae::Vec3 focus, uint32_t max_jobs = UINT32_MAX) {
+    if (field.streaming_paused) {
+        return 0;
+    }
+    auto context = std::make_shared<ChunkBuildContext>();
+    context->generation = field.generation;
+    context->resolution = field.resolution;
+    context->chunk_size = field.chunk_size;
+    context->procedural_primitives = field.procedural_primitives;
+    context->edit_primitives = field.edit_primitives;
+
+    std::vector<std::pair<float, MortonChunkKey>> jobs;
+    jobs.reserve(field.active_keys.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        auto found = field.chunks.find(key.code);
+        if (found == field.chunks.end()) {
+            continue;
+        }
+        MineSdfChunk& chunk = found->second;
+        if (!chunk.dirty || chunk.queued) {
+            continue;
+        }
+        jobs.push_back({chunk_priority(field, key, focus), key});
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+
+    uint32_t queued = 0;
+    for (const auto& job : jobs) {
+        if (queued >= max_jobs) {
+            break;
+        }
+        MineSdfChunk& chunk = field.chunks[job.second.code];
+        chunk.queued = true;
+        chunk.state = ChunkState::Queued;
+        chunk.priority = job.first;
+        enqueue_chunk_build(pool, context, job.second, chunk.build_serial, job.first);
+        ++queued;
+    }
+    field.queued_jobs_last_frame = queued;
+    return queued;
+}
+
+uint32_t drain_completed_chunks(MineSdfField& field, WorkerPool& pool, uint32_t max_results = 128u) {
+    std::vector<ChunkBuildResult> completed;
+    {
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        const uint32_t count = std::min<uint32_t>(max_results, static_cast<uint32_t>(pool.completed.size()));
+        completed.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            completed.push_back(std::move(pool.completed.back()));
+            pool.completed.pop_back();
+        }
+    }
+
+    uint32_t accepted = 0;
+    for (ChunkBuildResult& result : completed) {
+        if (result.generation != field.generation) {
+            ++field.stale_result_drops;
+            continue;
+        }
+        auto found = field.chunks.find(result.key.code);
+        if (found == field.chunks.end()) {
+            ++field.stale_result_drops;
+            continue;
+        }
+        if (result.build_serial != found->second.build_serial) {
+            ++field.stale_result_drops;
+            continue;
+        }
+        result.chunk.priority = found->second.priority;
+        result.chunk.urgent = found->second.urgent;
+        result.chunk.gpu_dirty = true;
+        field.chunks[result.key.code] = std::move(result.chunk);
+        ++accepted;
+    }
+    field.completed_jobs_last_frame = accepted;
+    field.completed_jobs_total += accepted;
+    return accepted;
+}
+
+void append_line(std::vector<RenderVertex>& lines, ae::Vec3 a, ae::Vec3 b, ae::Vec3 color) {
+    lines.push_back({a, ae::normalize(a), color});
+    lines.push_back({b, ae::normalize(b), color});
+}
+
+void append_sphere_preview(std::vector<RenderVertex>& lines, ae::Vec3 center, float radius, ae::Vec3 color) {
+    constexpr uint32_t Segments = 32u;
+    for (uint32_t i = 0; i < Segments; ++i) {
+        const float a0 = static_cast<float>(i) * ae::Pi * 2.0f / static_cast<float>(Segments);
+        const float a1 = static_cast<float>(i + 1u) * ae::Pi * 2.0f / static_cast<float>(Segments);
+        append_line(lines, center + ae::Vec3{std::cos(a0) * radius, std::sin(a0) * radius, 0.0f}, center + ae::Vec3{std::cos(a1) * radius, std::sin(a1) * radius, 0.0f}, color);
+        append_line(lines, center + ae::Vec3{std::cos(a0) * radius, 0.0f, std::sin(a0) * radius}, center + ae::Vec3{std::cos(a1) * radius, 0.0f, std::sin(a1) * radius}, color);
+        append_line(lines, center + ae::Vec3{0.0f, std::cos(a0) * radius, std::sin(a0) * radius}, center + ae::Vec3{0.0f, std::cos(a1) * radius, std::sin(a1) * radius}, color);
+    }
+}
+
+std::vector<RenderVertex> build_graph_lines(const MineNetwork& network, const MineSdfField& field, bool has_preview, ae::Vec3 preview_center) {
+    std::vector<RenderVertex> lines;
+    for (const MinePath& path : network.primary_shafts) {
+        for (uint32_t i = 0; i + 1u < path.points.size(); ++i) {
+            append_line(lines, path.points[i], path.points[i + 1u], color_primary_line());
+        }
+    }
+    for (const MinePath& path : network.branches) {
+        for (uint32_t i = 0; i + 1u < path.points.size(); ++i) {
+            append_line(lines, path.points[i], path.points[i + 1u], color_branch_line());
+        }
+    }
+    for (const MineChamber& chamber : network.chambers) {
+        const ae::Vec3 color = chamber.resource ? color_resource() : color_chamber_line();
+        const float r = chamber.radius * 0.72f;
+        append_line(lines, chamber.center + ae::Vec3{r, 0.0f, 0.0f}, chamber.center - ae::Vec3{r, 0.0f, 0.0f}, color);
+        append_line(lines, chamber.center + ae::Vec3{0.0f, r, 0.0f}, chamber.center - ae::Vec3{0.0f, r, 0.0f}, color);
+        append_line(lines, chamber.center + ae::Vec3{0.0f, 0.0f, r}, chamber.center - ae::Vec3{0.0f, 0.0f, r}, color);
+    }
+    for (const EditableMineObject& object : field.objects) {
+        if (!object.enabled || object.points.empty()) {
+            continue;
+        }
+        const ae::Vec3 color = object.kind == EditableObjectKind::Chamber ? color_chamber_line() : color_branch_line();
+        if (object.kind == EditableObjectKind::Chamber) {
+            append_sphere_preview(lines, object.points.front(), object.radius, color);
+        } else {
+            for (uint32_t i = 0; i + 1u < object.points.size(); ++i) {
+                append_line(lines, object.points[i], object.points[i + 1u], color);
+            }
+        }
+    }
+    if (field.has_tunnel_mark) {
+        append_sphere_preview(lines, field.tunnel_mark, field.brush_radius * 0.65f, color_primary_line());
+    }
+    if (has_preview) {
+        append_sphere_preview(lines, preview_center, field.brush_radius, color_brush_line());
+    }
+    return lines;
+}
+
+void upload_lines(GpuMesh& gpu, const std::vector<RenderVertex>& lines) {
+    if (gpu.line_vao == 0) {
+        glGenVertexArrays(1, &gpu.line_vao);
+        glGenBuffers(1, &gpu.line_vbo);
+    }
+    glBindVertexArray(gpu.line_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, gpu.line_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(lines.size() * sizeof(RenderVertex)), lines.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, position)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, normal)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, color)));
+    gpu.line_vertex_count = static_cast<uint32_t>(lines.size());
+}
+
+void configure_surface_vertex_attributes() {
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, position)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, normal)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, color)));
+}
+
+void destroy_gpu_chunk(GpuChunk& chunk) {
+    if (chunk.ebo != 0) glDeleteBuffers(1, &chunk.ebo);
+    if (chunk.vbo != 0) glDeleteBuffers(1, &chunk.vbo);
+    if (chunk.vao != 0) glDeleteVertexArrays(1, &chunk.vao);
+    chunk = {};
+}
+
+void clear_gpu_chunks(GpuChunkStore& store) {
+    for (auto& entry : store.chunks) {
+        destroy_gpu_chunk(entry.second);
+    }
+    store.chunks.clear();
+    store.urgent_uploads.clear();
+    store.pending_uploads.clear();
+    store.urgent_codes.clear();
+    store.pending_codes.clear();
+}
+
+void upload_chunk(GpuChunkStore& store, const MineSdfChunk& chunk, uint32_t generation) {
+    GpuChunk& gpu_chunk = store.chunks[chunk.key.code];
+    if (gpu_chunk.vao == 0) {
+        glGenVertexArrays(1, &gpu_chunk.vao);
+        glGenBuffers(1, &gpu_chunk.vbo);
+        glGenBuffers(1, &gpu_chunk.ebo);
+    }
+    glBindVertexArray(gpu_chunk.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, gpu_chunk.vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(chunk.vertices.size() * sizeof(RenderVertex)), chunk.vertices.data(), GL_STATIC_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu_chunk.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(chunk.indices.size() * sizeof(uint32_t)), chunk.indices.data(), GL_STATIC_DRAW);
+    configure_surface_vertex_attributes();
+    gpu_chunk.index_count = static_cast<uint32_t>(chunk.indices.size());
+    gpu_chunk.generation = generation;
+}
+
+void enqueue_visible_gpu_uploads(MineSdfField& field, GpuChunkStore& store, const std::vector<MortonChunkKey>& visible_keys) {
+    for (MortonChunkKey key : visible_keys) {
+        auto found = field.chunks.find(key.code);
+        if (found == field.chunks.end() || found->second.state != ChunkState::Ready || !found->second.gpu_dirty) {
+            continue;
+        }
+        if (found->second.urgent) {
+            if (store.urgent_codes.insert(key.code).second) {
+                store.urgent_uploads.push_back(key.code);
+            }
+        } else if (store.pending_codes.insert(key.code).second) {
+            store.pending_uploads.push_back(key.code);
+        }
+    }
+}
+
+uint32_t upload_queued_chunks(MineSdfField& field, GpuChunkStore& store, uint32_t max_uploads) {
+    uint32_t uploaded = 0;
+    auto pop_code = [&]() {
+        if (!store.urgent_uploads.empty()) {
+            const uint64_t code = store.urgent_uploads.front();
+            store.urgent_uploads.pop_front();
+            store.urgent_codes.erase(code);
+            return code;
+        }
+        const uint64_t code = store.pending_uploads.front();
+        store.pending_uploads.pop_front();
+        store.pending_codes.erase(code);
+        return code;
+    };
+    while (uploaded < max_uploads && (!store.urgent_uploads.empty() || !store.pending_uploads.empty())) {
+        const uint64_t code = pop_code();
+        auto found = field.chunks.find(code);
+        if (found == field.chunks.end() || found->second.state != ChunkState::Ready) {
+            continue;
+        }
+        upload_chunk(store, found->second, field.generation);
+        found->second.gpu_dirty = false;
+        found->second.urgent = false;
+        ++uploaded;
+    }
+    field.uploaded_chunks_last_frame = uploaded;
+    return uploaded;
+}
+
+uint32_t draw_visible_chunks(const GpuChunkStore& store, const std::vector<MortonChunkKey>& visible_keys) {
+    uint32_t index_count = 0;
+    for (MortonChunkKey key : visible_keys) {
+        const auto found = store.chunks.find(key.code);
+        if (found == store.chunks.end() || found->second.vao == 0 || found->second.index_count == 0u) {
+            continue;
+        }
+        glBindVertexArray(found->second.vao);
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(found->second.index_count), GL_UNSIGNED_INT, nullptr);
+        index_count += found->second.index_count;
+    }
+    return index_count;
+}
+
+void destroy_mesh(GpuMesh& gpu) {
+    if (gpu.line_vbo != 0) glDeleteBuffers(1, &gpu.line_vbo);
+    if (gpu.line_vao != 0) glDeleteVertexArrays(1, &gpu.line_vao);
+    gpu = {};
+}
+
+ae::Vec3 rotate_axis_angle(ae::Vec3 value, ae::Vec3 axis, float radians) {
+    axis = ae::normalize(axis);
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    return value * c + ae::cross(axis, value) * s + axis * (ae::dot(axis, value) * (1.0f - c));
+}
+
+void orthonormalize(Camera& camera) {
+    camera.forward = ae::normalize(camera.forward);
+    camera.right = camera.right - camera.forward * ae::dot(camera.right, camera.forward);
+    if (ae::length(camera.right) <= 0.00001f) {
+        camera.right = ae::normalize(ae::cross(camera.forward, {0.0f, 1.0f, 0.0f}));
+        if (ae::length(camera.right) <= 0.00001f) {
+            camera.right = {1.0f, 0.0f, 0.0f};
+        }
+    } else {
+        camera.right = ae::normalize(camera.right);
+    }
+    camera.up = ae::normalize(ae::cross(camera.right, camera.forward));
+}
+
+void rotate_fly_camera(Camera& camera, float yaw_delta, float pitch_delta, float roll_delta) {
+    if (yaw_delta != 0.0f) {
+        camera.forward = rotate_axis_angle(camera.forward, camera.up, yaw_delta);
+        camera.right = rotate_axis_angle(camera.right, camera.up, yaw_delta);
+    }
+    if (pitch_delta != 0.0f) {
+        camera.forward = rotate_axis_angle(camera.forward, camera.right, pitch_delta);
+        camera.up = rotate_axis_angle(camera.up, camera.right, pitch_delta);
+    }
+    if (roll_delta != 0.0f) {
+        camera.right = rotate_axis_angle(camera.right, camera.forward, roll_delta);
+        camera.up = rotate_axis_angle(camera.up, camera.forward, roll_delta);
+    }
+    orthonormalize(camera);
+}
+
+ae::Vec3 fly_forward(const Camera& camera) {
+    return camera.forward;
+}
+
+void fly_axes(const Camera& camera, ae::Vec3& forward, ae::Vec3& right, ae::Vec3& up) {
+    forward = camera.forward;
+    right = camera.right;
+    up = camera.up;
+}
+
+ae::Vec3 fly_up(const Camera& camera) {
+    return camera.up;
+}
+
+ae::Vec3 orbit_eye(const Camera& camera) {
+    const float cp = std::cos(camera.orbit_pitch);
+    return {
+        std::sin(camera.orbit_yaw) * cp * camera.orbit_distance,
+        std::sin(camera.orbit_pitch) * camera.orbit_distance,
+        std::cos(camera.orbit_yaw) * cp * camera.orbit_distance,
+    };
+}
+
+void aim_camera(Camera& camera, ae::Vec3 target) {
+    camera.forward = ae::normalize(target - camera.position);
+    camera.right = ae::cross(camera.forward, {0.0f, 1.0f, 0.0f});
+    if (ae::length(camera.right) <= 0.00001f) {
+        camera.right = {1.0f, 0.0f, 0.0f};
+    }
+    orthonormalize(camera);
+}
+
+bool raycast_field(const MineSdfField& field, ae::Vec3 origin, ae::Vec3 direction, ae::Vec3& hit) {
+    direction = ae::normalize(direction);
+    float previous_t = 0.0f;
+    float previous_value = sample_field(field, origin);
+    float best_abs = std::fabs(previous_value);
+    ae::Vec3 best = origin;
+    constexpr float MaxDistance = 2.5f;
+    const float step = std::max(0.006f, field.voxel * 0.55f);
+    for (float t = step; t <= MaxDistance; t += step) {
+        const ae::Vec3 p = origin + direction * t;
+        if (ae::length(p) > GridRadius + 0.08f) {
+            break;
+        }
+        const float value = sample_field(field, p);
+        if (std::fabs(value) < best_abs) {
+            best_abs = std::fabs(value);
+            best = p;
+        }
+        if ((previous_value <= 0.0f && value >= 0.0f) || (previous_value >= 0.0f && value <= 0.0f)) {
+            float lo = previous_t;
+            float hi = t;
+            for (uint32_t i = 0; i < 8u; ++i) {
+                const float mid = (lo + hi) * 0.5f;
+                const float mid_value = sample_field(field, origin + direction * mid);
+                if ((previous_value <= 0.0f && mid_value >= 0.0f) || (previous_value >= 0.0f && mid_value <= 0.0f)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            hit = origin + direction * ((lo + hi) * 0.5f);
+            return true;
+        }
+        previous_t = t;
+        previous_value = value;
+    }
+    if (best_abs < field.brush_radius * 1.6f) {
+        hit = best;
+        return true;
+    }
+    hit = origin + direction * 0.35f;
+    return false;
+}
+
+EditableMineObject* find_object(MineSdfField& field, uint32_t object_id) {
+    for (EditableMineObject& object : field.objects) {
+        if (object.id == object_id) {
+            return &object;
+        }
+    }
+    return nullptr;
+}
+
+EditableMineObject* nearest_enabled_object(MineSdfField& field, ae::Vec3 p) {
+    EditableMineObject* best = nullptr;
+    float best_distance = std::numeric_limits<float>::max();
+    for (EditableMineObject& object : field.objects) {
+        if (!object.enabled || object.points.empty()) {
+            continue;
+        }
+        float distance = std::numeric_limits<float>::max();
+        if (object.kind == EditableObjectKind::Chamber) {
+            distance = ae::length(p - object.points.front()) - object.radius;
+        } else {
+            for (uint32_t i = 0; i + 1u < object.points.size(); ++i) {
+                distance = std::min(distance, distance_to_segment(p, object.points[i], object.points[i + 1u]) - object.radius);
+            }
+        }
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = &object;
+        }
+    }
+    return best;
+}
+
+void place_camera_in_first_shaft(Camera& camera, const MineNetwork& network) {
+    if (network.primary_shafts.empty() || network.primary_shafts.front().points.size() < 4u) {
+        return;
+    }
+    camera.position = path_sample(network.primary_shafts.front(), 0.18f);
+    aim_camera(camera, path_sample(network.primary_shafts.front(), 0.62f));
+}
+
+void update_window_title(
+    SDL_Window* window,
+    const MineSettings& settings,
+    const BuildStats& stats,
+    bool fly_mode,
+    bool cutaway,
+    const MineSdfField* field = nullptr,
+    uint32_t queued_jobs = 0,
+    uint32_t worker_count = 0
+) {
+    std::ostringstream title;
+    title << "AETHERONUS | seed " << settings.seed
+          << " mines " << settings.mine_density
+          << " radius " << settings.tunnel_radius
+          << " grid " << stats.grid_resolution
+          << " fps " << (field != nullptr ? static_cast<uint32_t>(std::round(field->fps_estimate)) : 0u)
+          << " edits " << stats.edit_count
+          << " dirty " << stats.dirty_chunks
+          << " brush " << stats.brush_radius
+          << " remesh " << stats.last_remesh_ms << "ms"
+          << " chunks " << (field != nullptr ? field->chunks.size() : 0u)
+          << " active " << (field != nullptr ? field->active_keys.size() : 0u)
+          << " lod " << (field != nullptr ? field->visible_lod_counts[0] : 0u)
+          << "/" << (field != nullptr ? field->visible_lod_counts[1] : 0u)
+          << "/" << (field != nullptr ? field->visible_lod_counts[2] : 0u)
+          << " queued " << queued_jobs
+          << " done " << (field != nullptr ? field->completed_jobs_total : 0u)
+          << " upload " << (field != nullptr ? field->uploaded_chunks_last_frame : 0u)
+          << " trans " << (field != nullptr ? field->transition_triangle_count : 0u)
+          << " stale " << (field != nullptr ? field->stale_result_drops : 0u)
+          << " workers " << worker_count
+          << " | " << (stats.ok ? "OK" : "CHECK")
+          << " open " << stats.open_edges
+          << " nonmanifold " << stats.nonmanifold_edges
+          << " tris " << stats.triangles
+          << " | " << (fly_mode ? "fly" : "orbit")
+          << (cutaway ? " cutaway" : "");
+    SDL_SetWindowTitle(window, title.str().c_str());
 }
 
 } // namespace
 
-int main() {
+int main(int, char**) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::cerr << "SDL_Init failed: " << SDL_GetError() << std::endl;
         return 1;
     }
 
-    SDL_GL_ResetAttributes();
-    if (!set_gl_attribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4, "major version") ||
-        !set_gl_attribute(SDL_GL_CONTEXT_MINOR_VERSION, 3, "minor version") ||
-        !set_gl_attribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE, "core profile") ||
-        !set_gl_attribute(SDL_GL_DOUBLEBUFFER, 1, "double buffer") ||
-        !set_gl_attribute(SDL_GL_DEPTH_SIZE, 24, "depth size")) {
-        SDL_Quit();
-        return 1;
-    }
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-    SDL_Window* window = SDL_CreateWindow("AETHERONUS", 960, 540, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_Window* window = SDL_CreateWindow(
+        "AETHERONUS",
+        1280,
+        800,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
+    );
     if (window == nullptr) {
         std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << std::endl;
         SDL_Quit();
         return 1;
     }
 
-    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
-    if (gl_context == nullptr) {
+    SDL_GLContext context = SDL_GL_CreateContext(window);
+    if (context == nullptr) {
         std::cerr << "SDL_GL_CreateContext failed: " << SDL_GetError() << std::endl;
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
-
-    if (!SDL_GL_MakeCurrent(window, gl_context)) {
-        std::cerr << "SDL_GL_MakeCurrent failed: " << SDL_GetError() << std::endl;
-        SDL_GL_DestroyContext(gl_context);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -1425,629 +2476,427 @@ int main() {
 
     if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(SDL_GL_GetProcAddress))) {
         std::cerr << "gladLoadGLLoader failed" << std::endl;
-        SDL_GL_DestroyContext(gl_context);
+        SDL_GL_DestroyContext(context);
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     }
 
-    if (!GLAD_GL_VERSION_4_3) {
-        std::cerr << "OpenGL 4.3 is required." << std::endl;
-        SDL_GL_DestroyContext(gl_context);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
+    SDL_GL_SetSwapInterval(1);
+    SDL_SetWindowRelativeMouseMode(window, true);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glClearColor(0.018f, 0.022f, 0.025f, 1.0f);
 
-    print_gl_string(GL_VENDOR, "GL_VENDOR");
-    print_gl_string(GL_RENDERER, "GL_RENDERER");
-    print_gl_string(GL_VERSION, "GL_VERSION");
-    SDL_GL_SetSwapInterval(0);
-    std::cout << "Planet scale: " << ae::PlanetCircumferenceKilometers << " km circumference, "
-              << ae::PlanetRadiusKilometers << " km radius, "
-              << ae::KilometersPerWorldUnit << " km/mesh-unit, rendered in kilometer-space." << std::endl;
-
-    const ae::GoldbergTopology topology = ae::build_goldberg_topology(2);
-    const ae::PointCloud points = ae::build_surface_point_cloud(topology);
-    ae::FreeCamera camera;
-    ae::MarchingCubesConfig mesh_config;
-    mesh_config.enable_camera_proximity_lod = true;
-    mesh_config.lod_min_subdivisions = 4;
-    mesh_config.lod_max_subdivisions = 16;
-    mesh_config.lod_levels = 4;
-    mesh_config.lod_inner_patch_radius = 0.18f;
-    mesh_config.lod_outer_patch_radius = 0.95f;
-    mesh_config.lod_camera_position = free_camera_eye(camera);
-    mesh_config.enable_fractures = false;
-    mesh_config.fracture_seed = 1;
-    mesh_config.fracture_gap = 0.026f;
-    mesh_config.fracture_depth = 0.018f;
-    mesh_config.fracture_wall_depth = 0.64f;
-    mesh_config.fracture_chunk_outward_min = 0.08f;
-    mesh_config.fracture_chunk_outward_max = 0.72f;
-    mesh_config.svo_depth = DefaultSvoDepth;
-    mesh_config.surface_net_depth = DefaultSvoDepth;
-    mesh_config.local_surface_net_depth = HighSvoDepth;
-    mesh_config.voxel_features.cave_count = 10000;
-    mesh_config.voxel_features.cave_anchor_count = 10000;
-    mesh_config.voxel_features.cave_depth = StreamedCaveDepth;
-    mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
-    ae::VoxelEditSet voxel_edits;
-    mesh_config.voxel_edits = voxel_edits;
-    ae::MarchingCubesConfig preview_config = mesh_config;
-    preview_config.enable_svo_generation = false;
-    preview_config.enable_surface_net_generation = false;
-    const ae::QuantizedMesh mesh = ae::build_quantized_marching_cubes(topology, points, preview_config);
-    const ae::TopologyValidation validation = ae::validate_topology(topology, static_cast<uint32_t>(points.size()));
+    const ae::GoldbergConfig goldberg_config{4u, 0u};
+    const ae::GoldbergTopology topology = ae::build_goldberg_topology(goldberg_config);
+    const ae::PointCloud points = ae::build_surface_point_cloud(topology, {16u, 16u});
+    const ae::TopologyValidation topology_validation = ae::validate_topology(topology, static_cast<uint32_t>(points.size()));
     const ae::PointCloudValidation point_validation = ae::validate_point_cloud(topology, points);
-    const ae::QuantizedMeshValidation mesh_validation = ae::validate_quantized_mesh(mesh);
-    std::cout << validation.message << std::endl;
+    std::cout << topology_validation.message << std::endl;
     std::cout << point_validation.message << std::endl;
-    std::cout << "Startup preview: " << mesh_validation.message << std::endl;
-    if (!validation.ok || !point_validation.ok || !mesh_validation.ok) {
-        SDL_GL_DestroyContext(gl_context);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
+    if (!topology_validation.ok || !point_validation.ok) {
+        std::cerr << "Base Goldberg lattice validation failed; rendering mine testbed anyway." << std::endl;
     }
 
-    ae::DebugRenderer renderer;
-    if (!renderer.initialize(topology, points, mesh)) {
-        SDL_GL_DestroyContext(gl_context);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
+    const uint32_t shader = build_shader_program();
+    const int mvp_location = glGetUniformLocation(shader, "u_mvp");
+    const int model_location = glGetUniformLocation(shader, "u_model");
+    const int camera_location = glGetUniformLocation(shader, "u_camera_position");
+    const int cutaway_location = glGetUniformLocation(shader, "u_cutaway");
 
-    ae::QuantizedMesh current_mesh = mesh;
-    CaveInteriorStreamer cave_streamer;
-    cave_streamer.configure(current_mesh, mesh_config);
-    renderer.update_cave_interiors(cave_streamer.active_surface());
-    auto sync_terrain_hole_renderer = [&]() {
-        renderer.update_terrain_holes(build_goldberg_clip_holes(cave_streamer.active_holes(), voxel_edits));
-        renderer.update_cave_dig_transitions(cave_streamer.active_holes(), voxel_edits);
-        renderer.update_terrain_height_masks(voxel_edits.terrain_masks);
-    };
-    sync_terrain_hole_renderer();
-    ae::Vec3 last_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-    ae::Vec3 requested_mesh_lod_focus = last_mesh_lod_focus;
-    ae::Vec3 requested_mesh_camera_position = mesh_config.lod_camera_position;
-    uint32_t mesh_revision = 1;
-    uint32_t requested_mesh_revision = mesh_revision;
-    std::future<MeshBuildResult> pending_mesh_build;
-    MeshBuildMode requested_mesh_build_mode = MeshBuildMode::Full;
-    std::string requested_mesh_build_reason = "startup";
-    std::chrono::steady_clock::time_point requested_mesh_queued_at = std::chrono::steady_clock::now();
-    bool mesh_build_pending = false;
-    bool mesh_rebuild_requested = false;
-    auto build_progress = std::make_shared<BuildProgressState>();
-    bool show_fps = false;
-    bool benchmark_mode = false;
-    double benchmark_time = 0.0;
-    ae::DebugRenderOptions render_options;
-    ae::SpaceshipState spaceship;
-    bool relative_mouse_enabled = false;
-    float displayed_fps = 0.0f;
-    uint32_t frames_since_fps_update = 0;
-    std::array<double, 128> frame_times_ms = {};
-    uint32_t frame_time_cursor = 0;
-    double recent_worst_frame_ms = 0.0;
-    uint64_t fps_update_start = SDL_GetTicksNS();
-    uint64_t last_update_time = fps_update_start;
-    bool window_title_shows_progress = false;
-    uint32_t targeted_feature_id = 0u;
-    std::chrono::steady_clock::time_point last_cave_target_update = {};
-    bool terrain_paint_active = false;
-    size_t active_terrain_mask_index = 0u;
-    ae::Vec3 last_terrain_paint_hit = {};
-    constexpr float LodRebuildDistance = 0.12f;
-    constexpr std::chrono::milliseconds NoWait{0};
-    auto request_full_mesh_rebuild = [&](const char* reason) {
-        requested_mesh_revision = ++mesh_revision;
-        requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-        requested_mesh_camera_position = mesh_config.lod_camera_position;
-        requested_mesh_build_mode = MeshBuildMode::Full;
-        requested_mesh_build_reason = reason != nullptr ? reason : "full rebuild";
-        requested_mesh_queued_at = std::chrono::steady_clock::now();
-        mesh_rebuild_requested = true;
-    };
-    auto request_voxel_mesh_rebuild = [&](const char* reason) {
-        requested_mesh_revision = ++mesh_revision;
-        requested_mesh_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-        requested_mesh_camera_position = mesh_config.lod_camera_position;
-        if (!mesh_rebuild_requested || requested_mesh_build_mode != MeshBuildMode::Full) {
-            requested_mesh_build_mode = MeshBuildMode::VoxelsOnly;
-            requested_mesh_build_reason = reason != nullptr ? reason : "voxel rebuild";
-            requested_mesh_queued_at = std::chrono::steady_clock::now();
-        }
-        mesh_rebuild_requested = true;
-    };
+    WorkerPool workers;
+    start_worker_pool(workers);
 
-    build_progress->set(0.0f, "Queued startup depth-16 detail build");
-    pending_mesh_build = std::async(
-        std::launch::async,
-        build_lod_mesh_async,
-        std::cref(topology),
-        std::cref(points),
-        mesh_config,
-        mesh_revision,
-        std::string("startup"),
-        requested_mesh_queued_at,
-        build_progress
-    );
-    mesh_build_pending = true;
+    MineSettings settings;
+    SdfLodPolicy lod_policy;
+    uint32_t current_generation = 1u;
+    MineNetwork network = build_mine_network(points, settings);
+    MineSdfField field = build_base_mine_field(settings, network);
+    field.generation = current_generation;
+    Camera camera;
+    place_camera_in_first_shaft(camera, network);
+    add_focus_lod_chunks(field, camera.position, lod_policy);
+    queue_dirty_chunks(field, workers, camera.position, 384u);
 
+    std::vector<MortonChunkKey> visible_keys = collect_visible_lod_keys(field);
+    std::vector<MortonChunkKey> draw_keys;
+    TestbedMesh mesh;
+    mesh.stats = update_streaming_stats(field, settings, network, draw_keys);
+    mesh.graph_lines = build_graph_lines(network, field, false, {});
+    std::cout << "Goldberg config (" << goldberg_config.m << ", " << goldberg_config.n << ")" << std::endl;
+    std::cout << "Sparse SDF queued: grid " << field.resolution
+              << ", active chunks " << field.active_keys.size()
+              << ", workers " << workers.worker_count
+              << ", queued jobs " << worker_queue_size(workers) << std::endl;
+
+    GpuMesh gpu;
+    GpuChunkStore gpu_chunks;
+    upload_lines(gpu, mesh.graph_lines);
     bool running = true;
+    bool wireframe = false;
+    bool graph_overlay = true;
+    bool morton_overlay = false;
+    bool cutaway = false;
+    bool edit_inputs_armed = false;
+    int width = 1280;
+    int height = 800;
+    const auto edit_arm_begin = std::chrono::steady_clock::now();
+    auto last_frame = std::chrono::steady_clock::now();
+    auto last_stats_refresh = std::chrono::steady_clock::now();
+    auto last_stream_log = std::chrono::steady_clock::now();
+    bool pending_stats_refresh = false;
+    uint32_t edit_upload_boost_frames = 0;
+
+    auto refresh_stats = [&]() {
+        mesh.stats = update_streaming_stats(field, settings, network, draw_keys);
+        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+    };
+
+    auto rebuild = [&]() {
+        const std::vector<SdfEdit> saved_edits = field.edits;
+        const std::vector<EditableMineObject> saved_objects = field.objects;
+        const uint32_t next_edit_id = field.next_edit_id;
+        const uint32_t next_object_id = field.next_object_id;
+        const float brush_radius = field.brush_radius;
+        clear_worker_queue(workers);
+        clear_gpu_chunks(gpu_chunks);
+        ++current_generation;
+        network = build_mine_network(points, settings);
+        field = build_base_mine_field(settings, network);
+        field.generation = current_generation;
+        field.edits = saved_edits;
+        field.objects = saved_objects;
+        field.next_edit_id = next_edit_id;
+        field.next_object_id = next_object_id;
+        field.brush_radius = std::clamp(brush_radius, field.voxel * 1.25f, 0.16f);
+        rebuild_field_from_history(field);
+        place_camera_in_first_shaft(camera, network);
+        add_focus_lod_chunks(field, camera.position, lod_policy);
+        queue_dirty_chunks(field, workers, camera.position, 384u);
+        visible_keys = collect_visible_lod_keys(field);
+        draw_keys = collect_gpu_visible_lod_keys(field, gpu_chunks);
+        pending_stats_refresh = true;
+    };
+
+    update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+
     while (running) {
-        const auto frame_begin = std::chrono::steady_clock::now();
-        float ship_mouse_yaw = 0.0f;
-        float ship_mouse_pitch = 0.0f;
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::min(0.05f, std::chrono::duration<float>(now - last_frame).count());
+        last_frame = now;
+        if (dt > 0.000001f) {
+            const double sample_fps = 1.0 / static_cast<double>(dt);
+            field.fps_estimate = field.fps_estimate <= 0.0 ? sample_fps : field.fps_estimate * 0.92 + sample_fps * 0.08;
+        }
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+            if (event.type == SDL_EVENT_QUIT) {
                 running = false;
-            } else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-                if (event.key.key == SDLK_ESCAPE) {
-                    running = false;
-                } else if (event.key.key == SDLK_R) {
-                    camera = ae::FreeCamera{};
-                    mesh_config.lod_camera_position = free_camera_eye(camera);
-                    const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-                    if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        request_full_mesh_rebuild("camera reset");
-                    }
-                } else if (event.key.key == SDLK_F3) {
-                    show_fps = !show_fps;
-                } else if (event.key.key == SDLK_F2) {
-                    benchmark_mode = !benchmark_mode;
-                    benchmark_time = 0.0;
-                    show_fps = benchmark_mode ? true : show_fps;
-                    std::cout << "Benchmark camera path " << (benchmark_mode ? "enabled" : "disabled") << std::endl;
-                } else if (event.key.key == SDLK_F1) {
-                    render_options.show_cave_anchors = !render_options.show_cave_anchors;
-                    std::cout << "Cave anchor cloud " << (render_options.show_cave_anchors ? "shown" : "hidden")
-                              << " (" << current_mesh.cave_anchor_points.size() << " anchors)" << std::endl;
-                } else if (event.key.key == SDLK_F6) {
-                    render_options.show_goldberg_grid = !render_options.show_goldberg_grid;
-                    std::cout << "Goldberg grid " << (render_options.show_goldberg_grid ? "shown" : "hidden") << std::endl;
-                } else if (event.key.key == SDLK_F7) {
-                    render_options.show_mesh_wire = !render_options.show_mesh_wire;
-                    std::cout << "Mesh wire " << (render_options.show_mesh_wire ? "shown" : "hidden") << std::endl;
-                } else if (event.key.key == SDLK_F8) {
-                    render_options.show_points = !render_options.show_points;
-                    std::cout << "Point samples " << (render_options.show_points ? "shown" : "hidden") << std::endl;
-                } else if (event.key.key == SDLK_F10) {
-                    render_options.show_voxels = !render_options.show_voxels;
-                    std::cout << "Voxels " << (render_options.show_voxels ? "shown" : "hidden") << std::endl;
-                } else if (event.key.key == SDLK_F12) {
-                    render_options.show_surface_net = !render_options.show_surface_net;
-                    std::cout << "Surface nets " << (render_options.show_surface_net ? "shown" : "hidden") << std::endl;
-                } else if (event.key.key == SDLK_F11) {
-                    mesh_config.svo_depth = DefaultSvoDepth;
-                    mesh_config.surface_net_depth = DefaultSvoDepth;
-                    mesh_config.local_surface_net_depth = mesh_config.local_surface_net_depth >= HighSvoDepth ? DefaultSvoDepth : HighSvoDepth;
-                    mesh_config.voxel_features.cave_depth = StreamedCaveDepth;
-                    mesh_config.svo_debug_draw_depth = SvoDebugDrawDepth;
-                    request_voxel_mesh_rebuild("cave depth toggle");
-                    std::cout << "Streamed cave interior depth " << mesh_config.voxel_features.cave_depth
-                              << " rebuild requested (global exterior replacement disabled; SVO depth " << mesh_config.svo_depth
-                              << ")" << std::endl;
-                } else if (event.key.key == SDLK_F9) {
-                    render_options.follow_ship = !render_options.follow_ship;
-                    if (render_options.follow_ship != relative_mouse_enabled) {
-                        if (!render_options.follow_ship) {
-                            int width = 960;
-                            int height = 540;
-                            SDL_GetWindowSizeInPixels(window, &width, &height);
-                            SDL_WarpMouseInWindow(window, static_cast<float>(width) * 0.5f, static_cast<float>(height) * 0.5f);
-                        }
-                        if (SDL_SetWindowRelativeMouseMode(window, render_options.follow_ship)) {
-                            relative_mouse_enabled = render_options.follow_ship;
-                        } else {
-                            std::cerr << "SDL_SetWindowRelativeMouseMode failed: " << SDL_GetError() << std::endl;
-                        }
-                    }
-                    std::cout << "Ship follow camera " << (render_options.follow_ship ? "enabled" : "disabled") << std::endl;
-                } else if (event.key.key == SDLK_F4) {
-                    mesh_config.enable_fractures = !mesh_config.enable_fractures;
-                    request_full_mesh_rebuild("fracture toggle");
-                    std::cout << "Fractures " << (mesh_config.enable_fractures ? "enabled" : "disabled") << std::endl;
-                } else if (event.key.key == SDLK_F5) {
-                    ++mesh_config.fracture_seed;
-                    mesh_config.enable_fractures = true;
-                    request_full_mesh_rebuild("fracture seed");
-                    std::cout << "Fracture seed " << mesh_config.fracture_seed << std::endl;
-                } else if (event.key.key == SDLK_F13) {
-                    voxel_edits.digs.clear();
-                    voxel_edits.terrain_masks.clear();
-                    terrain_paint_active = false;
-                    mesh_config.voxel_edits = voxel_edits;
-                    cave_streamer.configure(current_mesh, mesh_config);
-                    renderer.update_cave_interiors(cave_streamer.active_surface());
-                    sync_terrain_hole_renderer();
-                    request_voxel_mesh_rebuild("clear dig edits");
-                    std::cout << "Cleared dig edits; cave stream reset" << std::endl;
-                }
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
-                const ae::CameraView dig_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
-                const ae::Vec3 dig_direction = ae::normalize(dig_view.target - dig_view.eye);
-                ae::Vec3 hit_mesh = {};
-                uint32_t hit_feature_id = 0u;
-                ae::Vec3 cave_surface_hit_mesh = {};
-                float cave_surface_hit_t = std::numeric_limits<float>::max();
-                const bool hit_active_cave = ray_surface_net_intersection(
-                    cave_streamer.active_surface(),
-                    dig_view.eye / ae::PlanetRadiusKilometers,
-                    dig_direction,
-                    cave_surface_hit_mesh,
-                    &cave_surface_hit_t
-                );
-                if (hit_active_cave) {
-                    hit_mesh = cave_surface_hit_mesh;
-                    hit_feature_id = nearest_cave_feature_id_for_point(cave_streamer.active_holes(), hit_mesh);
-                }
-                bool hit_cave_feature = hit_active_cave;
-                CaveFeatureRayHit cave_hit = {};
-                if (!hit_cave_feature && ray_cave_feature_hit(
-                        cave_streamer.features(),
-                        dig_view.eye / ae::PlanetRadiusKilometers,
-                        dig_direction,
-                        cave_hit,
-                        CaveClickTargetMaxDistanceKm
-                    )) {
-                    hit_mesh = cave_hit.hit_mesh;
-                    hit_feature_id = cave_hit.feature_id;
-                    hit_cave_feature = true;
-                }
-                if (hit_cave_feature) {
-                    terrain_paint_active = false;
-                    voxel_edits.digs.push_back({
-                        hit_mesh,
-                        8.0f,
-                        voxel_edits.local_depth,
-                        ae::VoxelDigTarget::CaveInterior,
-                        hit_feature_id,
-                    });
-                    mesh_config.voxel_edits = voxel_edits;
-                    cave_streamer.update_config(mesh_config);
-                    mesh_config.lod_camera_position = dig_view.eye;
-                    if (hit_feature_id != 0u) {
-                        cave_streamer.invalidate_feature(hit_feature_id);
-                    } else if (hit_active_cave) {
-                        cave_streamer.invalidate_active();
-                    }
-                    sync_terrain_hole_renderer();
-                    std::cout << "Dig edit " << voxel_edits.digs.size()
-                              << ": radius 8 km, local depth " << voxel_edits.local_depth
-                              << " cave stream rebuild requested" << std::endl;
-                } else if (ray_quantized_mesh_intersection(
-                               current_mesh,
-                               dig_view.eye / ae::PlanetRadiusKilometers,
-                               dig_direction,
-                               hit_mesh)) {
-                    active_terrain_mask_index = terrain_mask_for_point(voxel_edits, hit_mesh);
-                    paint_terrain_mask_point(voxel_edits, active_terrain_mask_index, hit_mesh, 8.0f);
-                    last_terrain_paint_hit = hit_mesh;
-                    terrain_paint_active = true;
-                    mesh_config.voxel_edits = voxel_edits;
-                    cave_streamer.update_config(mesh_config);
-                    mesh_config.lod_camera_position = dig_view.eye;
-                    sync_terrain_hole_renderer();
-                    std::cout << "Terrain height mask stroke: brush 8 km, masks "
-                              << voxel_edits.terrain_masks.size()
-                              << ", streamed cave requested" << std::endl;
-                }
-            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
-                terrain_paint_active = false;
-            } else if (event.type == SDL_EVENT_MOUSE_MOTION && terrain_paint_active && (event.motion.state & SDL_BUTTON_LMASK) != 0) {
-                const ae::CameraView paint_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
-                const ae::Vec3 paint_direction = ae::normalize(paint_view.target - paint_view.eye);
-                ae::Vec3 paint_hit_mesh = {};
-                if (ray_quantized_mesh_intersection(
-                        current_mesh,
-                        paint_view.eye / ae::PlanetRadiusKilometers,
-                        paint_direction,
-                        paint_hit_mesh)) {
-                    float projected_x = 0.0f;
-                    float projected_y = 0.0f;
-                    if (active_terrain_mask_index >= voxel_edits.terrain_masks.size() ||
-                        !terrain_mask_project(voxel_edits.terrain_masks[active_terrain_mask_index], paint_hit_mesh, projected_x, projected_y)) {
-                        active_terrain_mask_index = terrain_mask_for_point(voxel_edits, paint_hit_mesh);
-                        last_terrain_paint_hit = paint_hit_mesh;
-                    }
-                    paint_terrain_mask_line(
-                        voxel_edits.terrain_masks[active_terrain_mask_index],
-                        last_terrain_paint_hit,
-                        paint_hit_mesh,
-                        8.0f,
-                        TerrainHeightHole
+            } else if (event.type == SDL_EVENT_WINDOW_RESIZED) {
+                width = std::max(1, event.window.data1);
+                height = std::max(1, event.window.data2);
+            } else if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                if (camera.fly_mode) {
+                    rotate_fly_camera(
+                        camera,
+                        static_cast<float>(event.motion.xrel) * 0.0027f,
+                        -static_cast<float>(event.motion.yrel) * 0.0027f,
+                        0.0f
                     );
-                    last_terrain_paint_hit = paint_hit_mesh;
-                    mesh_config.voxel_edits = voxel_edits;
-                    cave_streamer.update_config(mesh_config);
-                    mesh_config.lod_camera_position = paint_view.eye;
-                    sync_terrain_hole_renderer();
+                } else if ((event.motion.state & SDL_BUTTON_RMASK) != 0) {
+                    camera.orbit_yaw += static_cast<float>(event.motion.xrel) * 0.004f;
+                    camera.orbit_pitch = std::clamp(camera.orbit_pitch - static_cast<float>(event.motion.yrel) * 0.004f, -1.48f, 1.48f);
                 }
-            } else if (event.type == SDL_EVENT_MOUSE_MOTION && render_options.follow_ship) {
-                ship_mouse_yaw += static_cast<float>(event.motion.xrel);
-                ship_mouse_pitch -= static_cast<float>(event.motion.yrel);
-            } else if (event.type == SDL_EVENT_MOUSE_MOTION && (event.motion.state & SDL_BUTTON_RMASK) != 0) {
-                camera.yaw += static_cast<float>(event.motion.xrel) * 0.0035f;
-                camera.pitch = std::clamp(camera.pitch - static_cast<float>(event.motion.yrel) * 0.0035f, -1.48f, 1.48f);
-                mesh_config.lod_camera_position = free_camera_eye(camera);
-                const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-                if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                    request_full_mesh_rebuild("orbit camera");
-                }
-            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-                camera.distance = std::clamp(
-                    camera.distance * std::pow(0.88f, event.wheel.y),
-                    ae::PlanetRadiusKilometers * 1.02f,
-                    ae::PlanetRadiusKilometers * 12.0f
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && edit_inputs_armed && camera.fly_mode &&
+                       (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)) {
+                ae::Vec3 hit;
+                raycast_field(field, camera.position, fly_forward(camera), hit);
+                const bool carve = event.button.button == SDL_BUTTON_LEFT;
+                apply_sdf_edit(
+                    field,
+                    make_sphere_edit(
+                        field,
+                        carve ? SdfEditMode::Carve : SdfEditMode::Fill,
+                        hit,
+                        field.brush_radius,
+                        carve ? EditMaterial::MineWall : EditMaterial::Fill
+                    )
                 );
+                add_focus_lod_chunks(field, hit, lod_policy);
+                queue_dirty_chunks(field, workers, hit, 512u);
+                edit_upload_boost_frames = 45u;
+                pending_stats_refresh = true;
+            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                if (camera.fly_mode) {
+                    field.brush_radius = std::clamp(
+                        field.brush_radius * std::pow(1.10f, event.wheel.y),
+                        field.voxel * 1.25f,
+                        0.16f
+                    );
+                    mesh.stats.brush_radius = field.brush_radius;
+                    update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                } else {
+                    camera.orbit_distance = std::clamp(camera.orbit_distance * std::pow(0.88f, event.wheel.y), 1.2f, 8.0f);
+                }
+            } else if (event.type == SDL_EVENT_KEY_DOWN) {
+                switch (event.key.key) {
+                    case SDLK_ESCAPE:
+                        running = false;
+                        break;
+                    case SDLK_TAB:
+                        camera.fly_mode = !camera.fly_mode;
+                        SDL_SetWindowRelativeMouseMode(window, camera.fly_mode);
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_F:
+                        wireframe = !wireframe;
+                        break;
+                    case SDLK_B:
+                        graph_overlay = !graph_overlay;
+                        break;
+                    case SDLK_P:
+                        field.streaming_paused = !field.streaming_paused;
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_M:
+                        morton_overlay = !morton_overlay;
+                        graph_overlay = morton_overlay || graph_overlay;
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_C:
+                        cutaway = !cutaway;
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_R:
+                        ++settings.seed;
+                        rebuild();
+                        break;
+                    case SDLK_LEFTBRACKET:
+                        field.brush_radius = std::max(field.voxel * 1.25f, field.brush_radius * 0.90f);
+                        mesh.stats.brush_radius = field.brush_radius;
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_RIGHTBRACKET:
+                        field.brush_radius = std::min(0.16f, field.brush_radius * 1.10f);
+                        mesh.stats.brush_radius = field.brush_radius;
+                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        break;
+                    case SDLK_G: {
+                        ae::Vec3 hit;
+                        raycast_field(field, camera.fly_mode ? camera.position : orbit_eye(camera), camera.fly_mode ? fly_forward(camera) : ae::normalize(-orbit_eye(camera)), hit);
+                        EditableMineObject object;
+                        object.id = field.next_object_id++;
+                        object.kind = EditableObjectKind::Chamber;
+                        object.points = {hit};
+                        object.radius = field.brush_radius * 1.35f;
+                        object.material = EditMaterial::MineWall;
+                        field.objects.push_back(object);
+                        apply_sdf_edit(field, make_sphere_edit(field, SdfEditMode::Carve, hit, object.radius, object.material, object.id));
+                        add_focus_lod_chunks(field, hit, lod_policy);
+                        queue_dirty_chunks(field, workers, hit, 512u);
+                        edit_upload_boost_frames = 45u;
+                        pending_stats_refresh = true;
+                        break;
+                    }
+                    case SDLK_T: {
+                        ae::Vec3 hit;
+                        raycast_field(field, camera.fly_mode ? camera.position : orbit_eye(camera), camera.fly_mode ? fly_forward(camera) : ae::normalize(-orbit_eye(camera)), hit);
+                        if (!field.has_tunnel_mark) {
+                            field.tunnel_mark = hit;
+                            field.has_tunnel_mark = true;
+                        } else {
+                            EditableMineObject object;
+                            object.id = field.next_object_id++;
+                            object.kind = EditableObjectKind::Tunnel;
+                            object.points = {field.tunnel_mark, hit};
+                            object.radius = field.brush_radius * 0.90f;
+                            object.material = EditMaterial::MineWall;
+                            field.objects.push_back(object);
+                            apply_sdf_edit(field, make_capsule_edit(field, SdfEditMode::Carve, object.points[0], object.points[1], object.radius, object.material, object.id));
+                            field.tunnel_mark = hit;
+                            add_focus_lod_chunks(field, hit, lod_policy);
+                            queue_dirty_chunks(field, workers, hit, 512u);
+                            edit_upload_boost_frames = 45u;
+                            pending_stats_refresh = true;
+                        }
+                        break;
+                    }
+                    case SDLK_X: {
+                        ae::Vec3 hit;
+                        raycast_field(field, camera.fly_mode ? camera.position : orbit_eye(camera), camera.fly_mode ? fly_forward(camera) : ae::normalize(-orbit_eye(camera)), hit);
+                        EditableMineObject* object = nearest_enabled_object(field, hit);
+                        if (object != nullptr) {
+                            if (object->kind == EditableObjectKind::Chamber) {
+                                apply_sdf_edit(field, make_sphere_edit(field, SdfEditMode::Fill, object->points.front(), object->radius * 1.08f, EditMaterial::Fill, object->id));
+                            } else if (object->points.size() >= 2u) {
+                                apply_sdf_edit(field, make_capsule_edit(field, SdfEditMode::Fill, object->points[0], object->points[1], object->radius * 1.08f, EditMaterial::Fill, object->id));
+                            }
+                            add_focus_lod_chunks(field, hit, lod_policy);
+                            queue_dirty_chunks(field, workers, hit, 512u);
+                            edit_upload_boost_frames = 45u;
+                            pending_stats_refresh = true;
+                        }
+                        break;
+                    }
+                    case SDLK_U:
+                        if (undo_edit(field)) {
+                            const ae::Vec3 focus = camera.fly_mode ? camera.position : orbit_eye(camera);
+                            add_focus_lod_chunks(field, focus, lod_policy);
+                            queue_dirty_chunks(field, workers, focus, 512u);
+                            edit_upload_boost_frames = 45u;
+                            pending_stats_refresh = true;
+                        }
+                        break;
+                    case SDLK_Y:
+                        if (redo_edit(field)) {
+                            const ae::Vec3 focus = camera.fly_mode ? camera.position : orbit_eye(camera);
+                            add_focus_lod_chunks(field, focus, lod_policy);
+                            queue_dirty_chunks(field, workers, focus, 512u);
+                            edit_upload_boost_frames = 45u;
+                            pending_stats_refresh = true;
+                        }
+                        break;
+                    case SDLK_1:
+                        settings.mine_density = settings.mine_density > 4u ? settings.mine_density - 4u : 4u;
+                        rebuild();
+                        break;
+                    case SDLK_2:
+                        settings.mine_density = std::min(64u, settings.mine_density + 4u);
+                        rebuild();
+                        break;
+                    case SDLK_3:
+                        settings.tunnel_radius = std::max(0.022f, settings.tunnel_radius * 0.90f);
+                        rebuild();
+                        break;
+                    case SDLK_4:
+                        settings.tunnel_radius = std::min(0.090f, settings.tunnel_radius * 1.10f);
+                        rebuild();
+                        break;
+                    default:
+                        break;
+                }
             }
         }
 
-        const uint64_t update_time = SDL_GetTicksNS();
-        const float dt = static_cast<float>(update_time - last_update_time) / 1'000'000'000.0f;
-        last_update_time = update_time;
-        const float safe_input_dt = std::max(dt, 0.0001f);
-        ae::SpaceshipInput ship_input;
-        ship_input.yaw = (ship_mouse_yaw / safe_input_dt) * 0.00012f;
-        ship_input.pitch = (ship_mouse_pitch / safe_input_dt) * 0.00012f;
+        if (!edit_inputs_armed) {
+            float mouse_x = 0.0f;
+            float mouse_y = 0.0f;
+            const bool no_mouse_buttons = SDL_GetMouseState(&mouse_x, &mouse_y) == 0u;
+            const bool settled = std::chrono::duration<float>(now - edit_arm_begin).count() > 1.0f;
+            edit_inputs_armed = settled && no_mouse_buttons;
+        }
+
         int key_count = 0;
         const bool* keys = SDL_GetKeyboardState(&key_count);
-        if (keys != nullptr) {
-            auto key_down = [&](SDL_Scancode scancode) {
-                return static_cast<int>(scancode) < key_count && keys[scancode];
-            };
-            ship_input.throttle += key_down(SDL_SCANCODE_W) ? 1.0f : 0.0f;
-            ship_input.throttle -= key_down(SDL_SCANCODE_S) ? 1.0f : 0.0f;
-            ship_input.roll -= key_down(SDL_SCANCODE_A) ? 1.0f : 0.0f;
-            ship_input.roll += key_down(SDL_SCANCODE_D) ? 1.0f : 0.0f;
-            if (!render_options.follow_ship) {
-                const ae::Vec3 forward = free_camera_forward(camera);
-                const ae::Vec3 right = free_camera_right(camera);
-                ae::Vec3 movement = {};
-                movement = movement + forward * (key_down(SDL_SCANCODE_I) ? 1.0f : 0.0f);
-                movement = movement - forward * (key_down(SDL_SCANCODE_K) ? 1.0f : 0.0f);
-                movement = movement - right * (key_down(SDL_SCANCODE_J) ? 1.0f : 0.0f);
-                movement = movement + right * (key_down(SDL_SCANCODE_L) ? 1.0f : 0.0f);
-                movement.y += key_down(SDL_SCANCODE_E) ? 1.0f : 0.0f;
-                movement.y -= key_down(SDL_SCANCODE_Q) ? 1.0f : 0.0f;
-                if (ae::length(movement) > 0.000001f) {
-                    camera.target = camera.target + ae::normalize(movement) * (camera.move_speed * dt);
-                    mesh_config.lod_camera_position = free_camera_eye(camera);
-                    const ae::Vec3 new_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-                    if (ae::length(new_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-                        request_full_mesh_rebuild("free camera move");
-                    }
-                }
+        auto key_down = [&](SDL_Scancode scancode) {
+            return keys != nullptr && static_cast<int>(scancode) < key_count && keys[scancode];
+        };
+        if (camera.fly_mode) {
+            ae::Vec3 movement = {};
+            ae::Vec3 forward;
+            ae::Vec3 right;
+            ae::Vec3 up;
+            fly_axes(camera, forward, right, up);
+            movement = movement + forward * (key_down(SDL_SCANCODE_W) ? 1.0f : 0.0f);
+            movement = movement - forward * (key_down(SDL_SCANCODE_S) ? 1.0f : 0.0f);
+            movement = movement - right * (key_down(SDL_SCANCODE_A) ? 1.0f : 0.0f);
+            movement = movement + right * (key_down(SDL_SCANCODE_D) ? 1.0f : 0.0f);
+            movement = movement + up * (key_down(SDL_SCANCODE_E) ? 1.0f : 0.0f);
+            movement = movement - up * (key_down(SDL_SCANCODE_Q) ? 1.0f : 0.0f);
+            if (ae::length(movement) > 0.000001f) {
+                const float speed = key_down(SDL_SCANCODE_LSHIFT) || key_down(SDL_SCANCODE_RSHIFT) ? 0.92f : 0.32f;
+                camera.position = camera.position + ae::normalize(movement) * (speed * dt);
             }
-        }
-        ae::update_spaceship(spaceship, ship_input, dt);
-        if (benchmark_mode && !render_options.follow_ship) {
-            benchmark_time += static_cast<double>(dt);
-            camera.target = {};
-            camera.yaw = static_cast<float>(benchmark_time * 0.18);
-            camera.pitch = -0.30f + std::sin(static_cast<float>(benchmark_time) * 0.37f) * 0.20f;
-            camera.distance = ae::PlanetRadiusKilometers * (1.08f + 0.16f * (0.5f + 0.5f * std::sin(static_cast<float>(benchmark_time) * 0.21f)));
-        }
-        const ae::CameraView camera_view = render_options.follow_ship ? make_ship_follow_view(spaceship) : make_free_camera_view(camera);
-        mesh_config.lod_camera_position = camera_view.eye;
-        const ae::Vec3 frame_aim_direction = ae::normalize(camera_view.target - camera_view.eye);
-        const auto cave_target_now = std::chrono::steady_clock::now();
-        if (last_cave_target_update == std::chrono::steady_clock::time_point{} ||
-            cave_target_now - last_cave_target_update >= std::chrono::milliseconds(125)) {
-            CaveFeatureRayHit targeted_cave = {};
-            targeted_feature_id = ray_cave_feature_hit(
-                cave_streamer.features(),
-                camera_view.eye / ae::PlanetRadiusKilometers,
-                frame_aim_direction,
-                targeted_cave,
-                CaveViewTargetMaxDistanceKm
-            ) ? targeted_cave.feature_id : 0u;
-            last_cave_target_update = cave_target_now;
-        }
-        if (cave_streamer.update(camera_view, frame_aim_direction, targeted_feature_id)) {
-            renderer.update_cave_interiors(cave_streamer.active_surface());
-            sync_terrain_hole_renderer();
-        }
-        const ae::Vec3 frame_lod_focus = ae::normalize(mesh_config.lod_camera_position);
-        if (ae::length(frame_lod_focus - requested_mesh_lod_focus) >= LodRebuildDistance) {
-            request_full_mesh_rebuild(render_options.follow_ship ? "ship camera LOD" : "camera LOD");
-        }
-
-        if (mesh_build_pending && pending_mesh_build.wait_for(NoWait) == std::future_status::ready) {
-            MeshBuildResult result = pending_mesh_build.get();
-            mesh_build_pending = false;
-            if (result.revision < requested_mesh_revision) {
-                std::cout << "Discarded stale mesh build revision " << result.revision
-                          << " (latest requested " << requested_mesh_revision << ")" << std::endl;
-                if (!mesh_rebuild_requested) {
-                    build_progress->set(0.0f, "Idle");
-                }
-            } else if (result.validation.ok) {
-                current_mesh = result.mesh;
-                renderer.update_mesh(result.mesh);
-                const bool reset_cave_streamer = result.mode == MeshBuildMode::Full || result.reason != "terrain dig";
-                if (reset_cave_streamer) {
-                    cave_streamer.configure(current_mesh, mesh_config);
-                }
-                renderer.update_cave_interiors(cave_streamer.active_surface());
-                sync_terrain_hole_renderer();
-                last_mesh_lod_focus = result.lod_focus;
-                std::cout << (result.mode == MeshBuildMode::VoxelsOnly ? "Voxel rebuild OK: " : "Mesh rebuild OK: ")
-                          << result.validation.message << std::endl;
-                const ae::RendererPerfStats& renderer_stats = renderer.perf_stats();
-                std::cout << "Perf [" << result.reason << "]: queue " << result.queue_wait_ms
-                          << " ms, async " << result.async_build_ms
-                          << " ms, validation " << result.validation_ms
-                          << " ms, upload " << renderer_stats.upload_ms
-                          << " ms, mesh upload " << (renderer_stats.mesh_upload_bytes / (1024.0 * 1024.0))
-                          << " MiB, surface-net upload " << (renderer_stats.surface_net_upload_bytes / (1024.0 * 1024.0))
-                          << " MiB, cave anchors " << result.mesh.cave_anchor_points.size()
-                          << ", cave descriptors " << result.mesh.voxel_features.size()
-                          << ", streamed active " << cave_streamer.stats().active
-                          << ", cached " << cave_streamer.stats().cached
-                          << ", queued " << cave_streamer.stats().queued << std::endl;
-                if (!result.mesh.perf.cave_features.empty()) {
-                    for (const ae::CaveFeatureBuildStats& cave_stats : result.mesh.perf.cave_features) {
-                        std::cout << "  Cave " << cave_stats.feature_id
-                                  << " cell " << cave_stats.owner_cell_id
-                                  << ": depth " << cave_stats.depth
-                                  << ", " << cave_stats.vertices << " vertices, "
-                                  << cave_stats.triangles << " triangles, "
-                                  << cave_stats.occupied_voxels << " occupied voxels, "
-                                  << cave_stats.candidate_cubes << " candidate cubes, "
-                                  << cave_stats.surface_net_ms << " ms"
-                                  << " [occ " << cave_stats.occupancy_ms
-                                  << ", candidates " << cave_stats.candidate_ms
-                                  << ", compact " << cave_stats.compact_ms
-                                  << ", verts " << cave_stats.vertex_ms
-                                  << ", quads " << cave_stats.quad_ms
-                                  << "]" << std::endl;
-                    }
-                }
-            } else {
-                std::cerr << result.validation.message << std::endl;
-                last_mesh_lod_focus = result.lod_focus;
-                build_progress->set(0.0f, "Build failed");
+            const float roll_input = (key_down(SDL_SCANCODE_L) ? 1.0f : 0.0f) - (key_down(SDL_SCANCODE_J) ? 1.0f : 0.0f);
+            if (std::fabs(roll_input) > 0.0f) {
+                rotate_fly_camera(camera, 0.0f, 0.0f, roll_input * 1.85f * dt);
             }
         }
 
-        if (!mesh_build_pending && mesh_rebuild_requested) {
-            ae::MarchingCubesConfig async_config = mesh_config;
-            async_config.lod_camera_position = requested_mesh_camera_position;
-            const uint32_t async_revision = requested_mesh_revision;
-            const MeshBuildMode async_mode = requested_mesh_build_mode;
-            const std::string async_reason = requested_mesh_build_reason;
-            const auto async_queued_at = requested_mesh_queued_at;
-            mesh_rebuild_requested = false;
-            requested_mesh_build_mode = MeshBuildMode::Full;
-            if (async_mode == MeshBuildMode::VoxelsOnly) {
-                ae::QuantizedMesh voxel_base_mesh = make_voxel_rebuild_source(current_mesh);
-                build_progress->set(0.0f, async_config.local_surface_net_depth >= HighSvoDepth ? "Queued depth-16 detail rebuild" : "Queued voxel rebuild");
-                pending_mesh_build = std::async(
-                    std::launch::async,
-                    build_voxel_mesh_async,
-                    std::move(voxel_base_mesh),
-                    async_config,
-                    async_revision,
-                    async_reason,
-                    async_queued_at,
-                    build_progress
-                );
-            } else {
-                build_progress->set(0.0f, async_config.local_surface_net_depth >= HighSvoDepth ? "Queued depth-16 detail rebuild" : "Queued mesh rebuild");
-                pending_mesh_build = std::async(
-                    std::launch::async,
-                    build_lod_mesh_async,
-                    std::cref(topology),
-                    std::cref(points),
-                    async_config,
-                    async_revision,
-                    async_reason,
-                    async_queued_at,
-                    build_progress
-                );
-            }
-            mesh_build_pending = true;
+        const ae::Vec3 eye = camera.fly_mode ? camera.position : orbit_eye(camera);
+        add_focus_lod_chunks(field, eye, lod_policy);
+        visible_keys = collect_visible_lod_keys(field);
+        const uint32_t accepted_chunks = drain_completed_chunks(field, workers, 64u);
+        if (accepted_chunks > 0u) {
+            pending_stats_refresh = true;
+        }
+        enqueue_visible_gpu_uploads(field, gpu_chunks, visible_keys);
+        const uint32_t upload_budget = !gpu_chunks.urgent_uploads.empty() || edit_upload_boost_frames > 0u
+            ? 12u
+            : (gpu_chunks.chunks.empty() ? 4u : 1u);
+        const uint32_t uploaded_chunks = upload_queued_chunks(field, gpu_chunks, upload_budget);
+        if (edit_upload_boost_frames > 0u) {
+            --edit_upload_boost_frames;
+        }
+        draw_keys = collect_gpu_visible_lod_keys(field, gpu_chunks);
+        if (uploaded_chunks > 0u) {
+            pending_stats_refresh = true;
+        }
+        const bool refresh_due = std::chrono::duration<float>(now - last_stats_refresh).count() >= 0.35f;
+        if (pending_stats_refresh && refresh_due) {
+            refresh_stats();
+            last_stats_refresh = now;
+            pending_stats_refresh = false;
+        }
+        if (std::chrono::duration<float>(now - last_stream_log).count() >= 2.0f) {
+            last_stream_log = now;
+            std::cout << "Sparse stream: completed " << field.completed_jobs_total
+                      << "/" << field.active_keys.size()
+                      << " chunks, queued " << worker_queue_size(workers)
+                      << ", gpu chunks " << gpu_chunks.chunks.size()
+                      << ", uploaded/frame " << uploaded_chunks
+                      << ", visible chunks " << draw_keys.size()
+                      << ", triangles " << mesh.stats.triangles
+                      << ", invalid " << mesh.stats.invalid_indices
+                      << ", degenerate " << mesh.stats.degenerate_triangles << std::endl;
+        }
+        queue_dirty_chunks(field, workers, eye, 64u);
+
+        const ae::Vec3 target = camera.fly_mode ? camera.position + fly_forward(camera) : ae::Vec3{0.0f, 0.0f, 0.0f};
+        const float aspect = static_cast<float>(width) / static_cast<float>(height);
+        const ae::Mat4 projection = ae::perspective(64.0f * ae::Pi / 180.0f, aspect, 0.015f, 30.0f);
+        const ae::Mat4 view = ae::look_at(eye, target, camera.fly_mode ? fly_up(camera) : ae::Vec3{0.0f, 1.0f, 0.0f});
+        const ae::Mat4 model = ae::identity();
+        const ae::Mat4 mvp = projection * view * model;
+        ae::Vec3 preview_hit;
+        const bool has_preview = camera.fly_mode && raycast_field(field, eye, fly_forward(camera), preview_hit);
+        mesh.graph_lines = build_graph_lines(network, field, has_preview, preview_hit);
+        upload_lines(gpu, mesh.graph_lines);
+
+        glViewport(0, 0, width, height);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glUseProgram(shader);
+        glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp.m);
+        glUniformMatrix4fv(model_location, 1, GL_FALSE, model.m);
+        glUniform3f(camera_location, eye.x, eye.y, eye.z);
+        glUniform1i(cutaway_location, cutaway ? 1 : 0);
+
+        glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
+        gpu.chunk_index_count = draw_visible_chunks(gpu_chunks, draw_keys);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+        if (graph_overlay && gpu.line_vertex_count > 0u) {
+            glDisable(GL_DEPTH_TEST);
+            glLineWidth(2.0f);
+            glBindVertexArray(gpu.line_vao);
+            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gpu.line_vertex_count));
+            glEnable(GL_DEPTH_TEST);
         }
 
-        int width = 960;
-        int height = 540;
-        SDL_GetWindowSizeInPixels(window, &width, &height);
-        renderer.resize(width, height);
-        renderer.render(camera_view, spaceship, render_options, show_fps, displayed_fps);
-        if (mesh_build_pending) {
-            renderer.render_progress_overlay(build_progress->progress());
-        }
         SDL_GL_SwapWindow(window);
-        const double frame_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - frame_begin
-        ).count();
-        frame_times_ms[frame_time_cursor % frame_times_ms.size()] = frame_ms;
-        ++frame_time_cursor;
-
-        ++frames_since_fps_update;
-        const uint64_t now = SDL_GetTicksNS();
-        const uint64_t elapsed = now - fps_update_start;
-        if (elapsed >= 250'000'000ull) {
-            displayed_fps = static_cast<float>(frames_since_fps_update) * 1'000'000'000.0f / static_cast<float>(elapsed);
-            frames_since_fps_update = 0;
-            fps_update_start = now;
-            recent_worst_frame_ms = 0.0;
-            const uint32_t frame_sample_count = std::min<uint32_t>(frame_time_cursor, static_cast<uint32_t>(frame_times_ms.size()));
-            for (uint32_t i = 0; i < frame_sample_count; ++i) {
-                recent_worst_frame_ms = std::max(recent_worst_frame_ms, frame_times_ms[i]);
-            }
-            if (mesh_build_pending) {
-                char percent_buffer[16] = {};
-                std::snprintf(
-                    percent_buffer,
-                    sizeof(percent_buffer),
-                    "%.6f%%",
-                    std::clamp(build_progress->progress(), 0.0, 1.0) * 100.0
-                );
-                const std::string title = "AETHERONUS - " + build_progress->label_copy() + " (" + percent_buffer + ")";
-                SDL_SetWindowTitle(window, title.c_str());
-                window_title_shows_progress = true;
-            } else if (show_fps) {
-                const ae::RendererPerfStats& renderer_stats = renderer.perf_stats();
-                const char* voxel_mode = "off";
-                if (render_options.show_voxels) {
-                    if (renderer_stats.voxel_compute_used) {
-                        voxel_mode = "compute";
-                    } else if (!renderer_stats.voxel_compute_available) {
-                        voxel_mode = "cpu";
-                    } else if (renderer_stats.voxel_compute_fallback_code == 2u) {
-                        voxel_mode = "waiting-svo";
-                    } else if (renderer_stats.voxel_compute_fallback_code == 3u) {
-                        voxel_mode = "bad-buffer";
-                    } else if (renderer_stats.voxel_compute_fallback_code == 4u) {
-                        voxel_mode = "gl-error";
-                    } else {
-                        voxel_mode = "cpu-fallback";
-                    }
-                }
-                const CaveStreamStats& cave_stats = cave_streamer.stats();
-                char title_buffer[320] = {};
-                std::snprintf(
-                    title_buffer,
-                    sizeof(title_buffer),
-                    "AETHERONUS - FPS %.0f | frame %.2f ms worst %.2f | render %.2f ms | GPU mesh %.2f surf %.2f dbg %.2f | caves %u/%u r%u cache %u q %u %.1f ms | vox %s %.2f ms | draws %u",
-                    displayed_fps,
-                    1000.0f / std::max(displayed_fps, 0.001f),
-                    recent_worst_frame_ms,
-                    renderer_stats.render_cpu_ms,
-                    renderer_stats.gpu_mesh_ms,
-                    renderer_stats.gpu_surface_net_ms,
-                    renderer_stats.gpu_debug_ms,
-                    cave_stats.active,
-                    cave_stats.descriptors,
-                    cave_stats.rendered,
-                    cave_stats.cached,
-                    cave_stats.queued,
-                    cave_stats.last_build_ms,
-                    voxel_mode,
-                    renderer_stats.voxel_compute_dispatch_ms,
-                    renderer_stats.draw_calls
-                );
-                SDL_SetWindowTitle(window, title_buffer);
-                window_title_shows_progress = true;
-            } else if (window_title_shows_progress) {
-                SDL_SetWindowTitle(window, "AETHERONUS");
-                window_title_shows_progress = false;
-            }
-        }
     }
 
-    if (relative_mouse_enabled) {
-        SDL_SetWindowRelativeMouseMode(window, false);
+    SDL_SetWindowRelativeMouseMode(window, false);
+    stop_worker_pool(workers);
+    clear_gpu_chunks(gpu_chunks);
+    destroy_mesh(gpu);
+    if (shader != 0) {
+        glDeleteProgram(shader);
     }
-    renderer.shutdown();
-    SDL_GL_DestroyContext(gl_context);
+    SDL_GL_DestroyContext(context);
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
