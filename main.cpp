@@ -33,6 +33,38 @@ namespace {
 constexpr float PlanetRadius = 1.0f;
 constexpr float GridRadius = 1.08f;
 constexpr float CoreVoidRadius = 0.20f;
+constexpr float PortalFadeStart = 0.085f;
+constexpr float PortalFadeEnd = 0.135f;
+constexpr float PortalOpenThreshold = 0.35f;
+constexpr float PortalTraversalThreshold = 0.02f;
+constexpr float PortalImpostorMinAlpha = 0.02f;
+constexpr float PortalImpostorRadiusScale = 1.24f;
+constexpr float PortalImpostorDepthBias = 0.55f;
+constexpr float EntrancePortalLookOpenDistance = 0.62f;
+constexpr float EntrancePortalLookRadiusScale = 5.5f;
+constexpr float InteriorPortalLookOpenDistance = 0.58f;
+constexpr float InteriorPortalLookRadiusScale = 6.5f;
+constexpr float PortalLookFullOpenFraction = 0.62f;
+constexpr float PortalLocalVisibilityRadius = 0.18f;
+constexpr float PortalCaptureFrameBudgetMs = 5.5f;
+constexpr float PortalCaptureVisibilityRadius = 0.42f;
+constexpr uint32_t PortalCaptureMaxChunks = 180u;
+constexpr uint32_t ExteriorPortalTraversalDepth = 1u;
+constexpr uint32_t InteriorPortalTraversalDepth = 3u;
+constexpr uint32_t PortalLookBranchTraversalDepth = 2u;
+constexpr float PortalLookBranchDistance = 0.92f;
+constexpr float PortalLookBranchApertureScale = 7.0f;
+constexpr float PortalLookBranchApertureMin = 0.10f;
+constexpr uint32_t ExteriorAreaId = 0u;
+constexpr uint32_t CoreAreaId = 1u;
+
+enum class MineAreaKind : uint8_t {
+    Exterior,
+    Shaft,
+    Branch,
+    Core,
+    Semantic,
+};
 
 struct RenderVertex {
     ae::Vec3 position;
@@ -148,15 +180,31 @@ struct GpuMesh {
     uint32_t line_vao = 0;
     uint32_t line_vbo = 0;
     uint32_t line_vertex_count = 0;
+    uint32_t preview_vao = 0;
+    uint32_t preview_vbo = 0;
+    uint32_t preview_vertex_count = 0;
     uint32_t chunk_index_count = 0;
 };
 
 struct GpuChunk {
-    uint32_t vao = 0;
-    uint32_t vbo = 0;
-    uint32_t ebo = 0;
     uint32_t index_count = 0;
+    uint32_t vertex_count = 0;
+    uint32_t first_index = 0;
+    int32_t base_vertex = 0;
     uint32_t generation = 0;
+    ae::Vec3 bounds_min;
+    ae::Vec3 bounds_max;
+    ae::Vec3 center;
+    float radius = 0.0f;
+    bool in_arena = false;
+};
+
+struct DrawElementsIndirectCommand {
+    uint32_t count = 0;
+    uint32_t instance_count = 1;
+    uint32_t first_index = 0;
+    uint32_t base_vertex = 0;
+    uint32_t base_instance = 0;
 };
 
 struct GpuChunkStore {
@@ -165,6 +213,47 @@ struct GpuChunkStore {
     std::deque<uint64_t> pending_uploads;
     std::unordered_set<uint64_t> urgent_codes;
     std::unordered_set<uint64_t> pending_codes;
+    uint32_t vao = 0;
+    uint32_t vbo = 0;
+    uint32_t ebo = 0;
+    uint32_t indirect_buffer = 0;
+    uint32_t vertex_capacity = 2'000'000u;
+    uint32_t index_capacity = 6'000'000u;
+    uint32_t vertex_cursor = 0;
+    uint32_t index_cursor = 0;
+    uint32_t draw_calls_last_frame = 0;
+    uint32_t drawn_chunks_last_frame = 0;
+    uint32_t culled_chunks_last_frame = 0;
+    uint64_t uploaded_bytes_last_frame = 0;
+    bool initialized = false;
+    bool indirect_available = true;
+    bool arena_reset_requested = false;
+};
+
+struct FramePerfStats {
+    double frame_ms = 0.0;
+    double input_ms = 0.0;
+    double visibility_ms = 0.0;
+    double upload_ms = 0.0;
+    double line_ms = 0.0;
+    double draw_submit_ms = 0.0;
+    double swap_ms = 0.0;
+    double gpu_surface_ms = 0.0;
+    double gpu_lines_ms = 0.0;
+};
+
+struct GpuTimer {
+    uint32_t query = 0;
+    bool pending = false;
+};
+
+struct Plane {
+    ae::Vec3 normal;
+    float d = 0.0f;
+};
+
+struct Frustum {
+    std::array<Plane, 6u> planes;
 };
 
 struct MortonChunkKey {
@@ -195,6 +284,7 @@ struct MineSdfChunk {
     bool queued = false;
     bool gpu_dirty = true;
     bool urgent = false;
+    bool force_visible = false;
     uint32_t build_serial = 1;
     float priority = 0.0f;
     std::vector<float> values;
@@ -203,6 +293,84 @@ struct MineSdfChunk {
     std::vector<uint32_t> indices;
     uint32_t invalid_indices = 0;
     uint32_t degenerate_triangles = 0;
+};
+
+struct MineArea {
+    uint32_t id = 0;
+    MineAreaKind kind = MineAreaKind::Shaft;
+    ae::Vec3 bounds_min;
+    ae::Vec3 bounds_max;
+    std::array<std::vector<uint64_t>, 3u> chunk_codes_by_lod;
+    std::vector<ae::Vec3> path;
+    float radius = 0.08f;
+};
+
+struct PortalCapture {
+    uint32_t cubemap_texture = 0;
+    ae::Vec3 capture_position;
+    bool stale = true;
+    int side = 1;
+    uint32_t face_cursor = 0;
+    uint32_t last_update_generation = 0;
+};
+
+struct MinePortal {
+    uint32_t id = 0;
+    uint32_t area_a = 0;
+    uint32_t area_b = 0;
+    ae::Vec3 center;
+    ae::Vec3 normal;
+    float radius = 0.08f;
+    float fade_start = PortalFadeStart;
+    float fade_end = PortalFadeEnd;
+    float open_alpha = 1.0f;
+    ae::Vec3 proxy_box_min;
+    ae::Vec3 proxy_box_max;
+    PortalCapture capture;
+};
+
+struct PortalSettings {
+    bool enabled = true;
+    bool debug = false;
+    uint32_t capture_size = 64u;
+    uint32_t captures_per_frame = 1u;
+    float fade_start = PortalFadeStart;
+    float fade_end = PortalFadeEnd;
+};
+
+struct PortalStats {
+    uint32_t portal_count = 0;
+    uint32_t open_portals = 0;
+    uint32_t closed_portals = 0;
+    uint32_t portal_culled_chunks = 0;
+    uint32_t shell_kept_chunks = 0;
+    uint32_t stale_captures = 0;
+    uint32_t capture_faces_this_frame = 0;
+    uint32_t portal_draw_calls = 0;
+};
+
+struct PortalGraph {
+    std::vector<MineArea> areas;
+    std::vector<MinePortal> portals;
+    std::unordered_map<uint64_t, uint32_t> chunk_area_by_code;
+    std::unordered_set<uint64_t> shell_chunk_codes;
+    PortalSettings settings;
+    PortalStats stats;
+};
+
+struct PortalGpu {
+    uint32_t shader = 0;
+    uint32_t vao = 0;
+    uint32_t vbo = 0;
+    uint32_t fbo = 0;
+    uint32_t depth = 0;
+    int mvp_location = -1;
+    int camera_location = -1;
+    int capture_location = -1;
+    int box_min_location = -1;
+    int box_max_location = -1;
+    int alpha_location = -1;
+    int cubemap_location = -1;
 };
 
 struct SdfPrimitive {
@@ -264,6 +432,11 @@ struct MineSdfField {
     uint32_t stale_result_drops = 0;
     double fps_estimate = 0.0;
 };
+
+void chunk_world_bounds(uint32_t chunk_size, MortonChunkKey key, ae::Vec3& minimum, ae::Vec3& maximum);
+uint32_t lod_resolution(uint32_t lod);
+float min_distance_to_box_origin(ae::Vec3 minimum, ae::Vec3 maximum);
+float max_distance_to_box_origin(ae::Vec3 minimum, ae::Vec3 maximum);
 
 struct WorkerTask {
     uint32_t generation = 0;
@@ -377,6 +550,72 @@ bool finite_vec3(ae::Vec3 value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
 
+double elapsed_ms(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+float mat4_at(const ae::Mat4& m, uint32_t row, uint32_t column) {
+    return m.m[column * 4u + row];
+}
+
+Plane normalize_plane(Plane plane) {
+    const float len = ae::length(plane.normal);
+    if (len <= 0.000001f) {
+        return plane;
+    }
+    plane.normal = plane.normal / len;
+    plane.d /= len;
+    return plane;
+}
+
+Frustum extract_frustum(const ae::Mat4& clip) {
+    auto row_plane = [&](uint32_t row_a, float sign, uint32_t row_b) {
+        return normalize_plane({
+            {
+                mat4_at(clip, row_a, 0u) + sign * mat4_at(clip, row_b, 0u),
+                mat4_at(clip, row_a, 1u) + sign * mat4_at(clip, row_b, 1u),
+                mat4_at(clip, row_a, 2u) + sign * mat4_at(clip, row_b, 2u),
+            },
+            mat4_at(clip, row_a, 3u) + sign * mat4_at(clip, row_b, 3u),
+        });
+    };
+    Frustum frustum;
+    frustum.planes[0] = row_plane(3u, 1.0f, 0u);
+    frustum.planes[1] = row_plane(3u, -1.0f, 0u);
+    frustum.planes[2] = row_plane(3u, 1.0f, 1u);
+    frustum.planes[3] = row_plane(3u, -1.0f, 1u);
+    frustum.planes[4] = row_plane(3u, 1.0f, 2u);
+    frustum.planes[5] = row_plane(3u, -1.0f, 2u);
+    return frustum;
+}
+
+bool sphere_in_frustum(const Frustum& frustum, ae::Vec3 center, float radius) {
+    for (const Plane& plane : frustum.planes) {
+        if (ae::dot(plane.normal, center) + plane.d < -radius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool aabb_in_frustum(const Frustum& frustum, ae::Vec3 minimum, ae::Vec3 maximum) {
+    for (const Plane& plane : frustum.planes) {
+        const ae::Vec3 positive{
+            plane.normal.x >= 0.0f ? maximum.x : minimum.x,
+            plane.normal.y >= 0.0f ? maximum.y : minimum.y,
+            plane.normal.z >= 0.0f ? maximum.z : minimum.z,
+        };
+        if (ae::dot(plane.normal, positive) + plane.d < 0.0f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool chunk_in_frustum(const Frustum& frustum, const GpuChunk& chunk) {
+    return aabb_in_frustum(frustum, chunk.bounds_min, chunk.bounds_max);
+}
+
 ae::Vec3 color_crust() { return {0.11f, 0.47f, 0.53f}; }
 ae::Vec3 color_mine_wall() { return {0.12f, 0.14f, 0.15f}; }
 ae::Vec3 color_resource() { return {1.0f, 0.55f, 0.12f}; }
@@ -474,6 +713,87 @@ void main() {
         char log[2048] = {};
         glGetProgramInfoLog(program, sizeof(log), nullptr, log);
         std::cerr << "Shader link failed: " << log << std::endl;
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+uint32_t build_portal_shader_program() {
+    const char* vertex_source = R"GLSL(
+#version 430 core
+layout(location = 0) in vec3 a_position;
+uniform mat4 u_mvp;
+out vec3 v_position;
+void main() {
+    v_position = a_position;
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+}
+)GLSL";
+
+    const char* fragment_source = R"GLSL(
+#version 430 core
+in vec3 v_position;
+uniform samplerCube u_cubemap;
+uniform vec3 u_camera_position;
+uniform vec3 u_capture_position;
+uniform vec3 u_box_min;
+uniform vec3 u_box_max;
+uniform float u_alpha;
+out vec4 frag_color;
+
+bool ray_box(vec3 origin, vec3 direction, out vec3 hit_point) {
+    vec3 safe_dir = direction;
+    safe_dir.x = abs(safe_dir.x) < 0.00001 ? (safe_dir.x < 0.0 ? -0.00001 : 0.00001) : safe_dir.x;
+    safe_dir.y = abs(safe_dir.y) < 0.00001 ? (safe_dir.y < 0.0 ? -0.00001 : 0.00001) : safe_dir.y;
+    safe_dir.z = abs(safe_dir.z) < 0.00001 ? (safe_dir.z < 0.0 ? -0.00001 : 0.00001) : safe_dir.z;
+    vec3 inv_dir = 1.0 / safe_dir;
+    vec3 t0 = (u_box_min - origin) * inv_dir;
+    vec3 t1 = (u_box_max - origin) * inv_dir;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    float near_t = max(max(tmin.x, tmin.y), tmin.z);
+    float far_t = min(min(tmax.x, tmax.y), tmax.z);
+    if (far_t < max(near_t, 0.0)) {
+        return false;
+    }
+    float t = near_t > 0.0 ? near_t : far_t;
+    hit_point = origin + direction * t;
+    return true;
+}
+
+void main() {
+    vec3 ray = normalize(v_position - u_camera_position);
+    vec3 hit_point;
+    vec3 sample_dir = ray;
+    if (ray_box(u_camera_position, ray, hit_point)) {
+        sample_dir = normalize(hit_point - u_capture_position);
+    }
+    vec3 color = texture(u_cubemap, sample_dir).rgb;
+    color = mix(color, color * vec3(0.68, 0.86, 0.95), 0.22);
+    frag_color = vec4(color, clamp(u_alpha, 0.0, 1.0));
+}
+)GLSL";
+
+    const uint32_t vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_source);
+    const uint32_t fragment_shader = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+    if (vertex_shader == 0 || fragment_shader == 0) {
+        return 0;
+    }
+
+    const uint32_t program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    int ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048] = {};
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        std::cerr << "Portal shader link failed: " << log << std::endl;
         glDeleteProgram(program);
         return 0;
     }
@@ -663,6 +983,240 @@ float distance_to_segment(ae::Vec3 p, ae::Vec3 a, ae::Vec3 b) {
     }
     const float t = std::clamp(ae::dot(p - a, ab) / len_sq, 0.0f, 1.0f);
     return ae::length(p - (a + ab * t));
+}
+
+ae::Vec3 min_vec3(ae::Vec3 a, ae::Vec3 b) {
+    return {std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)};
+}
+
+ae::Vec3 max_vec3(ae::Vec3 a, ae::Vec3 b) {
+    return {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
+}
+
+void expand_bounds(ae::Vec3& minimum, ae::Vec3& maximum, ae::Vec3 point, float radius) {
+    const ae::Vec3 extent{radius, radius, radius};
+    minimum = min_vec3(minimum, point - extent);
+    maximum = max_vec3(maximum, point + extent);
+}
+
+std::vector<ae::Vec3> sampled_path_range(const MinePath& path, float begin_t, float end_t, uint32_t samples = 5u) {
+    std::vector<ae::Vec3> points;
+    points.reserve(samples);
+    for (uint32_t i = 0; i < samples; ++i) {
+        const float t = lerp_float(begin_t, end_t, samples <= 1u ? 0.0f : static_cast<float>(i) / static_cast<float>(samples - 1u));
+        points.push_back(path_sample(path, t));
+    }
+    return points;
+}
+
+MineArea make_mine_area(uint32_t id, MineAreaKind kind, std::vector<ae::Vec3> path, float radius) {
+    MineArea area;
+    area.id = id;
+    area.kind = kind;
+    area.path = std::move(path);
+    area.radius = radius;
+    area.bounds_min = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
+    area.bounds_max = {-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
+    if (area.path.empty()) {
+        area.path.push_back({});
+    }
+    for (ae::Vec3 point : area.path) {
+        expand_bounds(area.bounds_min, area.bounds_max, point, radius);
+    }
+    return area;
+}
+
+float distance_to_area(ae::Vec3 p, const MineArea& area) {
+    float distance = std::numeric_limits<float>::max();
+    if (area.path.size() <= 1u) {
+        distance = ae::length(p - area.path.front());
+    } else {
+        for (uint32_t i = 0; i + 1u < area.path.size(); ++i) {
+            distance = std::min(distance, distance_to_segment(p, area.path[i], area.path[i + 1u]));
+        }
+    }
+    return distance - area.radius;
+}
+
+uint32_t nearest_area_id(const PortalGraph& graph, ae::Vec3 p) {
+    if (graph.areas.empty()) {
+        return UINT32_MAX;
+    }
+    uint32_t best_id = UINT32_MAX;
+    float best_distance = std::numeric_limits<float>::max();
+    for (const MineArea& area : graph.areas) {
+        if (area.kind == MineAreaKind::Exterior) {
+            continue;
+        }
+        const float distance = distance_to_area(p, area);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_id = area.id;
+        }
+    }
+    return best_id != UINT32_MAX ? best_id : graph.areas.front().id;
+}
+
+const MineArea* find_area(const PortalGraph& graph, uint32_t id) {
+    for (const MineArea& area : graph.areas) {
+        if (area.id == id) {
+            return &area;
+        }
+    }
+    return nullptr;
+}
+
+ae::Vec3 area_center(const MineArea& area) {
+    return (area.bounds_min + area.bounds_max) * 0.5f;
+}
+
+bool chunk_intersects_shell_bounds(MortonChunkKey key, ae::Vec3 minimum, ae::Vec3 maximum) {
+    const float shell_padding = (GridRadius * 2.0f) / static_cast<float>(lod_resolution(key.lod));
+    return min_distance_to_box_origin(minimum, maximum) <= PlanetRadius + shell_padding &&
+           max_distance_to_box_origin(minimum, maximum) >= PlanetRadius - shell_padding;
+}
+
+void add_mine_portal(
+    PortalGraph& graph,
+    uint32_t area_a,
+    uint32_t area_b,
+    ae::Vec3 center,
+    ae::Vec3 normal,
+    float radius
+) {
+    MinePortal portal;
+    portal.id = static_cast<uint32_t>(graph.portals.size());
+    portal.area_a = area_a;
+    portal.area_b = area_b;
+    portal.center = center;
+    portal.normal = ae::normalize(normal);
+    portal.radius = std::max(0.025f, radius);
+    portal.fade_start = graph.settings.fade_start;
+    portal.fade_end = graph.settings.fade_end;
+    const ae::Vec3 extent{portal.radius * 3.2f, portal.radius * 3.2f, portal.radius * 3.2f};
+    portal.proxy_box_min = center - extent;
+    portal.proxy_box_max = center + extent;
+    if (const MineArea* a = find_area(graph, area_a); a != nullptr && a->kind != MineAreaKind::Exterior) {
+        portal.proxy_box_min = min_vec3(portal.proxy_box_min, a->bounds_min);
+        portal.proxy_box_max = max_vec3(portal.proxy_box_max, a->bounds_max);
+    }
+    if (const MineArea* b = find_area(graph, area_b); b != nullptr && b->kind != MineAreaKind::Exterior) {
+        portal.proxy_box_min = min_vec3(portal.proxy_box_min, b->bounds_min);
+        portal.proxy_box_max = max_vec3(portal.proxy_box_max, b->bounds_max);
+    }
+    portal.capture.capture_position = center + portal.normal * (portal.radius * 1.25f);
+    graph.portals.push_back(portal);
+}
+
+void assign_portal_area_chunks(PortalGraph& graph, const MineSdfField& field) {
+    for (MineArea& area : graph.areas) {
+        for (auto& by_lod : area.chunk_codes_by_lod) {
+            by_lod.clear();
+        }
+    }
+    graph.chunk_area_by_code.clear();
+    graph.chunk_area_by_code.reserve(field.active_keys.size());
+    graph.shell_chunk_codes.clear();
+    graph.shell_chunk_codes.reserve(field.active_keys.size() / 3u);
+    for (const MortonChunkKey& key : field.active_keys) {
+        ae::Vec3 minimum;
+        ae::Vec3 maximum;
+        chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+        if (chunk_intersects_shell_bounds(key, minimum, maximum)) {
+            graph.shell_chunk_codes.insert(key.code);
+        }
+        const uint32_t area_id = nearest_area_id(graph, (minimum + maximum) * 0.5f);
+        graph.chunk_area_by_code[key.code] = area_id;
+        MineArea* area = nullptr;
+        for (MineArea& candidate : graph.areas) {
+            if (candidate.id == area_id) {
+                area = &candidate;
+                break;
+            }
+        }
+        if (area != nullptr && key.lod < area->chunk_codes_by_lod.size()) {
+            area->chunk_codes_by_lod[key.lod].push_back(key.code);
+        }
+    }
+}
+
+PortalGraph build_portal_graph(const MineNetwork& network, const MineSdfField& field) {
+    PortalGraph graph;
+    graph.areas.reserve(network.primary_shafts.size() * 3u + network.branches.size() + 8u);
+    graph.portals.reserve(network.primary_shafts.size() * 4u + network.branches.size() * 2u + 8u);
+
+    graph.areas.push_back(make_mine_area(ExteriorAreaId, MineAreaKind::Exterior, {{0.0f, 0.0f, 0.0f}}, GridRadius * 3.0f));
+    graph.areas.push_back(make_mine_area(CoreAreaId, MineAreaKind::Core, {{0.0f, 0.0f, 0.0f}}, CoreVoidRadius + 0.10f));
+    std::vector<std::array<uint32_t, 3u>> primary_area_ids;
+    primary_area_ids.reserve(network.primary_shafts.size());
+    uint32_t next_area = CoreAreaId + 1u;
+
+    for (uint32_t shaft_index = 0; shaft_index < network.primary_shafts.size(); ++shaft_index) {
+        const MinePath& shaft = network.primary_shafts[shaft_index];
+        std::array<uint32_t, 3u> ids = {};
+        for (uint32_t segment = 0; segment < 3u; ++segment) {
+            const float a = static_cast<float>(segment) / 3.0f;
+            const float b = static_cast<float>(segment + 1u) / 3.0f;
+            ids[segment] = next_area++;
+            graph.areas.push_back(make_mine_area(ids[segment], MineAreaKind::Shaft, sampled_path_range(shaft, a, b), shaft.radius * 2.35f));
+        }
+        primary_area_ids.push_back(ids);
+
+        const ae::Vec3 entrance_center = path_sample(shaft, 0.035f);
+        const ae::Vec3 entrance_after = path_sample(shaft, 0.10f);
+        add_mine_portal(graph, ExteriorAreaId, ids[0u], entrance_center, entrance_after - entrance_center, shaft.radius * 1.90f);
+
+        for (uint32_t split = 1u; split < 3u; ++split) {
+            const float t = static_cast<float>(split) / 3.0f;
+            const ae::Vec3 before = path_sample(shaft, std::max(0.0f, t - 0.025f));
+            const ae::Vec3 after = path_sample(shaft, std::min(1.0f, t + 0.025f));
+            add_mine_portal(graph, ids[split - 1u], ids[split], path_sample(shaft, t), after - before, shaft.radius * 1.65f);
+        }
+
+        const ae::Vec3 core_before = path_sample(shaft, 0.84f);
+        const ae::Vec3 core_after = path_sample(shaft, 0.96f);
+        add_mine_portal(graph, ids[2u], CoreAreaId, path_sample(shaft, 0.90f), core_after - core_before, shaft.radius * 1.85f);
+    }
+
+    for (uint32_t branch_index = 0; branch_index < network.branches.size(); ++branch_index) {
+        const MinePath& branch = network.branches[branch_index];
+        if (branch.points.size() < 2u) {
+            continue;
+        }
+        const uint32_t branch_area = next_area++;
+        const uint32_t start_area = nearest_area_id(graph, branch.points.front());
+        const uint32_t end_area = nearest_area_id(graph, branch.points.back());
+        graph.areas.push_back(make_mine_area(branch_area, MineAreaKind::Branch, branch.points, branch.radius * 2.20f));
+        const ae::Vec3 start_dir = branch.points[1u] - branch.points.front();
+        const ae::Vec3 end_dir = branch.points.back() - branch.points[branch.points.size() - 2u];
+        if (start_area != branch_area) {
+            add_mine_portal(graph, start_area, branch_area, branch.points.front(), start_dir, branch.radius * 1.70f);
+        }
+        if (end_area != branch_area) {
+            add_mine_portal(graph, branch_area, end_area, branch.points.back(), end_dir, branch.radius * 1.70f);
+        }
+    }
+
+    for (const EditableMineObject& object : field.objects) {
+        if (!object.enabled || object.kind != EditableObjectKind::Tunnel || object.points.size() < 2u) {
+            continue;
+        }
+        const uint32_t tunnel_area = next_area++;
+        const uint32_t start_area = nearest_area_id(graph, object.points.front());
+        const uint32_t end_area = nearest_area_id(graph, object.points.back());
+        graph.areas.push_back(make_mine_area(tunnel_area, MineAreaKind::Semantic, object.points, object.radius * 2.20f));
+        if (start_area != tunnel_area) {
+            add_mine_portal(graph, start_area, tunnel_area, object.points.front(), object.points[1u] - object.points.front(), object.radius * 1.65f);
+        }
+        if (end_area != tunnel_area) {
+            add_mine_portal(graph, tunnel_area, end_area, object.points.back(), object.points.back() - object.points[object.points.size() - 2u], object.radius * 1.65f);
+        }
+    }
+
+    assign_portal_area_chunks(graph, field);
+    graph.stats.portal_count = static_cast<uint32_t>(graph.portals.size());
+    graph.stats.stale_captures = graph.stats.portal_count;
+    return graph;
 }
 
 float mine_air_sdf(ae::Vec3 p, const MineNetwork& network) {
@@ -926,6 +1480,15 @@ bool boxes_overlap(ae::Vec3 a_min, ae::Vec3 a_max, ae::Vec3 b_min, ae::Vec3 b_ma
            a_min.z <= b_max.z && a_max.z >= b_min.z;
 }
 
+float distance_to_box(ae::Vec3 point, ae::Vec3 minimum, ae::Vec3 maximum) {
+    const ae::Vec3 closest{
+        std::clamp(point.x, minimum.x, maximum.x),
+        std::clamp(point.y, minimum.y, maximum.y),
+        std::clamp(point.z, minimum.z, maximum.z),
+    };
+    return ae::length(point - closest);
+}
+
 float min_distance_to_box_origin(ae::Vec3 minimum, ae::Vec3 maximum) {
     auto axis_distance = [](float min_value, float max_value) {
         if (0.0f < min_value) return min_value;
@@ -1096,6 +1659,7 @@ std::vector<uint64_t> mark_dirty_box(MineSdfField& field, ae::Vec3 minimum, ae::
             entry.second.queued = false;
             entry.second.gpu_dirty = true;
             entry.second.urgent = entry.second.urgent || urgent;
+            entry.second.force_visible = entry.second.force_visible || urgent;
             ++entry.second.build_serial;
             entry.second.state = ChunkState::Empty;
             touched.push_back(entry.first);
@@ -1110,6 +1674,7 @@ void mark_all_chunks_dirty(MineSdfField& field) {
         entry.second.queued = false;
         entry.second.gpu_dirty = true;
         entry.second.urgent = false;
+        entry.second.force_visible = false;
         ++entry.second.build_serial;
         entry.second.state = ChunkState::Empty;
     }
@@ -1163,16 +1728,19 @@ void add_active_chunks_for_box(MineSdfField& field, uint32_t lod, ae::Vec3 minim
 }
 
 struct SdfLodPolicy {
-    float near_radius = 0.34f;
-    float mid_radius = 0.78f;
+    float near_radius = 0.16f;
+    float mid_radius = 0.42f;
     float far_radius = 1.35f;
-    float target_fps = 60.0f;
+    float target_fps = 240.0f;
     float upload_budget_ms = 2.0f;
+    float quality_scale = 1.0f;
 };
 
 void add_focus_lod_chunks(MineSdfField& field, ae::Vec3 focus, const SdfLodPolicy& policy) {
-    const ae::Vec3 mid_extent{policy.mid_radius, policy.mid_radius, policy.mid_radius};
-    const ae::Vec3 near_extent{policy.near_radius, policy.near_radius, policy.near_radius};
+    const float mid_radius = std::clamp(policy.mid_radius * policy.quality_scale, 0.22f, 0.78f);
+    const float near_radius = std::clamp(policy.near_radius * policy.quality_scale, 0.08f, 0.34f);
+    const ae::Vec3 mid_extent{mid_radius, mid_radius, mid_radius};
+    const ae::Vec3 near_extent{near_radius, near_radius, near_radius};
     add_active_chunks_for_box(field, 1u, focus - mid_extent, focus + mid_extent);
     add_active_chunks_for_box(field, 2u, focus - near_extent, focus + near_extent);
 }
@@ -1570,6 +2138,22 @@ std::vector<MortonChunkKey> collect_visible_lod_keys(MineSdfField& field) {
     return visible_keys;
 }
 
+std::vector<MortonChunkKey> collect_lod_keys(MineSdfField& field, uint32_t lod) {
+    field.visible_lod_counts = {0u, 0u, 0u};
+    std::vector<MortonChunkKey> keys;
+    keys.reserve(field.active_keys.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        if (key.lod != lod || !chunk_ready(field, key)) {
+            continue;
+        }
+        keys.push_back(key);
+        if (lod < field.visible_lod_counts.size()) {
+            ++field.visible_lod_counts[lod];
+        }
+    }
+    return keys;
+}
+
 bool chunk_gpu_ready(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey key) {
     const auto chunk = field.chunks.find(key.code);
     if (chunk == field.chunks.end() || chunk->second.state != ChunkState::Ready || chunk->second.gpu_dirty) {
@@ -1577,6 +2161,11 @@ bool chunk_gpu_ready(const MineSdfField& field, const GpuChunkStore& store, Mort
     }
     const auto gpu_chunk = store.chunks.find(key.code);
     return gpu_chunk != store.chunks.end() && gpu_chunk->second.generation == field.generation && gpu_chunk->second.index_count > 0u;
+}
+
+bool chunk_force_visible(const MineSdfField& field, MortonChunkKey key) {
+    const auto chunk = field.chunks.find(key.code);
+    return chunk != field.chunks.end() && chunk->second.force_visible;
 }
 
 bool all_child_chunks_gpu_ready(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey parent) {
@@ -1599,28 +2188,98 @@ bool all_child_chunks_gpu_ready(const MineSdfField& field, const GpuChunkStore& 
     return true;
 }
 
-bool should_draw_gpu_lod_chunk(const MineSdfField& field, const GpuChunkStore& store, MortonChunkKey key) {
+float key_center_distance(const MineSdfField& field, MortonChunkKey key, ae::Vec3 focus) {
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+    return ae::length(((minimum + maximum) * 0.5f) - focus);
+}
+
+bool desired_lod_chunk(const MineSdfField& field, MortonChunkKey key, ae::Vec3 focus, const SdfLodPolicy& policy) {
+    const bool exterior_overview = ae::length(focus) > PlanetRadius + 0.18f;
+    if (exterior_overview) {
+        return key.lod == 0u;
+    }
+    if (key.lod == 0u) {
+        return true;
+    }
+    const float distance = key_center_distance(field, key, focus);
+    const float mid_radius = std::clamp(policy.mid_radius * policy.quality_scale, 0.22f, 0.78f);
+    const float near_radius = std::clamp(policy.near_radius * policy.quality_scale, 0.08f, 0.34f);
+    if (key.lod == 1u) {
+        return distance <= mid_radius;
+    }
+    return distance <= near_radius;
+}
+
+bool all_child_chunks_gpu_ready_and_desired(
+    const MineSdfField& field,
+    const GpuChunkStore& store,
+    MortonChunkKey parent,
+    ae::Vec3 focus,
+    const SdfLodPolicy& policy
+) {
+    if (parent.lod >= 2u) {
+        return false;
+    }
+    const uint32_t child_lod = parent.lod + 1u;
+    const uint32_t child_base_x = parent.x * 2u;
+    const uint32_t child_base_y = parent.y * 2u;
+    const uint32_t child_base_z = parent.z * 2u;
+    for (uint32_t z = 0; z < 2u; ++z) {
+        for (uint32_t y = 0; y < 2u; ++y) {
+            for (uint32_t x = 0; x < 2u; ++x) {
+                const MortonChunkKey child = make_chunk_key(child_lod, child_base_x + x, child_base_y + y, child_base_z + z);
+                if (!desired_lod_chunk(field, child, focus, policy) || !chunk_gpu_ready(field, store, child)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool should_draw_gpu_lod_chunk(
+    const MineSdfField& field,
+    const GpuChunkStore& store,
+    MortonChunkKey key,
+    ae::Vec3 focus,
+    const SdfLodPolicy& policy
+) {
     if (!chunk_gpu_ready(field, store, key)) {
+        return false;
+    }
+    if (chunk_force_visible(field, key)) {
+        return true;
+    }
+    if (!desired_lod_chunk(field, key, focus, policy)) {
         return false;
     }
     if (key.lod > 0u) {
         const MortonChunkKey parent = parent_chunk_key(key);
-        if (chunk_gpu_ready(field, store, parent) && !all_child_chunks_gpu_ready(field, store, parent)) {
+        if (chunk_gpu_ready(field, store, parent) &&
+            desired_lod_chunk(field, parent, focus, policy) &&
+            !all_child_chunks_gpu_ready_and_desired(field, store, parent, focus, policy)) {
             return false;
         }
     }
-    if (all_child_chunks_gpu_ready(field, store, key)) {
+    if (all_child_chunks_gpu_ready_and_desired(field, store, key, focus, policy)) {
         return false;
     }
     return true;
 }
 
-std::vector<MortonChunkKey> collect_gpu_visible_lod_keys(MineSdfField& field, const GpuChunkStore& store) {
+std::vector<MortonChunkKey> collect_gpu_visible_lod_keys(
+    MineSdfField& field,
+    const GpuChunkStore& store,
+    ae::Vec3 focus,
+    const SdfLodPolicy& policy
+) {
     field.visible_lod_counts = {0u, 0u, 0u};
     std::vector<MortonChunkKey> visible_keys;
     visible_keys.reserve(field.active_keys.size());
     for (const MortonChunkKey& key : field.active_keys) {
-        if (!should_draw_gpu_lod_chunk(field, store, key)) {
+        if (!should_draw_gpu_lod_chunk(field, store, key, focus, policy)) {
             continue;
         }
         visible_keys.push_back(key);
@@ -1629,6 +2288,22 @@ std::vector<MortonChunkKey> collect_gpu_visible_lod_keys(MineSdfField& field, co
         }
     }
     return visible_keys;
+}
+
+std::vector<MortonChunkKey> collect_gpu_lod_keys(MineSdfField& field, const GpuChunkStore& store, uint32_t lod) {
+    field.visible_lod_counts = {0u, 0u, 0u};
+    std::vector<MortonChunkKey> keys;
+    keys.reserve(field.active_keys.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        if (key.lod != lod || !chunk_gpu_ready(field, store, key)) {
+            continue;
+        }
+        keys.push_back(key);
+        if (lod < field.visible_lod_counts.size()) {
+            ++field.visible_lod_counts[lod];
+        }
+    }
+    return keys;
 }
 
 float axis_value(ae::Vec3 p, uint32_t axis) {
@@ -2055,6 +2730,7 @@ uint32_t drain_completed_chunks(MineSdfField& field, WorkerPool& pool, uint32_t 
         }
         result.chunk.priority = found->second.priority;
         result.chunk.urgent = found->second.urgent;
+        result.chunk.force_visible = found->second.force_visible;
         result.chunk.gpu_dirty = true;
         field.chunks[result.key.code] = std::move(result.chunk);
         ++accepted;
@@ -2121,6 +2797,54 @@ std::vector<RenderVertex> build_graph_lines(const MineNetwork& network, const Mi
     return lines;
 }
 
+std::vector<RenderVertex> build_preview_lines(const MineSdfField& field, bool has_preview, ae::Vec3 preview_center) {
+    std::vector<RenderVertex> lines;
+    if (has_preview) {
+        append_sphere_preview(lines, preview_center, field.brush_radius, color_brush_line());
+    }
+    return lines;
+}
+
+void append_box_lines(std::vector<RenderVertex>& lines, ae::Vec3 minimum, ae::Vec3 maximum, ae::Vec3 color) {
+    const std::array<ae::Vec3, 8u> corners = {{
+        {minimum.x, minimum.y, minimum.z}, {maximum.x, minimum.y, minimum.z},
+        {maximum.x, maximum.y, minimum.z}, {minimum.x, maximum.y, minimum.z},
+        {minimum.x, minimum.y, maximum.z}, {maximum.x, minimum.y, maximum.z},
+        {maximum.x, maximum.y, maximum.z}, {minimum.x, maximum.y, maximum.z},
+    }};
+    static constexpr std::array<std::array<uint32_t, 2u>, 12u> edges = {{
+        {{0u, 1u}}, {{1u, 2u}}, {{2u, 3u}}, {{3u, 0u}},
+        {{4u, 5u}}, {{5u, 6u}}, {{6u, 7u}}, {{7u, 4u}},
+        {{0u, 4u}}, {{1u, 5u}}, {{2u, 6u}}, {{3u, 7u}},
+    }};
+    for (const auto& edge : edges) {
+        append_line(lines, corners[edge[0]], corners[edge[1]], color);
+    }
+}
+
+std::vector<RenderVertex> build_portal_debug_lines(const PortalGraph& graph) {
+    std::vector<RenderVertex> lines;
+    if (!graph.settings.debug) {
+        return lines;
+    }
+    for (const MinePortal& portal : graph.portals) {
+        ae::Vec3 u;
+        ae::Vec3 v;
+        path_basis(portal.normal, u, v);
+        const bool exterior_portal = portal.area_a == ExteriorAreaId || portal.area_b == ExteriorAreaId;
+        const ae::Vec3 color = exterior_portal
+            ? ae::Vec3{0.25f, 0.70f, 1.0f}
+            : (portal.open_alpha > PortalOpenThreshold ? ae::Vec3{0.25f, 1.0f, 0.45f} : ae::Vec3{1.0f, 0.34f, 0.16f});
+        const float r = portal.radius;
+        append_line(lines, portal.center - u * r, portal.center + u * r, color);
+        append_line(lines, portal.center - v * r, portal.center + v * r, color);
+        append_line(lines, portal.center, portal.center + portal.normal * (r * 1.25f), {1.0f, 0.9f, 0.15f});
+        append_line(lines, portal.center, portal.capture.capture_position, {0.45f, 0.70f, 1.0f});
+        append_box_lines(lines, portal.proxy_box_min, portal.proxy_box_max, {0.28f, 0.48f, 1.0f});
+    }
+    return lines;
+}
+
 void upload_lines(GpuMesh& gpu, const std::vector<RenderVertex>& lines) {
     if (gpu.line_vao == 0) {
         glGenVertexArrays(1, &gpu.line_vao);
@@ -2138,6 +2862,23 @@ void upload_lines(GpuMesh& gpu, const std::vector<RenderVertex>& lines) {
     gpu.line_vertex_count = static_cast<uint32_t>(lines.size());
 }
 
+void upload_preview_lines(GpuMesh& gpu, const std::vector<RenderVertex>& lines) {
+    if (gpu.preview_vao == 0) {
+        glGenVertexArrays(1, &gpu.preview_vao);
+        glGenBuffers(1, &gpu.preview_vbo);
+    }
+    glBindVertexArray(gpu.preview_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, gpu.preview_vbo);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(lines.size() * sizeof(RenderVertex)), lines.data(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, position)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, normal)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, color)));
+    gpu.preview_vertex_count = static_cast<uint32_t>(lines.size());
+}
+
 void configure_surface_vertex_attributes() {
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(RenderVertex), reinterpret_cast<void*>(offsetof(RenderVertex, position)));
@@ -2148,38 +2889,143 @@ void configure_surface_vertex_attributes() {
 }
 
 void destroy_gpu_chunk(GpuChunk& chunk) {
-    if (chunk.ebo != 0) glDeleteBuffers(1, &chunk.ebo);
-    if (chunk.vbo != 0) glDeleteBuffers(1, &chunk.vbo);
-    if (chunk.vao != 0) glDeleteVertexArrays(1, &chunk.vao);
     chunk = {};
 }
 
 void clear_gpu_chunks(GpuChunkStore& store) {
-    for (auto& entry : store.chunks) {
-        destroy_gpu_chunk(entry.second);
-    }
     store.chunks.clear();
     store.urgent_uploads.clear();
     store.pending_uploads.clear();
     store.urgent_codes.clear();
     store.pending_codes.clear();
+    store.vertex_cursor = 0;
+    store.index_cursor = 0;
+    store.draw_calls_last_frame = 0;
+    store.drawn_chunks_last_frame = 0;
+    store.culled_chunks_last_frame = 0;
+    store.uploaded_bytes_last_frame = 0;
+    store.arena_reset_requested = false;
+}
+
+void mark_ready_chunks_gpu_dirty(MineSdfField& field) {
+    for (auto& entry : field.chunks) {
+        MineSdfChunk& chunk = entry.second;
+        if (chunk.state == ChunkState::Ready) {
+            chunk.gpu_dirty = true;
+            chunk.urgent = false;
+        }
+    }
+}
+
+void initialize_chunk_arena(GpuChunkStore& store) {
+    if (store.initialized) {
+        return;
+    }
+    glGenVertexArrays(1, &store.vao);
+    glGenBuffers(1, &store.vbo);
+    glGenBuffers(1, &store.ebo);
+    glGenBuffers(1, &store.indirect_buffer);
+    glBindVertexArray(store.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, store.vbo);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(static_cast<uint64_t>(store.vertex_capacity) * sizeof(RenderVertex)),
+        nullptr,
+        GL_DYNAMIC_DRAW
+    );
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, store.ebo);
+    glBufferData(
+        GL_ELEMENT_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(static_cast<uint64_t>(store.index_capacity) * sizeof(uint32_t)),
+        nullptr,
+        GL_DYNAMIC_DRAW
+    );
+    configure_surface_vertex_attributes();
+    store.initialized = true;
+}
+
+void destroy_chunk_arena(GpuChunkStore& store) {
+    if (store.indirect_buffer != 0) glDeleteBuffers(1, &store.indirect_buffer);
+    if (store.ebo != 0) glDeleteBuffers(1, &store.ebo);
+    if (store.vbo != 0) glDeleteBuffers(1, &store.vbo);
+    if (store.vao != 0) glDeleteVertexArrays(1, &store.vao);
+    store = {};
 }
 
 void upload_chunk(GpuChunkStore& store, const MineSdfChunk& chunk, uint32_t generation) {
-    GpuChunk& gpu_chunk = store.chunks[chunk.key.code];
-    if (gpu_chunk.vao == 0) {
-        glGenVertexArrays(1, &gpu_chunk.vao);
-        glGenBuffers(1, &gpu_chunk.vbo);
-        glGenBuffers(1, &gpu_chunk.ebo);
+    initialize_chunk_arena(store);
+    if (chunk.vertices.empty() || chunk.indices.empty()) {
+        store.chunks[chunk.key.code] = {};
+        return;
     }
-    glBindVertexArray(gpu_chunk.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, gpu_chunk.vbo);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(chunk.vertices.size() * sizeof(RenderVertex)), chunk.vertices.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gpu_chunk.ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(chunk.indices.size() * sizeof(uint32_t)), chunk.indices.data(), GL_STATIC_DRAW);
-    configure_surface_vertex_attributes();
-    gpu_chunk.index_count = static_cast<uint32_t>(chunk.indices.size());
+    if (chunk.vertices.size() > std::numeric_limits<uint32_t>::max() ||
+        chunk.indices.size() > std::numeric_limits<uint32_t>::max()) {
+        store.indirect_available = false;
+        return;
+    }
+    const uint32_t vertex_count = static_cast<uint32_t>(chunk.vertices.size());
+    const uint32_t index_count = static_cast<uint32_t>(chunk.indices.size());
+    if (store.vertex_cursor + vertex_count > store.vertex_capacity ||
+        store.index_cursor + index_count > store.index_capacity) {
+        while (store.vertex_cursor + vertex_count > store.vertex_capacity) {
+            store.vertex_capacity = std::max(store.vertex_capacity + 1u, store.vertex_capacity * 2u);
+        }
+        while (store.index_cursor + index_count > store.index_capacity) {
+            store.index_capacity = std::max(store.index_capacity + 1u, store.index_capacity * 2u);
+        }
+        clear_gpu_chunks(store);
+        store.arena_reset_requested = true;
+        glBindBuffer(GL_ARRAY_BUFFER, store.vbo);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(static_cast<uint64_t>(store.vertex_capacity) * sizeof(RenderVertex)),
+            nullptr,
+            GL_DYNAMIC_DRAW
+        );
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, store.ebo);
+        glBufferData(
+            GL_ELEMENT_ARRAY_BUFFER,
+            static_cast<GLsizeiptr>(static_cast<uint64_t>(store.index_capacity) * sizeof(uint32_t)),
+            nullptr,
+            GL_DYNAMIC_DRAW
+        );
+    }
+    if (store.vertex_cursor + vertex_count > store.vertex_capacity ||
+        store.index_cursor + index_count > store.index_capacity) {
+        store.indirect_available = false;
+        return;
+    }
+
+    GpuChunk gpu_chunk;
+    gpu_chunk.vertex_count = vertex_count;
+    gpu_chunk.index_count = index_count;
+    gpu_chunk.base_vertex = static_cast<int32_t>(store.vertex_cursor);
+    gpu_chunk.first_index = store.index_cursor;
     gpu_chunk.generation = generation;
+    chunk_world_bounds(16u, chunk.key, gpu_chunk.bounds_min, gpu_chunk.bounds_max);
+    gpu_chunk.center = (gpu_chunk.bounds_min + gpu_chunk.bounds_max) * 0.5f;
+    gpu_chunk.radius = ae::length(gpu_chunk.bounds_max - gpu_chunk.center);
+    gpu_chunk.in_arena = true;
+
+    glBindBuffer(GL_ARRAY_BUFFER, store.vbo);
+    glBufferSubData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLintptr>(static_cast<uint64_t>(gpu_chunk.base_vertex) * sizeof(RenderVertex)),
+        static_cast<GLsizeiptr>(static_cast<uint64_t>(vertex_count) * sizeof(RenderVertex)),
+        chunk.vertices.data()
+    );
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, store.ebo);
+    glBufferSubData(
+        GL_ELEMENT_ARRAY_BUFFER,
+        static_cast<GLintptr>(static_cast<uint64_t>(gpu_chunk.first_index) * sizeof(uint32_t)),
+        static_cast<GLsizeiptr>(static_cast<uint64_t>(index_count) * sizeof(uint32_t)),
+        chunk.indices.data()
+    );
+    store.uploaded_bytes_last_frame += static_cast<uint64_t>(vertex_count) * sizeof(RenderVertex) +
+        static_cast<uint64_t>(index_count) * sizeof(uint32_t);
+    store.vertex_cursor += vertex_count;
+    store.index_cursor += index_count;
+    store.chunks[chunk.key.code] = gpu_chunk;
 }
 
 void enqueue_visible_gpu_uploads(MineSdfField& field, GpuChunkStore& store, const std::vector<MortonChunkKey>& visible_keys) {
@@ -2198,8 +3044,21 @@ void enqueue_visible_gpu_uploads(MineSdfField& field, GpuChunkStore& store, cons
     }
 }
 
+void enqueue_urgent_gpu_uploads(MineSdfField& field, GpuChunkStore& store) {
+    for (auto& entry : field.chunks) {
+        MineSdfChunk& chunk = entry.second;
+        if (chunk.state != ChunkState::Ready || !chunk.gpu_dirty || !chunk.urgent) {
+            continue;
+        }
+        if (store.urgent_codes.insert(entry.first).second) {
+            store.urgent_uploads.push_back(entry.first);
+        }
+    }
+}
+
 uint32_t upload_queued_chunks(MineSdfField& field, GpuChunkStore& store, uint32_t max_uploads) {
     uint32_t uploaded = 0;
+    store.uploaded_bytes_last_frame = 0;
     auto pop_code = [&]() {
         if (!store.urgent_uploads.empty()) {
             const uint64_t code = store.urgent_uploads.front();
@@ -2219,6 +3078,15 @@ uint32_t upload_queued_chunks(MineSdfField& field, GpuChunkStore& store, uint32_
             continue;
         }
         upload_chunk(store, found->second, field.generation);
+        if (store.arena_reset_requested) {
+            mark_ready_chunks_gpu_dirty(field);
+            store.urgent_uploads.clear();
+            store.pending_uploads.clear();
+            store.urgent_codes.clear();
+            store.pending_codes.clear();
+            store.arena_reset_requested = false;
+            break;
+        }
         found->second.gpu_dirty = false;
         found->second.urgent = false;
         ++uploaded;
@@ -2231,20 +3099,733 @@ uint32_t draw_visible_chunks(const GpuChunkStore& store, const std::vector<Morto
     uint32_t index_count = 0;
     for (MortonChunkKey key : visible_keys) {
         const auto found = store.chunks.find(key.code);
-        if (found == store.chunks.end() || found->second.vao == 0 || found->second.index_count == 0u) {
+        if (found == store.chunks.end() || !found->second.in_arena || found->second.index_count == 0u) {
             continue;
         }
-        glBindVertexArray(found->second.vao);
+        glBindVertexArray(store.vao);
         glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(found->second.index_count), GL_UNSIGNED_INT, nullptr);
         index_count += found->second.index_count;
     }
     return index_count;
 }
 
+uint32_t draw_visible_chunks_indirect(
+    GpuChunkStore& store,
+    const std::vector<MortonChunkKey>& visible_keys,
+    const Frustum& frustum,
+    bool cull_enabled
+) {
+    std::vector<DrawElementsIndirectCommand> commands;
+    commands.reserve(visible_keys.size());
+    uint32_t index_count = 0;
+    store.drawn_chunks_last_frame = 0;
+    store.culled_chunks_last_frame = 0;
+    for (MortonChunkKey key : visible_keys) {
+        const auto found = store.chunks.find(key.code);
+        if (found == store.chunks.end() || !found->second.in_arena || found->second.index_count == 0u) {
+            continue;
+        }
+        const GpuChunk& chunk = found->second;
+        if (cull_enabled && !chunk_in_frustum(frustum, chunk)) {
+            ++store.culled_chunks_last_frame;
+            continue;
+        }
+        commands.push_back({
+            chunk.index_count,
+            1u,
+            chunk.first_index,
+            static_cast<uint32_t>(chunk.base_vertex),
+            0u,
+        });
+        index_count += chunk.index_count;
+    }
+    if (commands.empty()) {
+        store.draw_calls_last_frame = 0;
+        return 0;
+    }
+    store.drawn_chunks_last_frame = static_cast<uint32_t>(commands.size());
+    glBindVertexArray(store.vao);
+    if (store.indirect_available) {
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, store.indirect_buffer);
+        glBufferData(
+            GL_DRAW_INDIRECT_BUFFER,
+            static_cast<GLsizeiptr>(commands.size() * sizeof(DrawElementsIndirectCommand)),
+            commands.data(),
+            GL_STREAM_DRAW
+        );
+        glMultiDrawElementsIndirect(
+            GL_TRIANGLES,
+            GL_UNSIGNED_INT,
+            nullptr,
+            static_cast<GLsizei>(commands.size()),
+            0
+        );
+        store.draw_calls_last_frame = 1;
+    } else {
+        for (const DrawElementsIndirectCommand& command : commands) {
+            glDrawElementsBaseVertex(
+                GL_TRIANGLES,
+                static_cast<GLsizei>(command.count),
+                GL_UNSIGNED_INT,
+                reinterpret_cast<void*>(static_cast<uintptr_t>(command.first_index) * sizeof(uint32_t)),
+                static_cast<GLint>(command.base_vertex)
+            );
+        }
+        store.draw_calls_last_frame = static_cast<uint32_t>(commands.size());
+    }
+    return index_count;
+}
+
+std::vector<MortonChunkKey> frustum_culled_keys(const GpuChunkStore& store, const std::vector<MortonChunkKey>& keys, const Frustum& frustum) {
+    std::vector<MortonChunkKey> result;
+    result.reserve(keys.size());
+    for (MortonChunkKey key : keys) {
+        const auto found = store.chunks.find(key.code);
+        if (found == store.chunks.end() || !found->second.in_arena || found->second.index_count == 0u) {
+            continue;
+        }
+        if (chunk_in_frustum(frustum, found->second)) {
+            result.push_back(key);
+        }
+    }
+    return result;
+}
+
+std::vector<MortonChunkKey> frustum_culled_chunk_keys(const MineSdfField& field, const std::vector<MortonChunkKey>& keys, const Frustum& frustum) {
+    std::vector<MortonChunkKey> result;
+    result.reserve(keys.size());
+    for (MortonChunkKey key : keys) {
+        ae::Vec3 minimum;
+        ae::Vec3 maximum;
+        chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+        if (aabb_in_frustum(frustum, minimum, maximum)) {
+            result.push_back(key);
+        }
+    }
+    return result;
+}
+
+void invalidate_all_portal_captures(PortalGraph& graph) {
+    for (MinePortal& portal : graph.portals) {
+        portal.capture.stale = true;
+        portal.capture.face_cursor = 0u;
+    }
+}
+
+void invalidate_portal_captures_near(PortalGraph& graph, ae::Vec3 point, float radius) {
+    for (MinePortal& portal : graph.portals) {
+        const float influence = radius + portal.radius * 3.0f;
+        if (ae::length(portal.center - point) <= influence) {
+            portal.capture.stale = true;
+            portal.capture.face_cursor = 0u;
+        }
+    }
+}
+
+void update_portal_states(PortalGraph& graph, ae::Vec3 eye, ae::Vec3 view_forward, bool outside_planet, uint32_t generation) {
+    graph.stats.open_portals = 0u;
+    graph.stats.closed_portals = 0u;
+    graph.stats.stale_captures = 0u;
+    graph.stats.portal_count = static_cast<uint32_t>(graph.portals.size());
+    view_forward = ae::normalize(view_forward);
+    for (MinePortal& portal : graph.portals) {
+        const float distance = ae::length(eye - portal.center);
+        const float proxy_alpha = saturate((distance - portal.fade_start) / std::max(0.001f, portal.fade_end - portal.fade_start));
+        portal.open_alpha = 1.0f - proxy_alpha;
+        const bool exterior_portal = portal.area_a == ExteriorAreaId || portal.area_b == ExteriorAreaId;
+        const bool view_can_open = !exterior_portal || outside_planet;
+        const float look_open_distance = exterior_portal ? EntrancePortalLookOpenDistance : InteriorPortalLookOpenDistance;
+        const float look_radius_scale = exterior_portal ? EntrancePortalLookRadiusScale : InteriorPortalLookRadiusScale;
+        if (view_can_open && distance < look_open_distance) {
+            const ae::Vec3 to_portal = portal.center - eye;
+            const float along_view = ae::dot(to_portal, view_forward);
+            if (along_view > 0.0f) {
+                const ae::Vec3 closest_on_view_ray = eye + view_forward * along_view;
+                const float ray_distance = ae::length(portal.center - closest_on_view_ray);
+                const float aperture = std::max(portal.radius * 1.5f, portal.radius * look_radius_scale + distance * 0.025f);
+                const float aim_alpha = 1.0f - saturate(ray_distance / aperture);
+                const float full_open_distance = look_open_distance * PortalLookFullOpenFraction;
+                const float distance_alpha = 1.0f - saturate((distance - full_open_distance) / std::max(0.001f, look_open_distance - full_open_distance));
+                portal.open_alpha = std::max(portal.open_alpha, aim_alpha * distance_alpha);
+            }
+        }
+        const int desired_side = ae::dot(eye - portal.center, portal.normal) < 0.0f ? 1 : -1;
+        if (portal.capture.side != desired_side) {
+            portal.capture.side = desired_side;
+            portal.capture.capture_position = portal.center + portal.normal * (static_cast<float>(desired_side) * portal.radius * 1.45f);
+            portal.capture.stale = true;
+            portal.capture.face_cursor = 0u;
+        } else if (portal.capture.last_update_generation != generation && !portal.capture.stale) {
+            portal.capture.stale = true;
+            portal.capture.face_cursor = 0u;
+        }
+        if (portal.open_alpha > PortalOpenThreshold) {
+            ++graph.stats.open_portals;
+        } else {
+            ++graph.stats.closed_portals;
+        }
+        if (portal.capture.stale) {
+            ++graph.stats.stale_captures;
+        }
+    }
+}
+
+struct PortalReachEntry {
+    uint32_t area = UINT32_MAX;
+    uint32_t depth = 0u;
+};
+
+void add_portal_reachable_areas(
+    const PortalGraph& graph,
+    std::unordered_set<uint32_t>& reachable,
+    uint32_t seed_area,
+    uint32_t max_depth,
+    bool require_open
+) {
+    if (seed_area == UINT32_MAX) {
+        return;
+    }
+    std::deque<PortalReachEntry> queue;
+    reachable.insert(seed_area);
+    queue.push_back({seed_area, 0u});
+    while (!queue.empty()) {
+        const PortalReachEntry entry = queue.front();
+        queue.pop_front();
+        if (entry.depth >= max_depth) {
+            continue;
+        }
+        for (const MinePortal& portal : graph.portals) {
+            if (require_open && portal.open_alpha <= PortalTraversalThreshold) {
+                continue;
+            }
+            uint32_t next = UINT32_MAX;
+            if (portal.area_a == entry.area) {
+                next = portal.area_b;
+            } else if (portal.area_b == entry.area) {
+                next = portal.area_a;
+            }
+            if (next != UINT32_MAX && reachable.insert(next).second) {
+                queue.push_back({next, entry.depth + 1u});
+            }
+        }
+    }
+}
+
+uint32_t best_area_in_view_corridor(const PortalGraph& graph, ae::Vec3 eye, ae::Vec3 view_forward) {
+    uint32_t best_area = UINT32_MAX;
+    float best_score = std::numeric_limits<float>::max();
+    for (const MineArea& area : graph.areas) {
+        if (area.kind == MineAreaKind::Exterior) {
+            continue;
+        }
+        for (ae::Vec3 point : area.path) {
+            const ae::Vec3 to_point = point - eye;
+            const float along_view = ae::dot(to_point, view_forward);
+            if (along_view <= 0.0f || along_view > PortalLookBranchDistance) {
+                continue;
+            }
+            const ae::Vec3 closest_on_view_ray = eye + view_forward * along_view;
+            const float ray_distance = ae::length(point - closest_on_view_ray);
+            const float aperture = std::max(PortalLookBranchApertureMin, area.radius * 1.65f + along_view * 0.035f);
+            if (ray_distance > aperture) {
+                continue;
+            }
+            const float score = along_view + ray_distance * 3.0f;
+            if (score < best_score) {
+                best_score = score;
+                best_area = area.id;
+            }
+        }
+    }
+    return best_area;
+}
+
+void add_look_branch_reachable_areas(
+    const PortalGraph& graph,
+    std::unordered_set<uint32_t>& reachable,
+    ae::Vec3 eye,
+    ae::Vec3 view_forward,
+    bool outside_planet
+) {
+    view_forward = ae::normalize(view_forward);
+    uint32_t best_portal_a = UINT32_MAX;
+    uint32_t best_portal_b = UINT32_MAX;
+    float best_score = std::numeric_limits<float>::max();
+    for (const MinePortal& portal : graph.portals) {
+        const bool exterior_portal = portal.area_a == ExteriorAreaId || portal.area_b == ExteriorAreaId;
+        if ((outside_planet && !exterior_portal) || (!outside_planet && exterior_portal)) {
+            continue;
+        }
+        const ae::Vec3 to_portal = portal.center - eye;
+        const float along_view = ae::dot(to_portal, view_forward);
+        if (along_view <= 0.0f || along_view > PortalLookBranchDistance) {
+            continue;
+        }
+        const ae::Vec3 closest_on_view_ray = eye + view_forward * along_view;
+        const float ray_distance = ae::length(portal.center - closest_on_view_ray);
+        const float aperture = std::max(PortalLookBranchApertureMin, portal.radius * PortalLookBranchApertureScale + along_view * 0.035f);
+        if (ray_distance > aperture) {
+            continue;
+        }
+        const float score = along_view + ray_distance * 2.0f;
+        if (score < best_score) {
+            best_score = score;
+            best_portal_a = portal.area_a;
+            best_portal_b = portal.area_b;
+        }
+    }
+    if (!outside_planet) {
+        const uint32_t look_area = best_area_in_view_corridor(graph, eye, view_forward);
+        add_portal_reachable_areas(graph, reachable, look_area, PortalLookBranchTraversalDepth, false);
+    }
+    add_portal_reachable_areas(graph, reachable, best_portal_a, PortalLookBranchTraversalDepth, false);
+    add_portal_reachable_areas(graph, reachable, best_portal_b, PortalLookBranchTraversalDepth, false);
+}
+
+std::unordered_set<uint32_t> reachable_portal_areas(
+    const PortalGraph& graph,
+    uint32_t camera_area,
+    bool outside_planet,
+    ae::Vec3 eye,
+    ae::Vec3 view_forward
+) {
+    std::unordered_set<uint32_t> reachable;
+    if (camera_area == UINT32_MAX) {
+        return reachable;
+    }
+    const uint32_t max_depth = outside_planet ? ExteriorPortalTraversalDepth : InteriorPortalTraversalDepth;
+    add_portal_reachable_areas(graph, reachable, camera_area, max_depth, true);
+    add_look_branch_reachable_areas(graph, reachable, eye, view_forward, outside_planet);
+    return reachable;
+}
+
+uint32_t area_for_chunk(const MineSdfField& field, const PortalGraph& graph, MortonChunkKey key) {
+    if (const auto cached = graph.chunk_area_by_code.find(key.code); cached != graph.chunk_area_by_code.end()) {
+        return cached->second;
+    }
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+    return nearest_area_id(graph, (minimum + maximum) * 0.5f);
+}
+
+bool chunk_intersects_shell_cached(const MineSdfField& field, const PortalGraph& graph, MortonChunkKey key) {
+    if (graph.shell_chunk_codes.find(key.code) != graph.shell_chunk_codes.end()) {
+        return true;
+    }
+    ae::Vec3 minimum;
+    ae::Vec3 maximum;
+    chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+    return chunk_intersects_shell_bounds(key, minimum, maximum);
+}
+
+std::vector<MortonChunkKey> portal_filtered_draw_keys(
+    MineSdfField& field,
+    PortalGraph& graph,
+    const std::vector<MortonChunkKey>& keys,
+    ae::Vec3 eye,
+    ae::Vec3 view_forward,
+    bool outside_planet
+) {
+    graph.stats.portal_culled_chunks = 0u;
+    graph.stats.shell_kept_chunks = 0u;
+    if (!graph.settings.enabled || graph.areas.empty()) {
+        return keys;
+    }
+    const uint32_t camera_area = outside_planet ? ExteriorAreaId : nearest_area_id(graph, eye);
+    const std::unordered_set<uint32_t> reachable = reachable_portal_areas(graph, camera_area, outside_planet, eye, view_forward);
+    if (reachable.empty()) {
+        return keys;
+    }
+    std::vector<MortonChunkKey> filtered;
+    filtered.reserve(keys.size());
+    for (MortonChunkKey key : keys) {
+        if (chunk_force_visible(field, key)) {
+            filtered.push_back(key);
+            continue;
+        }
+        if (outside_planet && chunk_intersects_shell_cached(field, graph, key)) {
+            filtered.push_back(key);
+            ++graph.stats.shell_kept_chunks;
+            continue;
+        }
+        if (!outside_planet) {
+            ae::Vec3 minimum;
+            ae::Vec3 maximum;
+            chunk_world_bounds(field.chunk_size, key, minimum, maximum);
+            if (distance_to_box(eye, minimum, maximum) <= PortalLocalVisibilityRadius) {
+                filtered.push_back(key);
+                continue;
+            }
+        }
+        if (reachable.find(area_for_chunk(field, graph, key)) != reachable.end()) {
+            filtered.push_back(key);
+        } else {
+            ++graph.stats.portal_culled_chunks;
+        }
+    }
+    return filtered;
+}
+
+std::vector<MortonChunkKey> collect_uploaded_chunk_keys(const MineSdfField& field, const GpuChunkStore& store) {
+    std::vector<MortonChunkKey> keys;
+    keys.reserve(store.chunks.size());
+    for (const MortonChunkKey& key : field.active_keys) {
+        const auto found = store.chunks.find(key.code);
+        if (found != store.chunks.end() && found->second.in_arena && found->second.index_count > 0u) {
+            keys.push_back(key);
+        }
+    }
+    return keys;
+}
+
+std::vector<MortonChunkKey> collect_portal_capture_chunk_keys(
+    const MineSdfField& field,
+    const GpuChunkStore& store,
+    const MinePortal& portal,
+    ae::Vec3 capture_eye,
+    const Frustum& capture_frustum
+) {
+    struct Candidate {
+        MortonChunkKey key;
+        float distance = 0.0f;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(std::min<size_t>(store.chunks.size(), PortalCaptureMaxChunks * 2u));
+    const float radius = std::max(PortalCaptureVisibilityRadius, portal.radius * 7.0f);
+    for (const MortonChunkKey& key : field.active_keys) {
+        const auto found = store.chunks.find(key.code);
+        if (found == store.chunks.end() || !found->second.in_arena || found->second.index_count == 0u) {
+            continue;
+        }
+        const GpuChunk& chunk = found->second;
+        if (!chunk_in_frustum(capture_frustum, chunk)) {
+            continue;
+        }
+        const float distance = distance_to_box(capture_eye, chunk.bounds_min, chunk.bounds_max);
+        if (distance > radius) {
+            continue;
+        }
+        candidates.push_back({key, distance});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.distance != b.distance) {
+            return a.distance < b.distance;
+        }
+        if (a.key.lod != b.key.lod) {
+            return a.key.lod > b.key.lod;
+        }
+        return a.key.code < b.key.code;
+    });
+    if (candidates.size() > PortalCaptureMaxChunks) {
+        candidates.resize(PortalCaptureMaxChunks);
+    }
+    std::vector<MortonChunkKey> keys;
+    keys.reserve(candidates.size());
+    for (const Candidate& candidate : candidates) {
+        keys.push_back(candidate.key);
+    }
+    return keys;
+}
+
+void begin_gpu_timer(GpuTimer& timer) {
+    if (timer.query == 0) {
+        glGenQueries(1, &timer.query);
+    }
+    if (!timer.pending) {
+        glBeginQuery(GL_TIME_ELAPSED, timer.query);
+    }
+}
+
+void end_gpu_timer(GpuTimer& timer) {
+    if (!timer.pending) {
+        glEndQuery(GL_TIME_ELAPSED);
+        timer.pending = true;
+    }
+}
+
+void read_gpu_timer(GpuTimer& timer, double& milliseconds) {
+    if (!timer.pending || timer.query == 0) {
+        return;
+    }
+    GLint available = 0;
+    glGetQueryObjectiv(timer.query, GL_QUERY_RESULT_AVAILABLE, &available);
+    if (!available) {
+        return;
+    }
+    GLuint64 nanoseconds = 0;
+    glGetQueryObjectui64v(timer.query, GL_QUERY_RESULT, &nanoseconds);
+    milliseconds = static_cast<double>(nanoseconds) / 1'000'000.0;
+    timer.pending = false;
+}
+
+void destroy_gpu_timer(GpuTimer& timer) {
+    if (timer.query != 0) {
+        glDeleteQueries(1, &timer.query);
+    }
+    timer = {};
+}
+
 void destroy_mesh(GpuMesh& gpu) {
     if (gpu.line_vbo != 0) glDeleteBuffers(1, &gpu.line_vbo);
     if (gpu.line_vao != 0) glDeleteVertexArrays(1, &gpu.line_vao);
+    if (gpu.preview_vbo != 0) glDeleteBuffers(1, &gpu.preview_vbo);
+    if (gpu.preview_vao != 0) glDeleteVertexArrays(1, &gpu.preview_vao);
     gpu = {};
+}
+
+void initialize_portal_gpu(PortalGpu& gpu) {
+    if (gpu.shader == 0) {
+        gpu.shader = build_portal_shader_program();
+        gpu.mvp_location = glGetUniformLocation(gpu.shader, "u_mvp");
+        gpu.camera_location = glGetUniformLocation(gpu.shader, "u_camera_position");
+        gpu.capture_location = glGetUniformLocation(gpu.shader, "u_capture_position");
+        gpu.box_min_location = glGetUniformLocation(gpu.shader, "u_box_min");
+        gpu.box_max_location = glGetUniformLocation(gpu.shader, "u_box_max");
+        gpu.alpha_location = glGetUniformLocation(gpu.shader, "u_alpha");
+        gpu.cubemap_location = glGetUniformLocation(gpu.shader, "u_cubemap");
+    }
+    if (gpu.vao == 0) {
+        glGenVertexArrays(1, &gpu.vao);
+        glGenBuffers(1, &gpu.vbo);
+        glBindVertexArray(gpu.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(6u * sizeof(ae::Vec3)), nullptr, GL_DYNAMIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(ae::Vec3), nullptr);
+    }
+    if (gpu.fbo == 0) {
+        glGenFramebuffers(1, &gpu.fbo);
+        glGenRenderbuffers(1, &gpu.depth);
+    }
+}
+
+void destroy_portal_gpu(PortalGpu& gpu) {
+    if (gpu.depth != 0) glDeleteRenderbuffers(1, &gpu.depth);
+    if (gpu.fbo != 0) glDeleteFramebuffers(1, &gpu.fbo);
+    if (gpu.vbo != 0) glDeleteBuffers(1, &gpu.vbo);
+    if (gpu.vao != 0) glDeleteVertexArrays(1, &gpu.vao);
+    if (gpu.shader != 0) glDeleteProgram(gpu.shader);
+    gpu = {};
+}
+
+void destroy_portal_captures(PortalGraph& graph) {
+    for (MinePortal& portal : graph.portals) {
+        if (portal.capture.cubemap_texture != 0) {
+            glDeleteTextures(1, &portal.capture.cubemap_texture);
+            portal.capture.cubemap_texture = 0;
+        }
+    }
+}
+
+void ensure_portal_cubemap(MinePortal& portal, uint32_t capture_size) {
+    if (portal.capture.cubemap_texture != 0) {
+        return;
+    }
+    glGenTextures(1, &portal.capture.cubemap_texture);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, portal.capture.cubemap_texture);
+    for (uint32_t face = 0; face < 6u; ++face) {
+        glTexImage2D(
+            GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+            0,
+            GL_RGB8,
+            static_cast<GLsizei>(capture_size),
+            static_cast<GLsizei>(capture_size),
+            0,
+            GL_RGB,
+            GL_UNSIGNED_BYTE,
+            nullptr
+        );
+    }
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+}
+
+ae::Vec3 cube_face_direction(uint32_t face) {
+    static constexpr std::array<ae::Vec3, 6u> directions = {{
+        {1.0f, 0.0f, 0.0f}, {-1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f}, {0.0f, -1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f},
+    }};
+    return directions[std::min<uint32_t>(face, 5u)];
+}
+
+ae::Vec3 cube_face_up(uint32_t face) {
+    static constexpr std::array<ae::Vec3, 6u> ups = {{
+        {0.0f, -1.0f, 0.0f}, {0.0f, -1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f},
+        {0.0f, -1.0f, 0.0f}, {0.0f, -1.0f, 0.0f},
+    }};
+    return ups[std::min<uint32_t>(face, 5u)];
+}
+
+uint32_t update_portal_captures(
+    PortalGraph& graph,
+    PortalGpu& portal_gpu,
+    MineSdfField& field,
+    GpuChunkStore& gpu_chunks,
+    uint32_t surface_shader,
+    int mvp_location,
+    int model_location,
+    int camera_location,
+    int cutaway_location,
+    uint32_t generation,
+    int width,
+    int height,
+    double previous_frame_ms
+) {
+    graph.stats.capture_faces_this_frame = 0u;
+    if (!graph.settings.enabled || graph.settings.captures_per_frame == 0u) {
+        return 0u;
+    }
+    if (previous_frame_ms > PortalCaptureFrameBudgetMs) {
+        return 0u;
+    }
+    initialize_portal_gpu(portal_gpu);
+    uint32_t updated_faces = 0u;
+    glBindFramebuffer(GL_FRAMEBUFFER, portal_gpu.fbo);
+    glBindRenderbuffer(GL_RENDERBUFFER, portal_gpu.depth);
+    glRenderbufferStorage(
+        GL_RENDERBUFFER,
+        GL_DEPTH_COMPONENT24,
+        static_cast<GLsizei>(graph.settings.capture_size),
+        static_cast<GLsizei>(graph.settings.capture_size)
+    );
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, portal_gpu.depth);
+    glViewport(0, 0, static_cast<GLsizei>(graph.settings.capture_size), static_cast<GLsizei>(graph.settings.capture_size));
+    glUseProgram(surface_shader);
+    glUniformMatrix4fv(model_location, 1, GL_FALSE, ae::identity().m);
+    glUniform1i(cutaway_location, 0);
+
+    for (MinePortal& portal : graph.portals) {
+        if (updated_faces >= graph.settings.captures_per_frame) {
+            break;
+        }
+        if (!portal.capture.stale || portal.open_alpha > 0.96f) {
+            continue;
+        }
+        ensure_portal_cubemap(portal, graph.settings.capture_size);
+        const uint32_t face = std::min(portal.capture.face_cursor, 5u);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+            portal.capture.cubemap_texture,
+            0
+        );
+        glClearColor(0.015f, 0.020f, 0.024f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        const ae::Vec3 capture_eye = portal.capture.capture_position;
+        const ae::Mat4 projection = ae::perspective(ae::Pi * 0.5f, 1.0f, 0.015f, 30.0f);
+        const ae::Mat4 view = ae::look_at(capture_eye, capture_eye + cube_face_direction(face), cube_face_up(face));
+        const ae::Mat4 mvp = projection * view * ae::identity();
+        const Frustum capture_frustum = extract_frustum(mvp);
+        const std::vector<MortonChunkKey> capture_keys = collect_portal_capture_chunk_keys(field, gpu_chunks, portal, capture_eye, capture_frustum);
+        if (capture_keys.empty()) {
+            portal.capture.face_cursor = (portal.capture.face_cursor + 1u) % 6u;
+            if (portal.capture.face_cursor == 0u) {
+                portal.capture.stale = false;
+                portal.capture.last_update_generation = generation;
+            }
+            ++updated_faces;
+            continue;
+        }
+        glUniformMatrix4fv(mvp_location, 1, GL_FALSE, mvp.m);
+        glUniform3f(camera_location, capture_eye.x, capture_eye.y, capture_eye.z);
+        const uint32_t saved_drawn = gpu_chunks.drawn_chunks_last_frame;
+        const uint32_t saved_culled = gpu_chunks.culled_chunks_last_frame;
+        const uint32_t saved_calls = gpu_chunks.draw_calls_last_frame;
+        draw_visible_chunks_indirect(gpu_chunks, capture_keys, capture_frustum, true);
+        gpu_chunks.drawn_chunks_last_frame = saved_drawn;
+        gpu_chunks.culled_chunks_last_frame = saved_culled;
+        gpu_chunks.draw_calls_last_frame = saved_calls;
+        portal.capture.face_cursor = (portal.capture.face_cursor + 1u) % 6u;
+        if (portal.capture.face_cursor == 0u) {
+            portal.capture.stale = false;
+            portal.capture.last_update_generation = generation;
+        }
+        ++updated_faces;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, width, height);
+    graph.stats.capture_faces_this_frame = updated_faces;
+    return updated_faces;
+}
+
+ae::Vec3 portal_impostor_center(const MinePortal& portal) {
+    return portal.center + portal.normal * (static_cast<float>(portal.capture.side) * portal.radius * PortalImpostorDepthBias);
+}
+
+std::array<ae::Vec3, 6u> portal_quad_vertices(const MinePortal& portal) {
+    ae::Vec3 u;
+    ae::Vec3 v;
+    path_basis(portal.normal, u, v);
+    const ae::Vec3 center = portal_impostor_center(portal);
+    const float radius = portal.radius * PortalImpostorRadiusScale;
+    const ae::Vec3 a = center - u * radius - v * radius;
+    const ae::Vec3 b = center + u * radius - v * radius;
+    const ae::Vec3 c = center + u * radius + v * radius;
+    const ae::Vec3 d = center - u * radius + v * radius;
+    return {{a, b, c, a, c, d}};
+}
+
+uint32_t draw_portal_impostors(
+    PortalGraph& graph,
+    PortalGpu& gpu,
+    const ae::Mat4& mvp,
+    const Frustum& frustum,
+    ae::Vec3 eye,
+    bool exterior_overview
+) {
+    graph.stats.portal_draw_calls = 0u;
+    (void)exterior_overview;
+    if (!graph.settings.enabled || graph.portals.empty()) {
+        return 0u;
+    }
+    initialize_portal_gpu(gpu);
+    if (gpu.shader == 0) {
+        return 0u;
+    }
+
+    glUseProgram(gpu.shader);
+    glUniformMatrix4fv(gpu.mvp_location, 1, GL_FALSE, mvp.m);
+    glUniform3f(gpu.camera_location, eye.x, eye.y, eye.z);
+    glUniform1i(gpu.cubemap_location, 0);
+    glBindVertexArray(gpu.vao);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glActiveTexture(GL_TEXTURE0);
+
+    for (const MinePortal& portal : graph.portals) {
+        const float alpha = saturate(1.0f - portal.open_alpha);
+        if (alpha < PortalImpostorMinAlpha || portal.capture.cubemap_texture == 0) {
+            continue;
+        }
+        const ae::Vec3 impostor_center = portal_impostor_center(portal);
+        if (!sphere_in_frustum(frustum, impostor_center, portal.radius * PortalImpostorRadiusScale * 1.25f)) {
+            continue;
+        }
+        const std::array<ae::Vec3, 6u> vertices = portal_quad_vertices(portal);
+        glBindBuffer(GL_ARRAY_BUFFER, gpu.vbo);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertices.size() * sizeof(ae::Vec3)), vertices.data());
+        glBindTexture(GL_TEXTURE_CUBE_MAP, portal.capture.cubemap_texture);
+        glUniform3f(gpu.capture_location, portal.capture.capture_position.x, portal.capture.capture_position.y, portal.capture.capture_position.z);
+        glUniform3f(gpu.box_min_location, portal.proxy_box_min.x, portal.proxy_box_min.y, portal.proxy_box_min.z);
+        glUniform3f(gpu.box_max_location, portal.proxy_box_max.x, portal.proxy_box_max.y, portal.proxy_box_max.z);
+        glUniform1f(gpu.alpha_location, alpha);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        ++graph.stats.portal_draw_calls;
+    }
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    return graph.stats.portal_draw_calls;
 }
 
 ae::Vec3 rotate_axis_angle(ae::Vec3 value, ae::Vec3 axis, float radians) {
@@ -2407,6 +3988,10 @@ void update_window_title(
     bool fly_mode,
     bool cutaway,
     const MineSdfField* field = nullptr,
+    const GpuChunkStore* gpu_chunks = nullptr,
+    const PortalGraph* portals = nullptr,
+    const FramePerfStats* perf = nullptr,
+    bool vsync_enabled = false,
     uint32_t queued_jobs = 0,
     uint32_t worker_count = 0
 ) {
@@ -2416,6 +4001,7 @@ void update_window_title(
           << " radius " << settings.tunnel_radius
           << " grid " << stats.grid_resolution
           << " fps " << (field != nullptr ? static_cast<uint32_t>(std::round(field->fps_estimate)) : 0u)
+          << " frame " << (perf != nullptr ? perf->frame_ms : 0.0) << "ms"
           << " edits " << stats.edit_count
           << " dirty " << stats.dirty_chunks
           << " brush " << stats.brush_radius
@@ -2428,6 +4014,19 @@ void update_window_title(
           << " queued " << queued_jobs
           << " done " << (field != nullptr ? field->completed_jobs_total : 0u)
           << " upload " << (field != nullptr ? field->uploaded_chunks_last_frame : 0u)
+          << "/" << (gpu_chunks != nullptr ? gpu_chunks->uploaded_bytes_last_frame / 1024u : 0u) << "KB"
+          << " drawn " << (gpu_chunks != nullptr ? gpu_chunks->drawn_chunks_last_frame : 0u)
+          << " culled " << (gpu_chunks != nullptr ? gpu_chunks->culled_chunks_last_frame : 0u)
+          << " calls " << (gpu_chunks != nullptr ? gpu_chunks->draw_calls_last_frame : 0u)
+          << " portals " << (portals != nullptr ? portals->stats.portal_count : 0u)
+          << " popen " << (portals != nullptr ? portals->stats.open_portals : 0u)
+          << " pclosed " << (portals != nullptr ? portals->stats.closed_portals : 0u)
+          << " pculled " << (portals != nullptr ? portals->stats.portal_culled_chunks : 0u)
+          << " pshell " << (portals != nullptr ? portals->stats.shell_kept_chunks : 0u)
+          << " pcaps " << (portals != nullptr ? portals->stats.capture_faces_this_frame : 0u)
+          << "/" << (portals != nullptr ? portals->stats.stale_captures : 0u)
+          << " pdraw " << (portals != nullptr ? portals->stats.portal_draw_calls : 0u)
+          << " gpu " << (perf != nullptr ? perf->gpu_surface_ms : 0.0) << "ms"
           << " trans " << (field != nullptr ? field->transition_triangle_count : 0u)
           << " stale " << (field != nullptr ? field->stale_result_drops : 0u)
           << " workers " << worker_count
@@ -2436,6 +4035,7 @@ void update_window_title(
           << " nonmanifold " << stats.nonmanifold_edges
           << " tris " << stats.triangles
           << " | " << (fly_mode ? "fly" : "orbit")
+          << (vsync_enabled ? " vsync" : " no-vsync")
           << (cutaway ? " cutaway" : "");
     SDL_SetWindowTitle(window, title.str().c_str());
 }
@@ -2482,9 +4082,11 @@ int main(int, char**) {
         return 1;
     }
 
-    SDL_GL_SetSwapInterval(1);
+    bool vsync_enabled = false;
+    SDL_GL_SetSwapInterval(vsync_enabled ? 1 : 0);
     SDL_SetWindowRelativeMouseMode(window, true);
     glEnable(GL_DEPTH_TEST);
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
     glDisable(GL_CULL_FACE);
     glClearColor(0.018f, 0.022f, 0.025f, 1.0f);
 
@@ -2514,6 +4116,7 @@ int main(int, char**) {
     MineNetwork network = build_mine_network(points, settings);
     MineSdfField field = build_base_mine_field(settings, network);
     field.generation = current_generation;
+    PortalGraph portal_graph = build_portal_graph(network, field);
     Camera camera;
     place_camera_in_first_shaft(camera, network);
     add_focus_lod_chunks(field, camera.position, lod_policy);
@@ -2532,10 +4135,14 @@ int main(int, char**) {
 
     GpuMesh gpu;
     GpuChunkStore gpu_chunks;
+    PortalGpu portal_gpu;
+    initialize_chunk_arena(gpu_chunks);
+    bool graph_dirty = true;
+    bool preview_dirty = true;
     upload_lines(gpu, mesh.graph_lines);
     bool running = true;
     bool wireframe = false;
-    bool graph_overlay = true;
+    bool graph_overlay = false;
     bool morton_overlay = false;
     bool cutaway = false;
     bool edit_inputs_armed = false;
@@ -2545,12 +4152,40 @@ int main(int, char**) {
     auto last_frame = std::chrono::steady_clock::now();
     auto last_stats_refresh = std::chrono::steady_clock::now();
     auto last_stream_log = std::chrono::steady_clock::now();
+    auto last_preview_raycast = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    ae::Vec3 last_focus_position = camera.position;
+    ae::Vec3 last_visibility_position = camera.position;
+    ae::Vec3 last_visibility_forward = camera.forward;
+    ae::Vec3 cached_preview_hit = {};
+    bool cached_has_preview = false;
+    bool last_far_shell_overview = ae::length(camera.position) > PlanetRadius + 0.18f;
+    uint32_t frame_index = 0;
     bool pending_stats_refresh = false;
     uint32_t edit_upload_boost_frames = 0;
+    FramePerfStats perf;
+    GpuTimer surface_timer;
+    GpuTimer line_timer;
+
+    auto update_title = [&]() {
+        update_window_title(
+            window,
+            settings,
+            mesh.stats,
+            camera.fly_mode,
+            cutaway,
+            &field,
+            &gpu_chunks,
+            &portal_graph,
+            &perf,
+            vsync_enabled,
+            worker_queue_size(workers),
+            workers.worker_count
+        );
+    };
 
     auto refresh_stats = [&]() {
         mesh.stats = update_streaming_stats(field, settings, network, draw_keys);
-        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+        update_title();
     };
 
     auto rebuild = [&]() {
@@ -2561,8 +4196,10 @@ int main(int, char**) {
         const float brush_radius = field.brush_radius;
         clear_worker_queue(workers);
         clear_gpu_chunks(gpu_chunks);
+        destroy_portal_captures(portal_graph);
         ++current_generation;
         network = build_mine_network(points, settings);
+        graph_dirty = true;
         field = build_base_mine_field(settings, network);
         field.generation = current_generation;
         field.edits = saved_edits;
@@ -2571,15 +4208,20 @@ int main(int, char**) {
         field.next_object_id = next_object_id;
         field.brush_radius = std::clamp(brush_radius, field.voxel * 1.25f, 0.16f);
         rebuild_field_from_history(field);
+        portal_graph = build_portal_graph(network, field);
+        invalidate_all_portal_captures(portal_graph);
         place_camera_in_first_shaft(camera, network);
         add_focus_lod_chunks(field, camera.position, lod_policy);
         queue_dirty_chunks(field, workers, camera.position, 384u);
-        visible_keys = collect_visible_lod_keys(field);
-        draw_keys = collect_gpu_visible_lod_keys(field, gpu_chunks);
+        last_far_shell_overview = ae::length(camera.position) > PlanetRadius + 0.18f;
+        visible_keys = last_far_shell_overview ? collect_lod_keys(field, 0u) : collect_visible_lod_keys(field);
+        draw_keys = last_far_shell_overview
+            ? collect_gpu_lod_keys(field, gpu_chunks, 0u)
+            : collect_gpu_visible_lod_keys(field, gpu_chunks, camera.position, lod_policy);
         pending_stats_refresh = true;
     };
 
-    update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+    update_title();
 
     while (running) {
         const auto now = std::chrono::steady_clock::now();
@@ -2624,9 +4266,11 @@ int main(int, char**) {
                         carve ? EditMaterial::MineWall : EditMaterial::Fill
                     )
                 );
+                invalidate_portal_captures_near(portal_graph, hit, field.brush_radius);
                 add_focus_lod_chunks(field, hit, lod_policy);
                 queue_dirty_chunks(field, workers, hit, 512u);
                 edit_upload_boost_frames = 45u;
+                preview_dirty = true;
                 pending_stats_refresh = true;
             } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
                 if (camera.fly_mode) {
@@ -2636,7 +4280,8 @@ int main(int, char**) {
                         0.16f
                     );
                     mesh.stats.brush_radius = field.brush_radius;
-                    update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                    preview_dirty = true;
+                    update_title();
                 } else {
                     camera.orbit_distance = std::clamp(camera.orbit_distance * std::pow(0.88f, event.wheel.y), 1.2f, 8.0f);
                 }
@@ -2648,26 +4293,46 @@ int main(int, char**) {
                     case SDLK_TAB:
                         camera.fly_mode = !camera.fly_mode;
                         SDL_SetWindowRelativeMouseMode(window, camera.fly_mode);
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        update_title();
                         break;
                     case SDLK_F:
                         wireframe = !wireframe;
                         break;
                     case SDLK_B:
                         graph_overlay = !graph_overlay;
+                        graph_dirty = graph_overlay;
+                        preview_dirty = true;
+                        update_title();
+                        break;
+                    case SDLK_O:
+                        portal_graph.settings.enabled = !portal_graph.settings.enabled;
+                        update_title();
+                        break;
+                    case SDLK_I:
+                        portal_graph.settings.debug = !portal_graph.settings.debug;
+                        graph_dirty = true;
+                        preview_dirty = true;
+                        update_title();
+                        break;
+                    case SDLK_V:
+                        vsync_enabled = !vsync_enabled;
+                        SDL_GL_SetSwapInterval(vsync_enabled ? 1 : 0);
+                        update_title();
                         break;
                     case SDLK_P:
                         field.streaming_paused = !field.streaming_paused;
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        update_title();
                         break;
                     case SDLK_M:
                         morton_overlay = !morton_overlay;
                         graph_overlay = morton_overlay || graph_overlay;
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        graph_dirty = graph_overlay;
+                        preview_dirty = true;
+                        update_title();
                         break;
                     case SDLK_C:
                         cutaway = !cutaway;
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        update_title();
                         break;
                     case SDLK_R:
                         ++settings.seed;
@@ -2676,12 +4341,14 @@ int main(int, char**) {
                     case SDLK_LEFTBRACKET:
                         field.brush_radius = std::max(field.voxel * 1.25f, field.brush_radius * 0.90f);
                         mesh.stats.brush_radius = field.brush_radius;
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        preview_dirty = true;
+                        update_title();
                         break;
                     case SDLK_RIGHTBRACKET:
                         field.brush_radius = std::min(0.16f, field.brush_radius * 1.10f);
                         mesh.stats.brush_radius = field.brush_radius;
-                        update_window_title(window, settings, mesh.stats, camera.fly_mode, cutaway, &field, worker_queue_size(workers), workers.worker_count);
+                        preview_dirty = true;
+                        update_title();
                         break;
                     case SDLK_G: {
                         ae::Vec3 hit;
@@ -2694,9 +4361,13 @@ int main(int, char**) {
                         object.material = EditMaterial::MineWall;
                         field.objects.push_back(object);
                         apply_sdf_edit(field, make_sphere_edit(field, SdfEditMode::Carve, hit, object.radius, object.material, object.id));
+                        destroy_portal_captures(portal_graph);
+                        portal_graph = build_portal_graph(network, field);
                         add_focus_lod_chunks(field, hit, lod_policy);
                         queue_dirty_chunks(field, workers, hit, 512u);
                         edit_upload_boost_frames = 45u;
+                        graph_dirty = true;
+                        preview_dirty = true;
                         pending_stats_refresh = true;
                         break;
                     }
@@ -2706,6 +4377,8 @@ int main(int, char**) {
                         if (!field.has_tunnel_mark) {
                             field.tunnel_mark = hit;
                             field.has_tunnel_mark = true;
+                            graph_dirty = true;
+                            preview_dirty = true;
                         } else {
                             EditableMineObject object;
                             object.id = field.next_object_id++;
@@ -2716,9 +4389,13 @@ int main(int, char**) {
                             field.objects.push_back(object);
                             apply_sdf_edit(field, make_capsule_edit(field, SdfEditMode::Carve, object.points[0], object.points[1], object.radius, object.material, object.id));
                             field.tunnel_mark = hit;
+                            destroy_portal_captures(portal_graph);
+                            portal_graph = build_portal_graph(network, field);
                             add_focus_lod_chunks(field, hit, lod_policy);
                             queue_dirty_chunks(field, workers, hit, 512u);
                             edit_upload_boost_frames = 45u;
+                            graph_dirty = true;
+                            preview_dirty = true;
                             pending_stats_refresh = true;
                         }
                         break;
@@ -2734,8 +4411,12 @@ int main(int, char**) {
                                 apply_sdf_edit(field, make_capsule_edit(field, SdfEditMode::Fill, object->points[0], object->points[1], object->radius * 1.08f, EditMaterial::Fill, object->id));
                             }
                             add_focus_lod_chunks(field, hit, lod_policy);
+                            destroy_portal_captures(portal_graph);
+                            portal_graph = build_portal_graph(network, field);
                             queue_dirty_chunks(field, workers, hit, 512u);
                             edit_upload_boost_frames = 45u;
+                            graph_dirty = true;
+                            preview_dirty = true;
                             pending_stats_refresh = true;
                         }
                         break;
@@ -2744,8 +4425,12 @@ int main(int, char**) {
                         if (undo_edit(field)) {
                             const ae::Vec3 focus = camera.fly_mode ? camera.position : orbit_eye(camera);
                             add_focus_lod_chunks(field, focus, lod_policy);
+                            destroy_portal_captures(portal_graph);
+                            portal_graph = build_portal_graph(network, field);
                             queue_dirty_chunks(field, workers, focus, 512u);
                             edit_upload_boost_frames = 45u;
+                            graph_dirty = true;
+                            preview_dirty = true;
                             pending_stats_refresh = true;
                         }
                         break;
@@ -2753,8 +4438,12 @@ int main(int, char**) {
                         if (redo_edit(field)) {
                             const ae::Vec3 focus = camera.fly_mode ? camera.position : orbit_eye(camera);
                             add_focus_lod_chunks(field, focus, lod_policy);
+                            destroy_portal_captures(portal_graph);
+                            portal_graph = build_portal_graph(network, field);
                             queue_dirty_chunks(field, workers, focus, 512u);
                             edit_upload_boost_frames = 45u;
+                            graph_dirty = true;
+                            preview_dirty = true;
                             pending_stats_refresh = true;
                         }
                         break;
@@ -2815,28 +4504,90 @@ int main(int, char**) {
             }
         }
 
+        const auto input_end = std::chrono::steady_clock::now();
+        perf.input_ms = elapsed_ms(now, input_end);
+
         const ae::Vec3 eye = camera.fly_mode ? camera.position : orbit_eye(camera);
-        add_focus_lod_chunks(field, eye, lod_policy);
-        visible_keys = collect_visible_lod_keys(field);
+        const ae::Vec3 target = camera.fly_mode ? camera.position + fly_forward(camera) : ae::Vec3{0.0f, 0.0f, 0.0f};
+        const float aspect = static_cast<float>(width) / static_cast<float>(height);
+        const ae::Mat4 projection = ae::perspective(64.0f * ae::Pi / 180.0f, aspect, 0.015f, 30.0f);
+        const ae::Mat4 view = ae::look_at(eye, target, camera.fly_mode ? fly_up(camera) : ae::Vec3{0.0f, 1.0f, 0.0f});
+        const ae::Mat4 model = ae::identity();
+        const ae::Mat4 mvp = projection * view * model;
+        const Frustum frustum = extract_frustum(mvp);
+        const float eye_radius = ae::length(eye);
+        const bool outside_planet = eye_radius > PlanetRadius + 0.015f;
+        const bool far_shell_overview = eye_radius > PlanetRadius + 0.18f;
+        const bool exterior_changed = far_shell_overview != last_far_shell_overview;
+        last_far_shell_overview = far_shell_overview;
+
+        const auto visibility_begin = std::chrono::steady_clock::now();
+        const bool focus_moved = ae::length(eye - last_focus_position) > 0.035f;
+        if (focus_moved) {
+            add_focus_lod_chunks(field, eye, lod_policy);
+            last_focus_position = eye;
+        }
+        const bool visibility_moved =
+            ae::length(eye - last_visibility_position) > 0.018f ||
+            ae::length(fly_forward(camera) - last_visibility_forward) > 0.025f;
+        if ((frame_index & 1u) == 0u || visibility_moved || focus_moved || exterior_changed) {
+            visible_keys = far_shell_overview ? collect_lod_keys(field, 0u) : collect_visible_lod_keys(field);
+            last_visibility_position = eye;
+            last_visibility_forward = fly_forward(camera);
+        }
         const uint32_t accepted_chunks = drain_completed_chunks(field, workers, 64u);
         if (accepted_chunks > 0u) {
             pending_stats_refresh = true;
         }
-        enqueue_visible_gpu_uploads(field, gpu_chunks, visible_keys);
+        std::vector<MortonChunkKey> upload_keys = far_shell_overview
+            ? visible_keys
+            : frustum_culled_chunk_keys(field, visible_keys, frustum);
+        upload_keys.erase(
+            std::remove_if(upload_keys.begin(), upload_keys.end(), [&](MortonChunkKey key) {
+                return !desired_lod_chunk(field, key, eye, lod_policy);
+            }),
+            upload_keys.end()
+        );
+        enqueue_visible_gpu_uploads(field, gpu_chunks, upload_keys);
+        enqueue_urgent_gpu_uploads(field, gpu_chunks);
+        const auto visibility_end = std::chrono::steady_clock::now();
+        perf.visibility_ms = elapsed_ms(visibility_begin, visibility_end);
+
+        const auto upload_begin = std::chrono::steady_clock::now();
         const uint32_t upload_budget = !gpu_chunks.urgent_uploads.empty() || edit_upload_boost_frames > 0u
             ? 12u
             : (gpu_chunks.chunks.empty() ? 4u : 1u);
         const uint32_t uploaded_chunks = upload_queued_chunks(field, gpu_chunks, upload_budget);
+        perf.upload_ms = elapsed_ms(upload_begin, std::chrono::steady_clock::now());
         if (edit_upload_boost_frames > 0u) {
             --edit_upload_boost_frames;
         }
-        draw_keys = collect_gpu_visible_lod_keys(field, gpu_chunks);
+        if ((frame_index & 1u) == 0u || visibility_moved || exterior_changed || accepted_chunks > 0u || uploaded_chunks > 0u) {
+            draw_keys = far_shell_overview
+                ? collect_gpu_lod_keys(field, gpu_chunks, 0u)
+                : collect_gpu_visible_lod_keys(field, gpu_chunks, eye, lod_policy);
+        }
+        const ae::Vec3 view_forward = ae::normalize(target - eye);
+        update_portal_states(portal_graph, eye, view_forward, outside_planet, current_generation);
+        if (portal_graph.settings.debug) {
+            graph_dirty = true;
+        }
+        const std::vector<MortonChunkKey> portal_draw_keys = portal_filtered_draw_keys(field, portal_graph, draw_keys, eye, view_forward, outside_planet);
+        const std::vector<MortonChunkKey> culled_draw_keys = far_shell_overview
+            ? portal_draw_keys
+            : frustum_culled_keys(gpu_chunks, portal_draw_keys, frustum);
+        const uint32_t frustum_culled_chunks = far_shell_overview
+            ? 0u
+            : static_cast<uint32_t>(portal_draw_keys.size() - culled_draw_keys.size());
         if (uploaded_chunks > 0u) {
             pending_stats_refresh = true;
         }
-        const bool refresh_due = std::chrono::duration<float>(now - last_stats_refresh).count() >= 0.35f;
-        if (pending_stats_refresh && refresh_due) {
-            refresh_stats();
+        const bool refresh_due = std::chrono::duration<float>(now - last_stats_refresh).count() >= 0.5f;
+        if (refresh_due) {
+            if (pending_stats_refresh) {
+                mesh.stats = update_streaming_stats(field, settings, network, culled_draw_keys);
+            }
+            update_title();
             last_stats_refresh = now;
             pending_stats_refresh = false;
         }
@@ -2847,23 +4598,59 @@ int main(int, char**) {
                       << " chunks, queued " << worker_queue_size(workers)
                       << ", gpu chunks " << gpu_chunks.chunks.size()
                       << ", uploaded/frame " << uploaded_chunks
-                      << ", visible chunks " << draw_keys.size()
+                      << ", visible chunks " << culled_draw_keys.size()
+                      << ", draw calls " << gpu_chunks.draw_calls_last_frame
+                      << ", portals " << portal_graph.stats.portal_count
+                      << ", portal culled " << portal_graph.stats.portal_culled_chunks
+                      << ", shell kept " << portal_graph.stats.shell_kept_chunks
+                      << ", portal captures " << portal_graph.stats.capture_faces_this_frame
+                      << "/" << portal_graph.stats.stale_captures
+                      << ", frame " << perf.frame_ms << " ms"
+                      << ", gpu " << perf.gpu_surface_ms << " ms"
                       << ", triangles " << mesh.stats.triangles
                       << ", invalid " << mesh.stats.invalid_indices
                       << ", degenerate " << mesh.stats.degenerate_triangles << std::endl;
         }
-        queue_dirty_chunks(field, workers, eye, 64u);
+        queue_dirty_chunks(field, workers, eye, perf.frame_ms > 4.16 ? 16u : 64u);
 
-        const ae::Vec3 target = camera.fly_mode ? camera.position + fly_forward(camera) : ae::Vec3{0.0f, 0.0f, 0.0f};
-        const float aspect = static_cast<float>(width) / static_cast<float>(height);
-        const ae::Mat4 projection = ae::perspective(64.0f * ae::Pi / 180.0f, aspect, 0.015f, 30.0f);
-        const ae::Mat4 view = ae::look_at(eye, target, camera.fly_mode ? fly_up(camera) : ae::Vec3{0.0f, 1.0f, 0.0f});
-        const ae::Mat4 model = ae::identity();
-        const ae::Mat4 mvp = projection * view * model;
-        ae::Vec3 preview_hit;
-        const bool has_preview = camera.fly_mode && raycast_field(field, eye, fly_forward(camera), preview_hit);
-        mesh.graph_lines = build_graph_lines(network, field, has_preview, preview_hit);
-        upload_lines(gpu, mesh.graph_lines);
+        const bool preview_due = std::chrono::duration<float>(now - last_preview_raycast).count() >= (1.0f / 60.0f);
+        if (camera.fly_mode && preview_due) {
+            cached_has_preview = raycast_field(field, eye, fly_forward(camera), cached_preview_hit);
+            last_preview_raycast = now;
+        } else if (!camera.fly_mode) {
+            cached_has_preview = false;
+        }
+        const auto line_begin = std::chrono::steady_clock::now();
+        if (graph_dirty) {
+            mesh.graph_lines = (graph_overlay || portal_graph.settings.debug) ? build_graph_lines(network, field, false, {}) : std::vector<RenderVertex>{};
+            if (portal_graph.settings.debug) {
+                std::vector<RenderVertex> portal_lines = build_portal_debug_lines(portal_graph);
+                mesh.graph_lines.insert(mesh.graph_lines.end(), portal_lines.begin(), portal_lines.end());
+            }
+            upload_lines(gpu, mesh.graph_lines);
+            graph_dirty = false;
+        }
+        if (preview_due || preview_dirty) {
+            upload_preview_lines(gpu, build_preview_lines(field, cached_has_preview, cached_preview_hit));
+        }
+        preview_dirty = false;
+        perf.line_ms = elapsed_ms(line_begin, std::chrono::steady_clock::now());
+
+        update_portal_captures(
+            portal_graph,
+            portal_gpu,
+            field,
+            gpu_chunks,
+            shader,
+            mvp_location,
+            model_location,
+            camera_location,
+            cutaway_location,
+            current_generation,
+            width,
+            height,
+            perf.frame_ms
+        );
 
         glViewport(0, 0, width, height);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2875,23 +4662,54 @@ int main(int, char**) {
         glUniform1i(cutaway_location, cutaway ? 1 : 0);
 
         glPolygonMode(GL_FRONT_AND_BACK, wireframe ? GL_LINE : GL_FILL);
-        gpu.chunk_index_count = draw_visible_chunks(gpu_chunks, draw_keys);
+        const auto draw_begin = std::chrono::steady_clock::now();
+        begin_gpu_timer(surface_timer);
+        gpu.chunk_index_count = draw_visible_chunks_indirect(gpu_chunks, culled_draw_keys, frustum, false);
+        gpu_chunks.culled_chunks_last_frame = frustum_culled_chunks;
+        end_gpu_timer(surface_timer);
+        read_gpu_timer(surface_timer, perf.gpu_surface_ms);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
-        if (graph_overlay && gpu.line_vertex_count > 0u) {
+        draw_portal_impostors(portal_graph, portal_gpu, mvp, frustum, eye, far_shell_overview);
+
+        if (((graph_overlay || portal_graph.settings.debug) && gpu.line_vertex_count > 0u) || gpu.preview_vertex_count > 0u) {
+            begin_gpu_timer(line_timer);
             glDisable(GL_DEPTH_TEST);
             glLineWidth(2.0f);
-            glBindVertexArray(gpu.line_vao);
-            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gpu.line_vertex_count));
+            if ((graph_overlay || portal_graph.settings.debug) && gpu.line_vertex_count > 0u) {
+                glBindVertexArray(gpu.line_vao);
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gpu.line_vertex_count));
+            }
+            if (gpu.preview_vertex_count > 0u) {
+                glBindVertexArray(gpu.preview_vao);
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gpu.preview_vertex_count));
+            }
             glEnable(GL_DEPTH_TEST);
+            end_gpu_timer(line_timer);
+            read_gpu_timer(line_timer, perf.gpu_lines_ms);
         }
+        perf.draw_submit_ms = elapsed_ms(draw_begin, std::chrono::steady_clock::now());
 
+        const auto swap_begin = std::chrono::steady_clock::now();
         SDL_GL_SwapWindow(window);
+        perf.swap_ms = elapsed_ms(swap_begin, std::chrono::steady_clock::now());
+        perf.frame_ms = elapsed_ms(now, std::chrono::steady_clock::now());
+        const float target_ms = 1000.0f / std::max(1.0f, lod_policy.target_fps);
+        if (perf.frame_ms > target_ms * 1.12f) {
+            lod_policy.quality_scale = std::max(0.50f, lod_policy.quality_scale * 0.985f);
+        } else if (perf.frame_ms < target_ms * 0.82f) {
+            lod_policy.quality_scale = std::min(2.0f, lod_policy.quality_scale * 1.005f);
+        }
+        ++frame_index;
     }
 
     SDL_SetWindowRelativeMouseMode(window, false);
     stop_worker_pool(workers);
-    clear_gpu_chunks(gpu_chunks);
+    destroy_gpu_timer(surface_timer);
+    destroy_gpu_timer(line_timer);
+    destroy_portal_captures(portal_graph);
+    destroy_portal_gpu(portal_gpu);
+    destroy_chunk_arena(gpu_chunks);
     destroy_mesh(gpu);
     if (shader != 0) {
         glDeleteProgram(shader);
